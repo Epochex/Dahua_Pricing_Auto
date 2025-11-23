@@ -215,7 +215,7 @@ def main() -> None:
             continue
 
         if part_no.lower() in {"quit", "exit", "q"}:
-            print("程序已退出，感谢使用！")
+            print("程序已退出，Merci Auvoir！")
             break
 
         key = part_no.strip().lower()
