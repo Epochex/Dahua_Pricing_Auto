@@ -45,7 +45,7 @@ PRICE_COLS = {
 
 def _format_value(v):
     if v is None:
-        return "Price Not Found"
+        return "Value Not Found"
     try:
         if isinstance(v, float) and math.isnan(v):
             return "Price Not Found"
@@ -59,10 +59,13 @@ def render_table(
     calculated_fields: Iterable[str],
 ) -> str:
     """
-    把结果 dict 渲染成 tabulate 表格文本。
-    所有价格列：
-      - 如果在 calculated_fields 中 → 追加 ' | Calculated'
-      - 否则且非缺失 → 追加 ' | Original'
+    把结果 dict 渲染成表格。
+
+    规则：
+    - 只对“Calculated”的价格做格式处理：
+        * 数值 < 10  → 保留 1 位小数
+        * 数值 >=10 → 向上取整成整数（无小数）
+    - Original 的价格保持原值（不改小数位），只追加标记。
     """
     calc_set: Set[str] = set(calculated_fields)
     rows = []
@@ -74,15 +77,34 @@ def render_table(
         seen.add(col)
 
         raw = final_values.get(col)
+
+        # ===== 只对“Calculated 的价格列”做数值格式 =====
+        if col in PRICE_COLS and raw is not None and col in calc_set:
+            try:
+                num = float(raw)
+                if math.isnan(num):
+                    raw = None
+                else:
+                    if num < 10:
+                        # <10：保留 1 位小数（正常四舍五入）
+                        raw = f"{num:.1f}"
+                    else:
+                        # >=10：向上取整成整数
+                        raw = str(math.ceil(num))
+            except (TypeError, ValueError):
+                # 不是数值就保持原样
+                pass
+
         val = _format_value(raw)
 
-        # 对价格列追加 Original / Calculated 标记
+        # ===== Original / Calculated 标记 =====
         if col in PRICE_COLS and val != "Price Not Found":
             if col in calc_set:
                 val = f"{val} | Calculated"
             else:
                 val = f"{val} | Original"
 
+        # ===== 加粗关键列 =====
         if col in BOLD_COLS:
             col_disp = f"\033[1m{col}\033[0m"
             val_disp = f"\033[1m{val}\033[0m"
