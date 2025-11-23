@@ -1,7 +1,6 @@
 import math
 from typing import Dict, Iterable, Set
 
-import pandas as pd
 from tabulate import tabulate
 
 
@@ -21,9 +20,19 @@ COLUMNS_TO_SHOW = [
     "MSRP(EUR)",
 ]
 
-
 BOLD_COLS = {
     "Part No.",
+    "FOB C(EUR)",
+    "DDP A(EUR)",
+    "Suggested Reseller(EUR)",
+    "Gold(EUR)",
+    "Silver(EUR)",
+    "Ivory(EUR)",
+    "MSRP(EUR)",
+}
+
+# 需要打 Original / Calculated 标记的价格列
+PRICE_COLS = {
     "FOB C(EUR)",
     "DDP A(EUR)",
     "Suggested Reseller(EUR)",
@@ -51,6 +60,9 @@ def render_table(
 ) -> str:
     """
     把结果 dict 渲染成 tabulate 表格文本。
+    所有价格列：
+      - 如果在 calculated_fields 中 → 追加 ' | Calculated'
+      - 否则且非缺失 → 追加 ' | Original'
     """
     calc_set: Set[str] = set(calculated_fields)
     rows = []
@@ -61,11 +73,15 @@ def render_table(
             continue
         seen.add(col)
 
-        val = final_values.get(col)
-        val = _format_value(val)
+        raw = final_values.get(col)
+        val = _format_value(raw)
 
-        if col in calc_set and val != "Price Not Found":
-            val = f"{val} | calculated"
+        # 对价格列追加 Original / Calculated 标记
+        if col in PRICE_COLS and val != "Price Not Found":
+            if col in calc_set:
+                val = f"{val} | Calculated"
+            else:
+                val = f"{val} | Original"
 
         if col in BOLD_COLS:
             col_disp = f"\033[1m{col}\033[0m"
@@ -89,10 +105,10 @@ def build_status_line(result: Dict) -> str:
     auto_success = bool(result.get("auto_success"))
 
     if not auto_success:
-        return "计算状态：自动化计算失败，已切换为 Excel 原始价格"
+        return "计算状态：自动化计算失败，已切换为原始价格（若存在）"
 
     if calc_fields:
         return f"计算状态：自动化计算成功（产品线：{cat} | 系列：{series_display}）"
 
-    # auto_success=True 但没有任何字段需要计算 → 全部来自 France 原始数据
-    return f"计算状态：无需自动补全，全部使用 France 原始价格（产品线：{cat} | 系列：{series_display}）"
+    # auto_success=True 且没有任何字段需要计算 → 全部 Original
+    return f"计算状态：无需自动补全，全部使用原始价格（产品线：{cat} | 系列：{series_display}）"

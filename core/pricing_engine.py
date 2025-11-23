@@ -110,6 +110,9 @@ def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float
 
 
 def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
+    """
+    只有 France 行存在且 7 个价格都非空时才认为“全部原始价格齐全”。
+    """
     if fr_row is None:
         return False
     for col in PRICE_COLS:
@@ -133,32 +136,60 @@ def _choose_sys_base_price(sales_type: str, sys_row: pd.Series) -> Optional[floa
     return min_price or area_price
 
 
-def build_original_values(fr_row: Optional[pd.Series]) -> Dict[str, object]:
+def build_original_values(
+    fr_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> Dict[str, object]:
     """
-    从 France 行构造基础输出字段（不含计算标记）。
-    即便后面要计算，也是在这个 dict 上覆盖。
+    构造基础输出字段：
+      - 优先用 France
+      - 当 France 行不存在时，从 Sys 填充基础信息字段
+    价格列一律从 France 拿（France 没有则先置 None，后面统一通过计算补）
     """
     data: Dict[str, object] = {}
-    if fr_row is not None:
+
+    # Part No.
+    if fr_row is not None and "Part No." in fr_row:
         data["Part No."] = fr_row.get("Part No.")
+    elif sys_row is not None and "Part Num" in sys_row:
+        data["Part No."] = sys_row.get("Part Num")
+    else:
+        data["Part No."] = None
+
+    # Series（展示用，这里只做简单兜底；更精细的在 classifier.detect_series 里）
+    if fr_row is not None:
         data["Series"] = fr_row.get("Series") or fr_row.get("系列")
+    elif sys_row is not None:
+        # 没有 France 时，拿 Sys 的 Second Product Line 做兜底
+        data["Series"] = sys_row.get("Second Product Line") or sys_row.get("Catelog Name")
+    else:
+        data["Series"] = None
+
+    # 模型 / 状态 / 描述
+    if fr_row is not None:
         data["External Model"] = fr_row.get("External Model")
         data["Internal Model"] = fr_row.get("Internal Model")
         data["Sales Status"] = fr_row.get("Sales Status")
         data["Description"] = fr_row.get("Description")
-
-        for col in PRICE_COLS:
-            data[col] = fr_row.get(col)
+    elif sys_row is not None:
+        data["External Model"] = sys_row.get("External Model")
+        data["Internal Model"] = sys_row.get("Internal Model")
+        data["Sales Status"] = sys_row.get("Release Status")
+        data["Description"] = None
     else:
-        # 没有 France 行时，用占位
-        data["Part No."] = None
-        data["Series"] = None
         data["External Model"] = None
         data["Internal Model"] = None
         data["Sales Status"] = None
         data["Description"] = None
+
+    # 价格列：只看 France
+    if fr_row is not None:
+        for col in PRICE_COLS:
+            data[col] = fr_row.get(col)
+    else:
         for col in PRICE_COLS:
             data[col] = None
+
     return data
 
 
@@ -176,7 +207,8 @@ def compute_prices_for_part(
       - category: 产品线（DDP_RULES 的 key）
       - price_group: 价格组（PRICE_RULES 顶层 key）
       - series_display: 展示用 series
-      - auto_success: 是否完成了自动识别（否则就当纯 Excel 输出）
+      - auto_success: 是否完成了自动识别
+      - used_sys: 是否用到了 Sys 做价格计算
     """
     # 1) 产品线 & 价格组
     category, price_group = classify_category_and_price_group(
@@ -188,19 +220,20 @@ def compute_prices_for_part(
     # 2) Series（展示 + 给 PRICE_RULES 选子规则用）
     series_display, series_key = detect_series(france_row, sys_row, price_group)
 
-    # 3) 原始值（默认全部来自 France）
-    final_values = build_original_values(france_row)
+    # 3) 原始值（France 优先，France 不存在则从 Sys 补基础字段）
+    final_values = build_original_values(france_row, sys_row)
     calculated_fields: Set[str] = set()
 
-    # 4) 如果 France 所有价格都齐全 → 完全不做任何计算，直接返回
+    # 4) 如果 France 所有价格都齐全 → 直接视为“全部 Original”，不做计算
     if _all_prices_present(france_row):
+        auto_success = category is not None and category != "UNKNOWN"
         return {
             "final_values": final_values,
             "calculated_fields": calculated_fields,
             "category": category,
             "price_group": price_group,
             "series_display": series_display,
-            "auto_success": True,  # 识别到了产品线
+            "auto_success": auto_success,
             "used_sys": False,
         }
 
@@ -208,18 +241,17 @@ def compute_prices_for_part(
     fob = _to_float(final_values.get("FOB C(EUR)"))
 
     used_sys = False
-    if fob is None or fob <= 0:
+    if (fob is None or fob <= 0) and sys_row is not None:
         # France 没给 FOB，尝试用 Sys + Sales Type 算 FOB
-        if sys_row is not None:
-            sales_type = ""
-            if france_row is not None and "Sales Type" in france_row:
-                sales_type = str(france_row.get("Sales Type") or "")
-            base_price = _choose_sys_base_price(sales_type, sys_row)
-            if base_price is not None and base_price > 0:
-                fob = base_price * 0.9
-                final_values["FOB C(EUR)"] = round(fob, 2)
-                calculated_fields.add("FOB C(EUR)")
-                used_sys = True
+        sales_type = ""
+        if france_row is not None and "Sales Type" in france_row:
+            sales_type = str(france_row.get("Sales Type") or "")
+        base_price = _choose_sys_base_price(sales_type, sys_row)
+        if base_price is not None and base_price > 0:
+            fob = base_price * 0.9
+            final_values["FOB C(EUR)"] = round(fob, 2)
+            calculated_fields.add("FOB C(EUR)")
+            used_sys = True
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
