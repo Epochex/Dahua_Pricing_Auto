@@ -1,0 +1,105 @@
+﻿priority,field1,match_type1,pattern1,field2,match_type2,pattern2,category,price_group_hint,note
+5,Internal Model,contains,IVSS,,,,IVSS,IVSS,任何包含 IVSS 的设备 → IVSS（智能存储）
+6,Internal Model,contains,EVS,,,,EVS,EVS,任何包含 EVS 的设备 → EVS（IP 存储）
+7,Internal Model,contains,XVR,,,,XVR,XVR,兜底：型号里有 XVR 的 → XVR
+8,Internal Model,contains,MNVR,,,,车载后端,车载,MNVR 系列移动 NVR → 车载后端（Mobile NVR）
+9,Internal Model,contains,HC5,Series,contains,Auto Camera,车载前端,车载,典型车载摄像机 / 行车记录仪 → 车载前端
+
+10,First Level Product Category,equals,Network Cameras,,,,IPC,IPC,所有网络摄像机 → IPC
+11,First Level Product Category,equals,Wireless Cameras,,,,IPC,IPC,Wi-Fi / 4G 摄像机 → IPC
+12,First Level Product Category,equals,General Customized Product,Series,contains,Camera,IPC,IPC,定制类摄像机 → IPC
+
+20,First Level Product Category,equals,HDCVI Cameras,,,,HAC,HAC,HDCVI 模拟摄像机 → HAC
+21,First Level Product Category,equals,PTZ Cameras,,,,PTZ,PTZ,PTZ 摄像机 → PTZ
+22,First Level Product Category,equals,Thermal Cameras,,,,THERMAL,THERMAL,热成像产品 → THERMAL
+
+30,First Level Product Category,equals,Network Recorders,,,,NVR,NVR,网络录像机默认 → NVR（IVSS/EVS 已在优先级 5/6 抢走）
+31,First Level Product Category,equals,HDCVI Recorders,,,,XVR,XVR,HDCVI 录像机 → XVR
+
+40,First Level Product Category,equals,Video Intercoms,,,,VDP,VDP,可视对讲 → VDP
+41,First Level Product Category,equals,Access Control&Time Attendance,,,,ACCESS CONTROL,ACCESS CONTROL,门禁 / 考勤 → ACCESS CONTROL
+42,First Level Product Category,equals,Alarms,,,,ALARM,ALARM,报警类 → ALARM
+
+50,First Level Product Category,equals,Transmission,,,,TRANSMISSION,TRANSMISSION,传输类 → TRANSMISSION
+
+60,First Level Product Category,equals,Accessories,Second Level Product Category,equals,Camera Accessories,ACCESSORY,ACCESSORY,Accessories / Camera Accessories → ACCESSORY
+61,First Level Product Category,equals,Accessories,Second Level Product Category,equals,Cabling,ACCESSORY线缆,ACCESSORY线缆,Accessories / Cabling → ACCESSORY 线缆
+62,First Level Product Category,equals,Accessories,Second Level Product Category,equals,Power,ACCESSORY,ACCESSORY,Accessories / Power（电源） → ACCESSORY
+63,First Level Product Category,equals,Accessories,,,,ACCESSORY,ACCESSORY,其他 Accessories 统一归 ACCESSORY
+
+70,First Level Product Category,equals,Display,Second Level Product Category,equals,Monitors,监视器,监视器,Display / Monitors → 监视器
+71,First Level Product Category,equals,Display,Second Level Product Category,equals,Digital Signage,商显/TV-WALL,商显/TV-WALL,Display / Digital Signage → 商显/TV-WALL
+72,First Level Product Category,equals,Display,Second Level Product Category,equals,LCD Video Walls,商显/TV-WALL,商显/TV-WALL,Display / LCD Video Walls → 商显/TV-WALL
+73,First Level Product Category,equals,Display,Second Level Product Category,equals,LED Displays,商显/TV-WALL,商显/TV-WALL,Display / LED Displays → 商显/TV-WALL
+74,First Level Product Category,equals,Display,Second Level Product Category,equals,MPS,商显/TV-WALL,商显/TV-WALL,多屏处理系统 MPS 视为拼接/商显 → 商显/TV-WALL
+75,First Level Product Category,equals,Display,Second Level Product Category,equals,Audio,ACCESSORY,ACCESSORY,Display / Audio 视为配件 → ACCESSORY
+
+80,First Level Product Category,equals,Dahua Memory,,,,硬盘/存储介质,硬盘/存储介质,Dahua Memory → 硬盘/存储介质
+81,First Level Product Category,equals,Storage,Second Level Product Category,equals,IP Storage,EVS,EVS,Storage / IP Storage → EVS
+
+90,First Level Product Category,equals,Security Inspection Equipment,,,,安检机,安检机,安检设备 → 安检机
+100,First Level Product Category,equals,Interactive Whiteboard,,,,电子白板,电子白板,电子白板 → 电子白板
+
+110,First Level Product Category,equals,Traffic,,,,交通,交通/停车场,所有 Traffic 相关 → 交通（价目使用 交通/停车场）
+
+120,First Level Product Category,equals,Mobile,Series,equals,Auto Camera,车载前端,车载,Mobile / Auto Camera → 车载前端
+121,First Level Product Category,equals,Mobile,Series,equals,Consumer Auto Products,车载前端,车载,Mobile / Consumer Auto Products（行车记录仪等）→ 车载前端
+122,First Level Product Category,equals,Mobile,Series,equals,Auto Terminal,车载后端,车载,Mobile / Auto Terminal（MNVR4104-GFWI 等移动 NVR）→ 车载后端
+123,First Level Product Category,equals,Mobile,Series,equals,Other Series,车载前端,车载,Mobile / Other Series 默认视为前端（如 MPTZ 移动 PTZ）
+124,First Level Product Category,equals,Mobile,,,,车载前端,车载,兜底：Mobile 未命中细规则时按车载前端
+
+130,First Level Product Category,equals,Intelligent Computing,,,,IVSS,IVSS,Intelligent Computing 全部是 IVSS 系列 → IVSS
+
+140,First Level Product Category,equals,Smart Electricity,,,,充电桩,充电桩,Smart Electricity（当前只有 Smart Lighting ICS1-W2），临时归为充电桩规则（可后续单独拆）
+
+150,First Level Product Category,equals,Software,,,,软件,软件,所有 Software → 软件（DSS 等）
+
+160,First Level Product Category,equals,Fire Alarm,Second Level Product Category,equals,Residential Products,烟感,烟感,Fire Alarm / Residential Products（独立烟感）→ 烟感
+161,First Level Product Category,equals,Fire Alarm,Second Level Product Category,equals,Fire Network Camera,IPC,IPC,Fire Alarm / Fire Network Camera → IPC（消防网络摄像机）
+
+170,First Level Product Category,equals,Control,Second Level Product Category,equals,Keyboard,键盘/解码器,键盘/解码器,Control / Keyboard → 键盘/解码器
+171,First Level Product Category,equals,Control,Second Level Product Category,equals,Decoder,键盘/解码器,键盘/解码器,Control / Decoder → 键盘/解码器
+172,First Level Product Category,equals,Control,Second Level Product Category,equals,AVoIP,键盘/解码器,键盘/解码器,AVoIP 编解码/控制器 → 键盘/解码器
+173,First Level Product Category,equals,Control,Second Level Product Category,equals,Matrix,键盘/解码器,键盘/解码器,Matrix / DSCON / DSMS → 键盘/解码器
+174,First Level Product Category,equals,Control,Second Level Product Category,equals,Project Accessories,ACCESSORY,ACCESSORY,Control / Project Accessories → ACCESSORY
+175,First Level Product Category,equals,Control,Second Level Product Category,equals,others,ACCESSORY线缆,ACCESSORY线缆,Control / others（HDMI 线等）→ ACCESSORY 线缆
+
+180,First Level Product Category,equals,Traffic,Second Level Product Category,equals,Traffic Accessory,ACCESSORY,ACCESSORY,Traffic / Accessory → ACCESSORY（交通配件）
+181,First Level Product Category,equals,Traffic,Second Level Product Category,equals,Parking Products,交通,交通/停车场,Traffic / Parking → 交通
+182,First Level Product Category,equals,Traffic,Second Level Product Category,equals,Entrance&Exit Control Products,交通,交通/停车场,Traffic / Entrance&Exit → 交通
+183,First Level Product Category,equals,Traffic,Second Level Product Category,equals,Traffic Enforcement Products,交通,交通/停车场,Traffic Enforcement → 交通
+
+190,First Level Product Category,equals,Kits,Second Level Product Category,equals,IP Kits,IPC,IPC,IP Kits 视为网络摄像机套装 → IPC
+191,First Level Product Category,equals,Kits,Second Level Product Category,equals,HDCVI Kits,XVR,XVR,HDCVI Kits 视为 XVR 套装 → XVR
+
+200,First Level Product Category,equals,Account,Series,equals,Monitor,监视器,监视器,Account / Monitor → 监视器
+201,First Level Product Category,equals,Account,Series,equals,IOT Camera,IPC,IPC,Account / IOT Camera → IPC
+202,First Level Product Category,equals,Account,Series,equals,IP Camera for Distributors,IPC,IPC,Account / IP Camera for Distributors → IPC
+203,First Level Product Category,equals,Account,Series,equals,IP Camera for Industries,IPC,IPC,Account / IP Camera for Industries → IPC
+204,First Level Product Category,equals,Account,Series,contains,HAC,HAC,HAC,Account / HAC-* Series → HAC
+205,First Level Product Category,equals,Account,Series,equals,Access Control,ACCESS CONTROL,ACCESS CONTROL,Account / Access Control → ACCESS CONTROL
+206,First Level Product Category,equals,Account,Series,equals,Auto Camera,车载前端,车载,Account / Auto Camera → 车载前端
+207,First Level Product Category,equals,Account,,,,IPC,IPC,其他 Account 行默认走 IPC 规则
+
+210,First Level Product Category,equals,others,Series,equals,Monitor,监视器,监视器,others / Monitor → 监视器
+211,First Level Product Category,equals,others,Series,equals,Mobile Portable Terminal,交通,交通/停车场,others / Mobile Portable Terminal → 按交通类处理
+212,First Level Product Category,equals,others,,,,ACCESSORY,ACCESSORY,兜底：others 其他全部按 ACCESSORY 处理
+
+220,First Level Product Category,equals,Intelligent EV Charging,,,,充电桩,充电桩,Intelligent EV Charging → 充电桩（充电桩专用）
+
+230,First Level Product Category,equals,Network Cameras,Second Level Product Category,equals,WizMind Series,IPC,IPC,WizMind 系列仍走 IPC（高端 IPC）
+231,First Level Product Category,equals,Network Cameras,Second Level Product Category,equals,WizSense Series,IPC,IPC,WizSense 系列仍走 IPC
+232,First Level Product Category,equals,Network Cameras,Second Level Product Category,equals,Lite Series,IPC,IPC,Lite 系列仍走 IPC
+
+300,First Level Product Category,equals,Account,Second Level Product Category,equals,GDV,IPC,IPC,保留给特定大客户，默认按 IPC 规则
+301,First Level Product Category,equals,Account,Second Level Product Category,equals,SmartSD B.V,IPC,IPC,
+302,First Level Product Category,equals,Account,Second Level Product Category,equals,By Demes, IPC,IPC,
+303,First Level Product Category,equals,Account,Second Level Product Category,equals,CCF,IPC,IPC,
+304,First Level Product Category,equals,Account,Second Level Product Category,equals,ITESA,IPC,IPC,
+305,First Level Product Category,equals,Account,Second Level Product Category,equals,ONYX VISION,IPC,IPC,
+306,First Level Product Category,equals,Account,Second Level Product Category,equals,TEVAH SYSTEMS,IPC,IPC,
+307,First Level Product Category,equals,Account,Second Level Product Category,equals,VEDITEC,IPC,IPC,
+
+400,First Level Product Category,equals,others,,,,IPC,IPC,最终兜底：仍未命中的 others 行按 IPC 处理
+401,First Level Product Category,equals,Network Cameras,,,,IPC,IPC,最终兜底：Network Cameras 仍按 IPC
+402,First Level Product Category,equals,Mobile,,,,车载前端,车载,最终兜底：Mobile 行按车载前端

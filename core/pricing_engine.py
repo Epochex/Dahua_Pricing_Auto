@@ -1,24 +1,256 @@
-"""计算 FOB / DDP A / 各级渠道价
-- 暴露 compute_prices(pn, classification, data) -> dict
-"""
-from typing import Dict
+import math
+from typing import Dict, Optional, Set, Tuple
+
+import pandas as pd
+
+from .classifier import detect_series, classify_category_and_price_group
 from .pricing_rules import DDP_RULES, PRICE_RULES
 
 
-def compute_prices(pn: str, classification: Dict, data: Dict) -> Dict:
-    """占位计算：返回带有计算字段的 dict。
-    真实实现会使用 loader 提供的源表并依据 pricing_rules 执行层级计算。
+PRICE_COLS = [
+    "FOB C(EUR)",
+    "DDP A(EUR)",
+    "Suggested Reseller(EUR)",
+    "Gold(EUR)",
+    "Silver(EUR)",
+    "Ivory(EUR)",
+    "MSRP(EUR)",
+]
+
+
+def _to_float(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+        f = float(v)
+        if math.isnan(f):
+            return None
+        return f
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compute_ddp_a_from_fob(fob: Optional[float], category: str) -> Optional[float]:
+    if fob is None or fob <= 0:
+        return None
+    rule = DDP_RULES.get(category)
+    if not rule:
+        return None
+    ddp = fob
+    for pct in rule:
+        ddp *= (1 + pct)
+    return ddp
+
+
+def pick_price_rule(price_group: str, series_key: str) -> Optional[Dict]:
     """
-    base = 100.0  # placeholder base price
-    margin = DDP_RULES.get('default_margin', 0.15)
-    fob = round(base * (1 - margin), PRICE_RULES.get('rounding', 2))
-    ddp_a = round(base * (1 + 0.05), PRICE_RULES.get('rounding', 2))
+    根据 price_group (大类) + series_key 在 PRICE_RULES 中选择一条规则。
+    """
+    cat_rule = PRICE_RULES.get(price_group)
+    if not cat_rule:
+        return None
+
+    s_key_up = series_key.strip().upper()
+    if s_key_up:
+        # 先尝试精确匹配（不区分大小写）
+        for k, v in cat_rule.items():
+            if k == "_default_":
+                continue
+            if k.upper() == s_key_up:
+                return v
+        # 再尝试包含匹配
+        for k, v in cat_rule.items():
+            if k == "_default_":
+                continue
+            if k.upper() in s_key_up or s_key_up in k.upper():
+                return v
+
+    return cat_rule.get("_default_")
+
+
+def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float]]:
+    """
+    ddp_a → 各渠道价（reseller / gold / silver / ivory(installer) / msrp）
+    """
+    if ddp_a is None or rule is None:
+        return {}
+
+    def from_ddp(p):
+        if p is None:
+            return None
+        return ddp_a / (1 - p)
+
+    reseller = from_ddp(rule.get("reseller"))
+    gold = from_ddp(rule.get("gold"))
+    silver = from_ddp(rule.get("silver"))
+    ivory = from_ddp(rule.get("ivory"))
+    msrp_pct = rule.get("msrp_on_installer")
+
+    if ivory is not None and msrp_pct is not None:
+        msrp = ivory / (1 - msrp_pct)
+    else:
+        msrp = None
+
+    # 有的品类 reseller 没有单独折扣，直接用 DDP A
+    if reseller is None:
+        reseller = ddp_a
+
     return {
-        'pn': pn,
-        'classification': classification,
-        'prices': {
-            'base': base,
-            'fob': fob,
-            'ddp_a': ddp_a,
+        "DDP A(EUR)": round(ddp_a, 2),
+        "Suggested Reseller(EUR)": round(reseller, 2) if reseller is not None else None,
+        "Gold(EUR)": round(gold, 2) if gold is not None else None,
+        "Silver(EUR)": round(silver, 2) if silver is not None else None,
+        "Ivory(EUR)": round(ivory, 2) if ivory is not None else None,
+        "MSRP(EUR)": round(msrp, 2) if msrp is not None else None,
+    }
+
+
+def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
+    if fr_row is None:
+        return False
+    for col in PRICE_COLS:
+        if col not in fr_row or _to_float(fr_row[col]) is None:
+            return False
+    return True
+
+
+def _choose_sys_base_price(sales_type: str, sys_row: pd.Series) -> Optional[float]:
+    """根据 Sales Type 选择 Sys 的 Min / Area Price"""
+    sales_up = (sales_type or "").strip().upper()
+    min_price = _to_float(sys_row.get("Min Price"))
+    area_price = _to_float(sys_row.get("Area Price"))
+
+    if sales_up in {"SMB", "DISTRIBUTION"}:
+        return min_price
+    if sales_up == "PROJECT":
+        return area_price
+
+    # 不识别的类型默认用 Min Price
+    return min_price or area_price
+
+
+def build_original_values(fr_row: Optional[pd.Series]) -> Dict[str, object]:
+    """
+    从 France 行构造基础输出字段（不含计算标记）。
+    即便后面要计算，也是在这个 dict 上覆盖。
+    """
+    data: Dict[str, object] = {}
+    if fr_row is not None:
+        data["Part No."] = fr_row.get("Part No.")
+        data["Series"] = fr_row.get("Series") or fr_row.get("系列")
+        data["External Model"] = fr_row.get("External Model")
+        data["Internal Model"] = fr_row.get("Internal Model")
+        data["Sales Status"] = fr_row.get("Sales Status")
+        data["Description"] = fr_row.get("Description")
+
+        for col in PRICE_COLS:
+            data[col] = fr_row.get(col)
+    else:
+        # 没有 France 行时，用占位
+        data["Part No."] = None
+        data["Series"] = None
+        data["External Model"] = None
+        data["Internal Model"] = None
+        data["Sales Status"] = None
+        data["Description"] = None
+        for col in PRICE_COLS:
+            data[col] = None
+    return data
+
+
+def compute_prices_for_part(
+    part_no: str,
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+    france_map: pd.DataFrame,
+    sys_map: pd.DataFrame,
+) -> Dict:
+    """
+    核心：给定 PN 对应的 France 行 / Sys 行，输出：
+      - final_values: 各字段最终值
+      - calculated_fields: 被计算补全的字段名集合
+      - category: 产品线（DDP_RULES 的 key）
+      - price_group: 价格组（PRICE_RULES 顶层 key）
+      - series_display: 展示用 series
+      - auto_success: 是否完成了自动识别（否则就当纯 Excel 输出）
+    """
+    # 1) 产品线 & 价格组
+    category, price_group = classify_category_and_price_group(
+        france_row, sys_row, france_map, sys_map
+    )
+    if not price_group:
+        price_group = category
+
+    # 2) Series（展示 + 给 PRICE_RULES 选子规则用）
+    series_display, series_key = detect_series(france_row, sys_row, price_group)
+
+    # 3) 原始值（默认全部来自 France）
+    final_values = build_original_values(france_row)
+    calculated_fields: Set[str] = set()
+
+    # 4) 如果 France 所有价格都齐全 → 完全不做任何计算，直接返回
+    if _all_prices_present(france_row):
+        return {
+            "final_values": final_values,
+            "calculated_fields": calculated_fields,
+            "category": category,
+            "price_group": price_group,
+            "series_display": series_display,
+            "auto_success": True,  # 识别到了产品线
+            "used_sys": False,
         }
+
+    # 5) 需要做补全：先找 FOB
+    fob = _to_float(final_values.get("FOB C(EUR)"))
+
+    used_sys = False
+    if fob is None or fob <= 0:
+        # France 没给 FOB，尝试用 Sys + Sales Type 算 FOB
+        if sys_row is not None:
+            sales_type = ""
+            if france_row is not None and "Sales Type" in france_row:
+                sales_type = str(france_row.get("Sales Type") or "")
+            base_price = _choose_sys_base_price(sales_type, sys_row)
+            if base_price is not None and base_price > 0:
+                fob = base_price * 0.9
+                final_values["FOB C(EUR)"] = round(fob, 2)
+                calculated_fields.add("FOB C(EUR)")
+                used_sys = True
+
+    # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
+    ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
+    if ddp_existing is not None and ddp_existing > 0:
+        ddp_a = ddp_existing
+    else:
+        ddp_a = compute_ddp_a_from_fob(fob, category)
+        if ddp_a is not None:
+            final_values["DDP A(EUR)"] = round(ddp_a, 2)
+            calculated_fields.add("DDP A(EUR)")
+
+    # 7) 渠道价：如果某列缺失且有 DDP + 价格组规则，就计算补全
+    if ddp_a is not None:
+        price_rule = pick_price_rule(price_group, series_key)
+        if price_rule is not None:
+            channel_prices = compute_channel_prices(ddp_a, price_rule)
+            for col in PRICE_COLS:
+                if col == "FOB C(EUR)":
+                    continue  # FOB 不在 channel_prices 里
+                if _to_float(final_values.get(col)) is None and col in channel_prices:
+                    final_values[col] = channel_prices[col]
+                    calculated_fields.add(col)
+
+    auto_success = category is not None and category != "UNKNOWN"
+
+    return {
+        "final_values": final_values,
+        "calculated_fields": calculated_fields,
+        "category": category,
+        "price_group": price_group,
+        "series_display": series_display,
+        "auto_success": auto_success,
+        "used_sys": used_sys,
     }
