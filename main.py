@@ -61,7 +61,7 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
                 "Reseller S": reseller,
                 "SI-S": gold,     # Gold
                 "SI-A": silver,   # Silver
-                "SI-B": ivory,    # 这里按你的描述，直接用 Ivory
+                "SI-B": ivory,    # Ivory
                 "MSTP": ivory,    # MSTP = Ivory
                 "MSRP": msrp,
             }
@@ -96,6 +96,7 @@ def run_batch(
     批量模式：
       - 读取根目录 List_PN.txt，每行一个 PN
       - 对每个 PN 计算价格
+      - 在控制台打印每个 PN 的表格结果（含 Original/Calculated 标记）
       - 导出 Country / Country&Customer 模板
     """
     list_path = get_file_in_base("List_PN.txt")
@@ -114,7 +115,7 @@ def run_batch(
 
     results_for_export: List[Dict] = []
 
-    for pn in pns:
+    for idx, pn in enumerate(pns, start=1):
         key = pn.strip().lower()
         fr_row = None
         sys_row = None
@@ -133,6 +134,14 @@ def run_batch(
 
         result = compute_prices_for_part(pn, fr_row, sys_row, france_map, sys_map)
         fv = result["final_values"]
+
+        # 控制台输出当前 PN 的表格，复用单条查询的展示逻辑
+        print("=" * 80)
+        print(f"[Batch {idx}/{len(pns)}] PN = {pn}")
+        print(build_status_line(result))
+        print()
+        print(render_table(fv, result["calculated_fields"]))
+        print()
 
         # 简单检查：至少有 DDP A，否则基本没法上传
         if fv.get("DDP A(EUR)") is None:
