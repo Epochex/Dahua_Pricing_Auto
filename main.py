@@ -20,20 +20,139 @@ from core.pricing_engine import compute_prices_for_part
 from core.formatter import render_table, build_status_line
 
 
-def _prepare_index(df: pd.DataFrame, col_name: str, key_col: str = "_pn_key") -> pd.DataFrame:
+# =========================
+# PN 标准化工具
+# =========================
+
+def normalize_pn_raw(raw) -> str:
     """
-    给 DataFrame 增加一个标准化的 PN key 列，便于查找。
-    col_name: 原表中的 PN 列名，例如 "Part No." 或 "Part Num"
+    原样标准化：
+    - 转字符串
+    - strip 去空格
+    - lower 小写
+    不做任何截断，用于“完全匹配”。
+    """
+    if raw is None:
+        return ""
+    return str(raw).strip().lower()
+
+
+def normalize_pn_base(raw) -> str:
+    """
+    “前缀 key” 标准化，用于兜底匹配。
+
+    需求：1.0.01.01.16317-9002 == 1.0.01.01.16317
+
+    规则：
+    1) 先做 normalize_pn_raw 得到 s
+    2) 若 s 中包含 '-'，拆成 base-suffix：
+       - 如果 base 只由 [0-9 .] 组成，且包含至少一个 '.'，
+         认为是 Dahua 内部编码：返回 base 作为前缀 key
+       - 否则不截断，直接返回 s
+    3) 没有 '-' 就直接返回 s
+    """
+    s = normalize_pn_raw(raw)
+    if not s:
+        return ""
+
+    base, sep, suffix = s.partition("-")
+    if sep and base and suffix:
+        base_compact = base.replace(" ", "")
+        # 限定：只在“点分数字”风格编码上去掉后缀，避免误伤其他真带“-”的料号
+        if base_compact and all((c.isdigit() or c == ".") for c in base_compact) and "." in base_compact:
+            return base
+
+    return s
+
+
+def _prepare_index(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+    """
+    给 DataFrame 增加两个 key：
+    - _pn_key_raw  : 用于完全匹配
+    - _pn_key_base : 用于前缀兜底匹配
     """
     df = df.copy()
-    df[key_col] = (
-        df[col_name]
-        .astype(str)
-        .str.strip()
-        .str.lower()
-    )
+    df["_pn_key_raw"] = df[col_name].apply(normalize_pn_raw)
+    df["_pn_key_base"] = df[col_name].apply(normalize_pn_base)
     return df
 
+
+# =========================
+# 匹配工具
+# =========================
+
+def _mode_label(mode: str) -> str:
+    """
+    把内部匹配模式翻译成可读中文。
+    """
+    if mode == "exact_raw":
+        return "精确匹配"
+    if mode == "fallback_suffix_to_base":
+        return "输入带后缀，回退到无后缀基础料号"
+    if mode == "fallback_base_to_suffix":
+        return "输入无后缀，回退到带后缀国际料号"
+    return "未匹配"
+
+
+def _find_row_with_fallback(
+    df: pd.DataFrame,
+    key_raw: str,
+    key_base: str,
+    pn_col_name: str,
+):
+    """
+    在 df 中按“精确 → 兜底”的顺序找一行，且区分输入是否带后缀。
+
+    返回 (row_or_None, match_mode, matched_pn_str)
+
+    情况 1：输入不带后缀，例如 1.0.01.19.10564
+      1) 先按 _pn_key_raw == key_raw 精确匹配
+      2) 若找不到，再按 _pn_key_base == key_base 匹配
+         （可以匹配到 1.0.01.19.10564-9001 这类带国际后缀的行）
+
+    情况 2：输入带后缀，例如 1.0.01.19.10564-9001
+      1) 先按 _pn_key_raw == key_raw 精确匹配
+      2) 若找不到，再按 _pn_key_raw == key_base 匹配
+         （即只兜底到“不带后缀”的基础料号 1.0.01.19.10564）
+    """
+    if not key_raw and not key_base:
+        return None, "none", None
+
+    # 先尝试精确匹配
+    if key_raw:
+        m = df[df["_pn_key_raw"] == key_raw]
+        if not m.empty:
+            row = m.iloc[0]
+            matched_pn = row.get(pn_col_name)
+            return row, "exact_raw", matched_pn
+
+    if not key_base:
+        return None, "none", None
+
+    # 判断“输入是否带有可截断的后缀”
+    has_suffix = ("-" in key_raw) and (key_base != key_raw)
+
+    if has_suffix:
+        # 输入带后缀：兜底只找“没有后缀”的那一行（raw == base）
+        m = df[df["_pn_key_raw"] == key_base]
+        if not m.empty:
+            row = m.iloc[0]
+            matched_pn = row.get(pn_col_name)
+            return row, "fallback_suffix_to_base", matched_pn
+    else:
+        # 输入不带后缀：兜底找任意 base 相同的行（可以是带后缀的国际料号）
+        m = df[df["_pn_key_base"] == key_base]
+        if not m.empty:
+            row = m.iloc[0]
+            matched_pn = row.get(pn_col_name)
+            return row, "fallback_base_to_suffix", matched_pn
+
+    return None, "none", None
+
+
+# =========================
+# 导出 DataFrame 构造
+# =========================
 
 def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
     """
@@ -61,7 +180,6 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
                 "Reseller S": reseller,
                 "SI-S": gold,     # Gold
                 "SI-A": silver,   # Silver
-                "SI-B": ivory,    # Ivory
                 "MSTP": ivory,    # MSTP = Ivory
                 "MSRP": msrp,
             }
@@ -77,7 +195,7 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
                 "SI-S": si_s,     # Diamond (同 Gold)
                 "SI-A": si_a,     # Gold
                 "SI-B": silver,   # Silver
-                "STP": ivory,     # Ivory
+                "MSTP": ivory,     # Ivory
                 "MSRP": msrp,
             }
 
@@ -85,6 +203,10 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
 
     return pd.DataFrame(data)
 
+
+# =========================
+# 批量模式
+# =========================
 
 def run_batch(
     france_df: pd.DataFrame,
@@ -98,6 +220,7 @@ def run_batch(
       - 对每个 PN 计算价格
       - 在控制台打印每个 PN 的表格结果（含 Original/Calculated 标记）
       - 导出 Country / Country&Customer 模板
+      - 所有 PN 处理完后，再一次性汇总输出“找不到的 PN 列表”
     """
     list_path = get_file_in_base("List_PN.txt")
     if not os.path.exists(list_path):
@@ -114,30 +237,40 @@ def run_batch(
     print(f"\n检测到批量模式，共 {len(pns)} 个 PN，将依次计算价格...\n")
 
     results_for_export: List[Dict] = []
+    not_found: List[str] = []
 
     for idx, pn in enumerate(pns, start=1):
-        key = pn.strip().lower()
-        fr_row = None
-        sys_row = None
+        key_raw = normalize_pn_raw(pn)
+        key_base = normalize_pn_base(pn)
 
-        fr_matches = france_df[france_df["_pn_key"] == key]
-        if not fr_matches.empty:
-            fr_row = fr_matches.iloc[0]
-
-        sys_matches = sys_df[sys_df["_pn_key"] == key]
-        if not sys_matches.empty:
-            sys_row = sys_matches.iloc[0]
+        fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+            france_df, key_raw, key_base, "Part No."
+        )
+        sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+            sys_df, key_raw, key_base, "Part Num"
+        )
 
         if fr_row is None and sys_row is None:
-            print(f"[Skip] PN={pn} 在 France / Sys 中均未找到，跳过。")
+            # 暂时只记录，等所有 PN 处理完再统一输出
+            not_found.append(pn)
             continue
 
-        result = compute_prices_for_part(pn, fr_row, sys_row, france_map, sys_map)
-        fv = result["final_values"]
-
-        # 控制台输出当前 PN 的表格，复用单条查询的展示逻辑
+        # ===== 匹配信息提示 =====
         print("=" * 80)
         print(f"[Batch {idx}/{len(pns)}] PN = {pn}")
+        print(
+            f"[Match] France: {fr_matched if fr_matched is not None else '未命中'} "
+            f"({ _mode_label(fr_mode) }) | "
+            f"Sys: {sys_matched if sys_matched is not None else '未命中'} "
+            f"({ _mode_label(sys_mode) })"
+        )
+
+        result = compute_prices_for_part(pn, fr_row, sys_row, france_map, sys_map)
+
+        # 报价维度一律使用“输入的 PN”，而不是底层匹配到的 France/Sys PN
+        fv = result["final_values"]
+        fv["Part No."] = pn
+
         print(build_status_line(result))
         print()
         print(render_table(fv, result["calculated_fields"]))
@@ -149,8 +282,14 @@ def run_batch(
 
         results_for_export.append(fv)
 
+    # 先输出“完全找不到”的 PN 汇总信息
+    if not_found:
+        print("\n以下 PN 在 France / Sys 中均未找到（已跳过）：")
+        for pn in not_found:
+            print(f"[Skip] PN={pn} 在 France / Sys 中均未找到，跳过。")
+
     if not results_for_export:
-        print("❌ 没有任何 PN 计算成功，批量处理结束。")
+        print("\n❌ 没有任何 PN 计算成功，批量处理结束。")
         return
 
     # 选择导出模板层级
@@ -177,6 +316,10 @@ def run_batch(
     print(f"\n✅ 导出完成：{out_path}\n")
 
 
+# =========================
+# 交互主循环
+# =========================
+
 def main() -> None:
     print("=" * 80)
     print(APP_TITLE)
@@ -202,7 +345,7 @@ def main() -> None:
     france_map = load_france_mapping()
     sys_map = load_sys_mapping()
 
-    # 标准化 PN 索引
+    # 标准化 PN 索引：同时生成 raw/base 两套 key
     france_df = _prepare_index(france_df, "Part No.")
     sys_df = _prepare_index(sys_df, "Part Num")
 
@@ -218,24 +361,31 @@ def main() -> None:
             print("程序已退出，Merci Auvoir！")
             break
 
-        key = part_no.strip().lower()
+        key_raw = normalize_pn_raw(part_no)
+        key_base = normalize_pn_base(part_no)
 
-        # 在 France / Sys 表中查 PN
-        fr_row = None
-        fr_matches = france_df[france_df["_pn_key"] == key]
-        if not fr_matches.empty:
-            fr_row = fr_matches.iloc[0]
-
-        sys_row = None
-        sys_matches = sys_df[sys_df["_pn_key"] == key]
-        if not sys_matches.empty:
-            sys_row = sys_matches.iloc[0]
+        fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+            france_df, key_raw, key_base, "Part No."
+        )
+        sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+            sys_df, key_raw, key_base, "Part Num"
+        )
 
         if fr_row is None and sys_row is None:
             print("❌ France / Sys 中均未找到该 PN，请确认 PN 是否正确或联系 PM 新增。")
             continue
 
+        print(
+            f"[Match] France: {fr_matched if fr_matched is not None else '未命中'} "
+            f"({ _mode_label(fr_mode) }) | "
+            f"Sys: {sys_matched if sys_matched is not None else '未命中'} "
+            f"({ _mode_label(sys_mode) })"
+        )
+
         result = compute_prices_for_part(part_no, fr_row, sys_row, france_map, sys_map)
+
+        # 同样在单条查询里覆盖 Part No. 为“输入的 PN”
+        result["final_values"]["Part No."] = part_no
 
         print("\n查询结果如下：")
         print(build_status_line(result))
