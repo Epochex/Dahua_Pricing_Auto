@@ -27,14 +27,20 @@ def _normalize_field_name(f) -> str:
 def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[str]]:
     """
     通用映射逻辑：
-      - 逐行按 priority 顺序匹配
+      - 按 priority 从小到大匹配
       - 支持 equals / contains 两种模式
       - 返回 (category, price_group_hint)
     """
     if mapping is None or mapping.empty:
         return "UNKNOWN", None
 
-    for _, rule in mapping.iterrows():
+    # 显式按 priority 排序，保证优先级语义
+    if "priority" in mapping.columns:
+        iter_rules = mapping.sort_values("priority", ascending=True).iterrows()
+    else:
+        iter_rules = mapping.iterrows()
+
+    for _, rule in iter_rules:
         field1 = _normalize_field_name(rule.get("field1"))
         if not field1:
             continue
@@ -181,16 +187,39 @@ def classify_category_and_price_group(
     """
     综合 France + Sys 两侧信息确定 category & price_group_hint。
     优先使用 France 映射，失败再用 Sys，最后兜底 IPC。
+
+    额外规则：
+      - Sys 表中若 Catelog Name 显示 Accessories / Accessory，
+        则优先按 ACCESSORY / ACCESSORY线缆 处理，避免被 First Product Line=IPC 误判。
     """
+    # 1) France 优先
     if france_row is not None:
         cat, grp = apply_mapping(france_row, france_map)
         if cat != "UNKNOWN":
             return cat, grp or cat
 
+    # 2) Sys 信息
     if sys_row is not None:
         cat, grp = apply_mapping(sys_row, sys_map)
+
+        # —— Accessories 特例处理 —— #
+        catelog = safe_upper(sys_row.get("Catelog Name"))
+        second_pl = safe_upper(sys_row.get("Second Product Line"))
+
+        if "ACCESSORIES" in catelog or "ACCESSORY" in catelog:
+            # 原本识别为 UNKNOWN 或 IPC 时，强制纠正为配件类
+            if cat in {"UNKNOWN", "IPC"}:
+                # 粗分：含 Cabling / Cable / 线缆 / Wire → 走 ACCESSORY线缆 规则
+                if any(x in second_pl for x in ["CABLING", "CABLE", "线缆", "WIRE"]):
+                    cat = "ACCESSORY线缆"
+                    # 顶层 price_group 仍然走 ACCESSORY 这棵树
+                    grp = "ACCESSORY"
+                else:
+                    cat = "ACCESSORY"
+                    grp = "ACCESSORY"
+
         if cat != "UNKNOWN":
             return cat, grp or cat
 
-    # 最终兜底：按 IPC 处理
-    return "IPC", "IPC"
+    # 3) 最终兜底：按 IPC 处理（例如完全识别失败时）
+    return "UNKNOWN", None
