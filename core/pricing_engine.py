@@ -156,7 +156,7 @@ def _choose_sys_base_price(part_no: str, sales_type: str, sys_row: pd.Series) ->
         print(f"  Min Price      = {min_price if min_price is not None else 'N/A'}")
         print(f"  Area Price     = {area_price if area_price is not None else 'N/A'}")
         print(f"  Standard Price = {std_price if std_price is not None else 'N/A'}")
-        choice = input("请选择 Sys 价格基准 (1=Min | FOB L, 2=Area | FOB N, 3=Standard | FOB S, q=跳过本 PN)：").strip().lower()
+        choice = input("请选择 Sys 价格基准 (1 = Min|FOB L, 2 = Area|FOB N, 3 = Standard|FOB S, q=跳过本 PN)：").strip().lower()
 
         if choice == "1":
             return min_price
