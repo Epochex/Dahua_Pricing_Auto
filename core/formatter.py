@@ -1,5 +1,6 @@
 import math
 from typing import Dict, Iterable, Set
+from decimal import Decimal, ROUND_HALF_UP
 
 from tabulate import tabulate
 
@@ -43,6 +44,23 @@ PRICE_COLS = {
 }
 
 
+def round_price_number(num: float) -> float:
+    """
+    统一的价格取整规则（导出 & 控制台都用这一套）：
+
+    - num < 30  → 四舍五入到 1 位小数
+    - num >= 30 → 四舍五入到整数
+
+    使用 Decimal + ROUND_HALF_UP，行为与 Excel 四舍五入一致。
+    """
+    d = Decimal(str(num))
+    if num < 30:
+        q = d.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    else:
+        q = d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(q)
+
+
 def _format_value(v):
     if v is None:
         return "Value Not Found"
@@ -62,9 +80,9 @@ def render_table(
     把结果 dict 渲染成表格。
 
     规则：
-    - 只对“Calculated”的价格做格式处理：
-        * 数值 < 10  → 保留 1 位小数
-        * 数值 >=10 → 向上取整成整数（无小数）
+    - 只对“Calculated”的价格做数值格式：
+        * 数值 < 30  → 四舍五入到 1 位小数
+        * 数值 >=30 → 四舍五入到整数
     - Original 的价格保持原值（不改小数位），只追加标记。
     """
     calc_set: Set[str] = set(calculated_fields)
@@ -85,12 +103,13 @@ def render_table(
                 if math.isnan(num):
                     raw = None
                 else:
-                    if num < 10:
-                        # <10：保留 1 位小数（正常四舍五入）
-                        raw = f"{num:.1f}"
+                    num2 = round_price_number(num)
+                    if num2 < 30:
+                        # <30：保留 1 位小数
+                        raw = f"{num2:.1f}"
                     else:
-                        # >=10：向上取整成整数
-                        raw = str(math.ceil(num))
+                        # >=30：显示为整数
+                        raw = str(int(num2))
             except (TypeError, ValueError):
                 # 不是数值就保持原样
                 pass

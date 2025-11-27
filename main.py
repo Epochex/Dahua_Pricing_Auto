@@ -2,6 +2,7 @@ import sys
 from typing import List, Dict
 
 import os
+import math
 import pandas as pd
 
 from config import (
@@ -17,7 +18,7 @@ from core.loader import (
     load_sys_mapping,
 )
 from core.pricing_engine import compute_prices_for_part
-from core.formatter import render_table, build_status_line
+from core.formatter import render_table, build_status_line, round_price_number
 
 
 # =========================
@@ -156,20 +157,51 @@ def _find_row_with_fallback(
 
 def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
     """
-    rows: 每个元素是 compute_prices_for_part 的 result["final_values"]。
+    rows: 每个元素形如
+        {
+            "final_values": {...},
+            "calculated_fields": set([...]),
+        }
     level: "1" -> Country; "2" -> Country&Customer
+
+    导出时对“Calculated 的价格列”应用与控制台一致的取整规则：
+      - < 30 → 四舍五入到 1 位小数
+      - ≥ 30 → 四舍五入到整数
+    Original 列保持原始数值。
     """
     data = []
 
-    for fv in rows:
+    for item in rows:
+        fv = item.get("final_values", {}) or {}
+        calc_set = set(item.get("calculated_fields") or [])
+
+        def fmt(col_name: str):
+            """
+            导出单元格用的数值：
+              - 如果 col_name 在 calculated_fields 里 → 做数值取整
+              - 否则直接返回原始值（保持原始小数位）
+            """
+            raw = fv.get(col_name)
+            if col_name not in calc_set:
+                return raw
+
+            # 只对 Calculated 列做统一取整
+            try:
+                num = float(raw)
+                if math.isnan(num):
+                    return None
+                return round_price_number(num)
+            except (TypeError, ValueError):
+                return raw
+
         pn = fv.get("Part No.")
-        fob = fv.get("FOB C(EUR)")
-        ddp = fv.get("DDP A(EUR)")
-        reseller = fv.get("Suggested Reseller(EUR)")
-        gold = fv.get("Gold(EUR)")
-        silver = fv.get("Silver(EUR)")
-        ivory = fv.get("Ivory(EUR)")
-        msrp = fv.get("MSRP(EUR)")
+        fob = fmt("FOB C(EUR)")
+        ddp = fmt("DDP A(EUR)")
+        reseller = fmt("Suggested Reseller(EUR)")
+        gold = fmt("Gold(EUR)")
+        silver = fmt("Silver(EUR)")
+        ivory = fmt("Ivory(EUR)")
+        msrp = fmt("MSRP(EUR)")
 
         if level == "1":
             # Country 模板
@@ -195,7 +227,7 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
                 "SI-S": si_s,     # Diamond (同 Gold)
                 "SI-A": si_a,     # Gold
                 "SI-B": silver,   # Silver
-                "MSTP": ivory,     # Ivory
+                "MSTP": ivory,    # Ivory
                 "MSRP": msrp,
             }
 
@@ -236,6 +268,7 @@ def run_batch(
 
     print(f"\n检测到批量模式，共 {len(pns)} 个 PN，将依次计算价格...\n")
 
+    # 每个元素：{"final_values": {...}, "calculated_fields": set([...])}
     results_for_export: List[Dict] = []
     not_found: List[str] = []
 
@@ -280,7 +313,12 @@ def run_batch(
         if fv.get("DDP A(EUR)") is None:
             print(f"[Warn] PN={pn} 未得到有效 DDP A 价格，仍写入导出表但需人工复核。")
 
-        results_for_export.append(fv)
+        results_for_export.append(
+            {
+                "final_values": fv,
+                "calculated_fields": set(result.get("calculated_fields") or []),
+            }
+        )
 
     # 先输出“完全找不到”的 PN 汇总信息
     if not_found:
