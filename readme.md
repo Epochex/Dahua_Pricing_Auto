@@ -55,7 +55,7 @@
 
 ## 3. 运行环境与依赖
 
-本工具基于 Python 生态构建，推荐使用 Python 3.10+（已在 Python 3.11 环境充分验证）。运行依赖主要为四类：数据处理（pandas）、Excel 读写（openpyxl / xlrd）、控制台表格渲染（tabulate）。其中 FrancePrice.xlsx 为 xlsx 格式，SysPrice.xls 为旧版 Excel 格式，因此 openpyxl 与 xlrd 缺一不可。安装方式如下：
+本工具基于 Python 生态构建，推荐使用 Python 3.10+（已在 Python 3.12 环境充分验证）。运行依赖主要为四类：数据处理（pandas）、Excel 读写（openpyxl / xlrd）、控制台表格渲染（tabulate）。其中 FrancePrice.xlsx 为 xlsx 格式，SysPrice.xls 为旧版 Excel 格式，因此 openpyxl 与 xlrd 缺一不可。安装方式如下：
 
 pip install pandas openpyxl xlrd tabulate
 

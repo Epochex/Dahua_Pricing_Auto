@@ -73,8 +73,8 @@ def _prepare_index(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
     - _pn_key_base : 用于前缀兜底匹配
     """
     df = df.copy()
-    df["_pn_key_raw"] = df[col_name].apply(normalize_pn_raw)
-    df["_pn_key_base"] = df[col_name].apply(normalize_pn_base)
+    df["_pn_key_raw"] = df[col_name].apply(normalize_pn_raw)   # 精准匹配
+    df["_pn_key_base"] = df[col_name].apply(normalize_pn_base)  # 前缀兜底
     return df
 
 
@@ -256,8 +256,20 @@ def run_batch(
     """
     list_path = get_file_in_base("List_PN.txt")
     if not os.path.exists(list_path):
-        print(f"❌ 未找到批量 PN 列表文件：{list_path}")
+        # 第一次使用：自动创建模板文件
+        with open(list_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# List_PN.txt 模板\n"
+                "# 每行一个 Part No.\n"
+                "# 示例：\n"
+                "# 1.1.02.08.14034-002\n"
+                "# 1.0.01.19.10564\n"
+                "\n"
+            )
+        print(f"❌ 未找到批量 PN 列表文件，已自动创建模板：{list_path}")
+        print("  请编辑该文件，填入每行一个 PN 后，再次进入批量模式。")
         return
+
 
     with open(list_path, "r", encoding="utf-8") as f:
         pns = [line.strip() for line in f if line.strip()]
