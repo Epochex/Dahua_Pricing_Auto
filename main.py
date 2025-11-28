@@ -1,24 +1,30 @@
+from __future__ import annotations
+
 import sys
-from typing import List, Dict
-
+import time
 import os
+from typing import TYPE_CHECKING, List, Dict
 import math
-import pandas as pd
 
-from config import (
-    APP_TITLE,
-    DATA_DATE,
-    AUTHOR_INFO,
-    get_file_in_base,
-)
-from core.loader import (
-    load_france_price,
-    load_sys_price,
-    load_france_mapping,
-    load_sys_mapping,
-)
-from core.pricing_engine import compute_prices_for_part
-from core.formatter import render_table, build_status_line, round_price_number
+from config import APP_TITLE, DATA_DATE, AUTHOR_INFO, get_file_in_base
+
+if TYPE_CHECKING:
+    import pandas as pd
+    
+# from config import (
+#     APP_TITLE,
+#     DATA_DATE,
+#     AUTHOR_INFO,
+#     get_file_in_base,
+# )
+# from core.loader import (
+#     load_france_price,
+#     load_sys_price,
+#     load_france_mapping,
+#     load_sys_mapping,
+# )
+# from core.pricing_engine import compute_prices_for_part
+# from core.formatter import render_table, build_status_line, round_price_number
 
 
 # =========================
@@ -266,7 +272,8 @@ def run_batch(
                 "# 1.0.01.19.10564\n"
                 "\n"
             )
-        print(f"❌ 未找到批量 PN 列表文件，已自动创建模板：{list_path}")
+        print(f"❌ 未找到批量 PN 列表文件\n")
+        print(f"✅ 已在当前目录创建模板文件：{list_path}")
         print("  请编辑该文件，填入每行一个 PN 后，再次进入批量模式。")
         return
 
@@ -377,27 +384,42 @@ def main() -> None:
     print(AUTHOR_INFO)
     print("=" * 80)
 
+    print("正在加载依赖库和数据，请稍候...\n", flush=True)
+
+    # 这里 import 重型库
+    import pandas as pd
+    from core.loader import (
+        load_france_price,
+        load_sys_price,
+        load_france_mapping,
+        load_sys_mapping,
+    )
+    from core.pricing_engine import compute_prices_for_part
+    from core.formatter import render_table, build_status_line, round_price_number
+
     # ===== 载入数据 =====
     try:
+        print("[1/5] 正在加载 FrancePrice.xlsx...", flush=True)
         france_df = load_france_price()
-    except FileNotFoundError:
-        print("❌ 无法找到 data/FrancePrice.xlsx，请检查 data 目录。")
-        input("按回车退出...")
-        sys.exit(1)
 
-    try:
+        print("[2/5] 正在加载 SysPrice.xls...", flush=True)
         sys_df = load_sys_price()
-    except FileNotFoundError:
-        print("❌ 无法找到 data/SysPrice.xls，请检查 data 目录。")
+
+        print("[3/5] 正在加载 Mapping 映射表...", flush=True)
+        france_map = load_france_mapping()
+        sys_map = load_sys_mapping()
+
+    except FileNotFoundError as e:
+        print(f"❌ 载入数据失败：{e}")
         input("按回车退出...")
         sys.exit(1)
 
-    france_map = load_france_mapping()
-    sys_map = load_sys_mapping()
+    print("[4/5] 国家侧和系统侧数据载入完成", flush=True)
 
     # 标准化 PN 索引：同时生成 raw/base 两套 key
     france_df = _prepare_index(france_df, "Part No.")
     sys_df = _prepare_index(sys_df, "Part Num")
+    print("[5/5] 精准索引和模糊识别索引模块加载完成\n", flush=True)
 
     while True:
         part_no = input("\n请输入 Part No.（输入 quit 退出，直接回车进入批量模式）：").strip()
@@ -443,5 +465,5 @@ def main() -> None:
         print(render_table(result["final_values"], result["calculated_fields"]))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":    
     main()

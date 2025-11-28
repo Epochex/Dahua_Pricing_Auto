@@ -148,3 +148,7 @@ Series 检测则基于 Series 字段（France/Sys 均可提供），用于选择
 
 ---
 
+## 11. 压缩打包代码
+```python
+pyinstaller --onefile --name DahuaPricingTool --add-data "data;data" --add-data "mapping;mapping" main.py
+```
