@@ -57,7 +57,7 @@ def normalize_pn_base(raw) -> str:
     return s
 
 
-def _prepare_index(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+def _prepare_index(df: "pd.DataFrame", col_name: str) -> "pd.DataFrame":
     """
     给 DataFrame 增加两个 key：
     - _pn_key_raw  : 用于完全匹配
@@ -87,7 +87,7 @@ def _mode_label(mode: str) -> str:
 
 
 def _find_row_with_fallback(
-    df: pd.DataFrame,
+    df: "pd.DataFrame",
     key_raw: str,
     key_base: str,
     pn_col_name: str,
@@ -146,7 +146,11 @@ def _find_row_with_fallback(
 # 导出 DataFrame 构造
 # =========================
 
-def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
+def build_export_df(
+    rows: List[Dict],
+    level: str,
+    round_price_number,
+) -> "pd.DataFrame":
     """
     rows: 每个元素形如
         {
@@ -160,6 +164,8 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
       - ≥ 30 → 四舍五入到整数
     Original 列保持原始数值。
     """
+    import pandas as pd  # 这里本身很轻量，只是构造 DataFrame
+
     data = []
 
     for item in rows:
@@ -167,16 +173,10 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
         calc_set = set(item.get("calculated_fields") or [])
 
         def fmt(col_name: str):
-            """
-            导出单元格用的数值：
-              - 如果 col_name 在 calculated_fields 里 → 做数值取整
-              - 否则直接返回原始值（保持原始小数位）
-            """
             raw = fv.get(col_name)
             if col_name not in calc_set:
                 return raw
 
-            # 只对 Calculated 列做统一取整
             try:
                 num = float(raw)
                 if math.isnan(num):
@@ -232,10 +232,14 @@ def build_export_df(rows: List[Dict], level: str) -> pd.DataFrame:
 # =========================
 
 def run_batch(
-    france_df: pd.DataFrame,
-    sys_df: pd.DataFrame,
-    france_map: pd.DataFrame,
-    sys_map: pd.DataFrame,
+    france_df: "pd.DataFrame",
+    sys_df: "pd.DataFrame",
+    france_map: "pd.DataFrame",
+    sys_map: "pd.DataFrame",
+    compute_prices_for_part,
+    build_status_line,
+    render_table,
+    round_price_number,
 ) -> None:
     """
     批量模式：
@@ -261,7 +265,6 @@ def run_batch(
         print(f"✅ 已在当前目录创建模板文件：{list_path}")
         print("  请编辑该文件，填入每行一个 PN 后，再次进入批量模式。")
         return
-
 
     with open(list_path, "r", encoding="utf-8") as f:
         pns = [line.strip() for line in f if line.strip()]
@@ -346,7 +349,8 @@ def run_batch(
             return
         level = input("请输入 1 或 2（输入 q 放弃导出）：").strip()
 
-    df_export = build_export_df(results_for_export, level)
+    # 这里把 round_price_number 透传给 build_export_df
+    df_export = build_export_df(results_for_export, level, round_price_number)
 
     if level == "1":
         out_name = "Country_import_upload_Model.xlsx"
@@ -372,7 +376,7 @@ def main() -> None:
     print("正在加载依赖库和数据，请稍候...\n", flush=True)
 
     # 这里 import 重型库
-    import pandas as pd
+    import pandas as pd  # noqa: F401
     from core.loader import (
         load_france_price,
         load_sys_price,
@@ -411,7 +415,16 @@ def main() -> None:
 
         # 批量模式
         if part_no == "":
-            run_batch(france_df, sys_df, france_map, sys_map)
+            run_batch(
+                france_df,
+                sys_df,
+                france_map,
+                sys_map,
+                compute_prices_for_part,
+                build_status_line,
+                render_table,
+                round_price_number,
+            )
             continue
 
         if part_no.lower() in {"quit", "exit", "q"}:
@@ -450,5 +463,6 @@ def main() -> None:
         print(render_table(result["final_values"], result["calculated_fields"]))
 
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
     main()
+    
