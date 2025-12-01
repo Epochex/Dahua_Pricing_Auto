@@ -153,22 +153,35 @@ def _choose_sys_base_price(part_no: str, sales_type: str, sys_row: pd.Series) ->
     while True:
         print("\n[Sys 定价基准选择] 需要从 Sys 表价格中选择 FOB 计算基准：")
         print(f"  PN = {part_no}")
-        print(f"  Min Price      = {min_price if min_price is not None else 'N/A'}")
-        print(f"  Area Price     = {area_price if area_price is not None else 'N/A'}")
-        print(f"  Standard Price = {std_price if std_price is not None else 'N/A'}")
+        # print(f"  Min Price      = {min_price if min_price is not None else 'N/A'}")
+        # print(f"  Area Price     = {area_price if area_price is not None else 'N/A'}")
+        # print(f"  Standard Price = {std_price if std_price is not None else 'N/A'}")
+        print(f"  1 = Min Price | FOB L      = {'可用' if min_price is not None else 'N/A'}")
+        print(f"  2 = Area Price | FOB N     = {'可用' if area_price is not None else 'N/A'}")
+        print(f"  3 = Standard Price | FOB S = {'可用' if std_price is not None else 'N/A'}")
         choice = input("请选择 Sys 价格基准 (1 = Min|FOB L, 2 = Area|FOB N, 3 = Standard|FOB S, q=跳过本 PN)：").strip().lower()
 
-        if choice == "1":
-            return min_price
-        if choice == "2":
-            return area_price
-        if choice == "3":
-            return std_price
+        mapping = {
+            "1": min_price,
+            "2": area_price,
+            "3": std_price,
+        }
+
         if choice in {"q", "quit", "exit"}:
-            print("[Info] 已选择跳过本 PN 的 Sys 基准价格计算。")
             return None
 
-        print("输入无效，请输入 1 / 2 / 3 / q 之一。")
+        if choice not in mapping:
+            print("输入无效，请重试。")
+            continue
+
+        selected_price = mapping[choice]
+
+        # 若价格不存在则提示
+        if selected_price is None:
+            print("[Warning] 该 FOB 价格为 N/A，不可选择，请重新选择。")
+            continue
+
+        return selected_price
 
 
 def build_original_values(
