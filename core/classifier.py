@@ -81,6 +81,27 @@ def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[
     return "UNKNOWN", None
 
 
+def _normalize_category_and_price_group(cat: str, grp: Optional[str]) -> Tuple[str, Optional[str]]:
+    """
+    统一某些品类的 price_group，用于渠道折扣。
+
+    - 监视器 / 商显 / IT监视器 → 统一走 PRICE_RULES['监视器/商显/LCD']
+    - 其他保持原逻辑：price_group_hint 优先，否则用 category 自己
+    """
+    if not cat:
+        return cat, grp
+    cat = cat.strip()
+
+    # 折扣规则合并：监视器、商显/TV-WALL、IT监视器 共用同一组折扣行
+    if cat in {"监视器", "商显/TV-WALL", "IT监视器"}:
+        # 这里只改 price_group，用于 PRICE_RULES；
+        # category 仍然保持原值，用于 DDP_RULES（DDP 公式不变）
+        return cat, "监视器/商显/LCD"
+
+    # 默认逻辑：grp 不为空就用 grp，否则用 cat
+    return cat, (grp or cat)
+
+
 # ========= Series 识别（给 PRICE_RULES 用） =========
 
 
@@ -196,7 +217,8 @@ def classify_category_and_price_group(
     if france_row is not None:
         cat, grp = apply_mapping(france_row, france_map)
         if cat != "UNKNOWN":
-            return cat, grp or cat
+            cat, grp = _normalize_category_and_price_group(cat, grp)
+            return cat, grp
 
     # 2) Sys 信息
     if sys_row is not None:
@@ -219,7 +241,8 @@ def classify_category_and_price_group(
                     grp = "ACCESSORY"
 
         if cat != "UNKNOWN":
-            return cat, grp or cat
+            cat, grp = _normalize_category_and_price_group(cat, grp)
+            return cat, grp
 
     # 3) 最终兜底：按 IPC 处理（例如完全识别失败时）
     return "UNKNOWN", None
