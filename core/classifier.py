@@ -98,8 +98,15 @@ def _normalize_category_and_price_group(cat: str, grp: Optional[str]) -> Tuple[s
         # category 仍然保持原值，用于 DDP_RULES（DDP 公式不变）
         return cat, "监视器/商显/LCD"
 
+    # 电子防盗门：DDP 仍用 "电子防盗门"，折扣统一走 ACCESS CONTROL 这棵树
+    if cat == "电子防盗门":
+        # cat 不动（仍然是电子防盗门，确保用 DDP_RULES["电子防盗门"]）
+        # price_group 强制改成 ACCESS CONTROL → 用 PRICE_RULES["ACCESS CONTROL"]
+        return cat, "ACCESS CONTROL"
+
     # 默认逻辑：grp 不为空就用 grp，否则用 cat
     return cat, (grp or cat)
+
 
 
 # ========= Series 识别（给 PRICE_RULES 用） =========
