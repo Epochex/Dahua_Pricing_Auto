@@ -75,10 +75,7 @@ def pick_price_rule(price_group: str, series_key: str) -> Optional[Dict]:
 def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float]]:
     """
     ddp_a → 各渠道价（reseller / gold / silver / ivory(installer) / msrp）
-
-    注意：
-    - 这里只返回“原始浮点值”，不做任何 round；
-    - 最终展示时统一在 formatter 里做格式化。
+    返回不 round 的原始浮点数，显示格式在 formatter 里统一控制。
     """
     if ddp_a is None or rule is None:
         return {}
@@ -103,7 +100,6 @@ def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float
     if reseller is None:
         reseller = ddp_a
 
-    # 不 round，保持全精度，后面 formatter 再统一控制显示位数
     return {
         "DDP A(EUR)": ddp_a,
         "Suggested Reseller(EUR)": reseller,
@@ -112,7 +108,6 @@ def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float
         "Ivory(EUR)": ivory,
         "MSRP(EUR)": msrp,
     }
-
 
 
 def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
@@ -127,48 +122,43 @@ def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
     return True
 
 
-def _choose_sys_base_price(part_no: str, sales_type: str, sys_row: pd.Series) -> Optional[float]:
+def _normalize_sales_type(v) -> str:
     """
-    根据 Sales Type 或交互式选择，从 Sys 的价格列中选一个作为 FOB 计算基准。
+    统一 Sales Type 输出为：
+      - SMB / DISTRIBUTION / PROJECT / UNKNOWN
+    """
+    if v is None:
+        return "UNKNOWN"
+    try:
+        if pd.isna(v):
+            return "UNKNOWN"
+    except Exception:  # noqa: BLE001
+        pass
+    s = str(v).strip().upper()
+    if s in {"SMB", "DISTRIBUTION", "PROJECT"}:
+        return s
+    return "UNKNOWN"
 
-    - 若 sales_type 为 SMB / DISTRIBUTION → 使用 Min Price
-    - 若 sales_type 为 PROJECT → 使用 Area Price
-    - 其他情况（包括 France 行缺失 / 没有 Sales Type）：
-        进入交互模式，让用户在 Min / Area / Standard 里选一个。
+
+def _choose_sys_base_price_from_sys(sys_row: pd.Series) -> Tuple[Optional[float], str, Optional[str]]:
     """
-    sales_up = (sales_type or "").strip().upper()
+    新规则（无交互）：
+      - Sales Type in {DISTRIBUTION, SMB} -> Min Price
+      - Sales Type == PROJECT            -> Area Price
+      - 其他/缺失                         -> None（不再让你手动选）
+    返回：(base_price, sales_type_norm, basis_field_name)
+    """
+    sales = _normalize_sales_type(sys_row.get("Sales Type"))
 
     min_price = _to_float(sys_row.get("Min Price"))
     area_price = _to_float(sys_row.get("Area Price"))
-    std_price = _to_float(sys_row.get("Standard Price"))
 
-    # 1) 有明确 Sales Type 的情况，保持原有逻辑
-    if sales_up in {"SMB", "DISTRIBUTION"}:
-        return min_price
-    if sales_up == "PROJECT":
-        return area_price
+    if sales in {"SMB", "DISTRIBUTION"}:
+        return min_price, sales, "Min Price"
+    if sales == "PROJECT":
+        return area_price, sales, "Area Price"
 
-    # 2) 无 Sales Type 或无法识别 → 交互选择
-    #    注意：这里可能在批量模式下被调用，会逐条询问。
-    while True:
-        print("\n[Sys 定价基准选择] 需要从 Sys 表价格中选择 FOB 计算基准：")
-        print(f"  PN = {part_no}")
-        print(f"  Min Price      = {min_price if min_price is not None else 'N/A'}")
-        print(f"  Area Price     = {area_price if area_price is not None else 'N/A'}")
-        print(f"  Standard Price = {std_price if std_price is not None else 'N/A'}")
-        choice = input("请选择 Sys 价格基准 (1 = Min|FOB L, 2 = Area|FOB N, 3 = Standard|FOB S, q=跳过本 PN)：").strip().lower()
-
-        if choice == "1":
-            return min_price
-        if choice == "2":
-            return area_price
-        if choice == "3":
-            return std_price
-        if choice in {"q", "quit", "exit"}:
-            print("[Info] 已选择跳过本 PN 的 Sys 基准价格计算。")
-            return None
-
-        print("输入无效，请输入 1 / 2 / 3 / q 之一。")
+    return None, sales, None
 
 
 def build_original_values(
@@ -191,11 +181,10 @@ def build_original_values(
     else:
         data["Part No."] = None
 
-    # Series（展示用，这里只做简单兜底；更精细的在 classifier.detect_series 里）
+    # Series（展示用兜底；更精细在 detect_series 里）
     if fr_row is not None:
         data["Series"] = fr_row.get("Series") or fr_row.get("系列")
     elif sys_row is not None:
-        # 没有 France 时，拿 Sys 的 Second Product Line 做兜底
         data["Series"] = sys_row.get("Second Product Line") or sys_row.get("Catelog Name")
     else:
         data["Series"] = None
@@ -217,7 +206,7 @@ def build_original_values(
         data["Sales Status"] = None
         data["Description"] = None
 
-    # 价格列：只看 France
+    # 价格列：只看 France（不改你原逻辑）
     if fr_row is not None:
         for col in PRICE_COLS:
             data[col] = fr_row.get(col)
@@ -227,6 +216,7 @@ def build_original_values(
 
     return data
 
+
 def compute_prices_for_part(
     part_no: str,
     france_row: Optional[pd.Series],
@@ -235,14 +225,10 @@ def compute_prices_for_part(
     sys_map: pd.DataFrame,
 ) -> Dict:
     """
-    核心：给定 PN 对应的 France 行 / Sys 行，输出：
-      - final_values: 各字段最终值
-      - calculated_fields: 被计算补全的字段名集合
-      - category: 产品线（DDP_RULES 的 key）
-      - price_group: 价格组（PRICE_RULES 顶层 key）
-      - series_display: 展示用 series
-      - auto_success: 是否完成了自动识别
-      - used_sys: 是否用到了 Sys 做价格计算
+    输出 result dict：
+      - final_values / calculated_fields / category / price_group / series_display / auto_success / used_sys
+      - sys_sales_type: 本 PN 在 Sys 中的 Sales Type（规范化后的）
+      - sys_basis_field: 本次 Sys FOB 计算若发生，用的是哪列（Min Price / Area Price）
     """
     # 1) 产品线 & 价格组
     category, price_group = classify_category_and_price_group(
@@ -258,7 +244,13 @@ def compute_prices_for_part(
     final_values = build_original_values(france_row, sys_row)
     calculated_fields: Set[str] = set()
 
-    # 3.5) 无法识别产品线 → 不做任何自动计算，直接人工介入
+    # ===== Sys 侧：提前解析 Sales Type（仅用于打印/记录，不改变 France 优先级）=====
+    sys_sales_type = "UNKNOWN"
+    sys_basis_field: Optional[str] = None
+    if sys_row is not None:
+        _, sys_sales_type, sys_basis_field = _choose_sys_base_price_from_sys(sys_row)
+
+    # 3.5) 无法识别产品线 → 不做任何自动计算
     if category is None or category == "UNKNOWN":
         print(
             f"[Warn] PN={part_no} 无法从 France/Sys 映射中识别产品线，"
@@ -272,37 +264,42 @@ def compute_prices_for_part(
             "series_display": series_display,
             "auto_success": False,
             "used_sys": False,
+            "sys_sales_type": sys_sales_type,
+            "sys_basis_field": None,
         }
 
-    # 4) 如果 France 所有价格都齐全 → 直接视为“全部 Original”，不做计算
+    # 4) 如果 France 所有价格都齐全 → 全部 Original（不计算）
     if _all_prices_present(france_row):
-        auto_success = True
         return {
             "final_values": final_values,
             "calculated_fields": calculated_fields,
             "category": category,
             "price_group": price_group,
             "series_display": series_display,
-            "auto_success": auto_success,
+            "auto_success": True,
             "used_sys": False,
+            "sys_sales_type": sys_sales_type,
+            "sys_basis_field": None,
         }
 
-    # 5) 需要做补全：先找 FOB
+    # 5) 需要补全：先找 FOB
     fob = _to_float(final_values.get("FOB C(EUR)"))
 
     used_sys = False
+    used_sys_basis_field: Optional[str] = None
+
+    # 只在 France 缺失 FOB 时，才允许从 Sys 计算 FOB（不改你原逻辑）
     if (fob is None or fob <= 0) and sys_row is not None:
-        # France 没给 FOB，尝试用 Sys + Sales Type / 交互选择 算 FOB
-        sales_type = ""
-        if france_row is not None and "Sales Type" in france_row:
-            sales_type = str(france_row.get("Sales Type") or "")
-        base_price = _choose_sys_base_price(part_no, sales_type, sys_row)
+        base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(sys_row)
+        # 记录给打印用
+        sys_sales_type = sales_norm
+        # 只有真正算出来 FOB 才认为“用了 Sys”
         if base_price is not None and base_price > 0:
             fob = base_price * 0.9
-            # 不 round，保留原始浮点值
             final_values["FOB C(EUR)"] = fob
             calculated_fields.add("FOB C(EUR)")
             used_sys = True
+            used_sys_basis_field = basis_field  # Min Price / Area Price
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
@@ -311,7 +308,6 @@ def compute_prices_for_part(
     else:
         ddp_a = compute_ddp_a_from_fob(fob, category)
         if ddp_a is not None:
-            # 不 round，保留原始浮点值
             final_values["DDP A(EUR)"] = ddp_a
             calculated_fields.add("DDP A(EUR)")
 
@@ -322,12 +318,10 @@ def compute_prices_for_part(
             channel_prices = compute_channel_prices(ddp_a, price_rule)
             for col in PRICE_COLS:
                 if col == "FOB C(EUR)":
-                    continue  # FOB 不在 channel_prices 里
+                    continue
                 if _to_float(final_values.get(col)) is None and col in channel_prices:
                     final_values[col] = channel_prices[col]
                     calculated_fields.add(col)
-
-    auto_success = True  # 能走到这里说明产品线识别成功，且已尝试自动补全
 
     return {
         "final_values": final_values,
@@ -335,6 +329,8 @@ def compute_prices_for_part(
         "category": category,
         "price_group": price_group,
         "series_display": series_display,
-        "auto_success": auto_success,
+        "auto_success": True,
         "used_sys": used_sys,
+        "sys_sales_type": sys_sales_type,
+        "sys_basis_field": used_sys_basis_field,  # 只在 used_sys=True 时给出
     }

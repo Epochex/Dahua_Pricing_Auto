@@ -32,7 +32,6 @@ BOLD_COLS = {
     "MSRP(EUR)",
 }
 
-# 需要打 Original / Calculated 标记的价格列
 PRICE_COLS = {
     "FOB C(EUR)",
     "DDP A(EUR)",
@@ -46,12 +45,9 @@ PRICE_COLS = {
 
 def round_price_number(num: float) -> float:
     """
-    统一的价格取整规则（导出 & 控制台都用这一套）：
-
-    - num < 30  → 四舍五入到 1 位小数
-    - num >= 30 → 四舍五入到整数
-
-    使用 Decimal + ROUND_HALF_UP，行为与 Excel 四舍五入一致。
+    统一价格取整规则（导出 & 控制台都用）：
+    - < 30 → 四舍五入到 1 位小数
+    - ≥ 30 → 四舍五入到整数
     """
     d = Decimal(str(num))
     if num < 30:
@@ -77,13 +73,11 @@ def render_table(
     calculated_fields: Iterable[str],
 ) -> str:
     """
-    把结果 dict 渲染成表格。
-
-    规则：
-    - 只对“Calculated”的价格做数值格式：
-        * 数值 < 30  → 四舍五入到 1 位小数
-        * 数值 >=30 → 四舍五入到整数
-    - Original 的价格保持原值（不改小数位），只追加标记。
+    渲染表格：
+    - 仅对 Calculated 的价格做显示格式：
+        * <30 → 1 位小数
+        * ≥30 → 整数
+    - Original 保持原值，只追加标记
     """
     calc_set: Set[str] = set(calculated_fields)
     rows = []
@@ -96,7 +90,7 @@ def render_table(
 
         raw = final_values.get(col)
 
-        # ===== 只对“Calculated 的价格列”做数值格式 =====
+        # 只格式化 Calculated 的价格列
         if col in PRICE_COLS and raw is not None and col in calc_set:
             try:
                 num = float(raw)
@@ -105,25 +99,22 @@ def render_table(
                 else:
                     num2 = round_price_number(num)
                     if num2 < 30:
-                        # <30：保留 1 位小数
                         raw = f"{num2:.1f}"
                     else:
-                        # >=30：显示为整数
                         raw = str(int(num2))
             except (TypeError, ValueError):
-                # 不是数值就保持原样
                 pass
 
         val = _format_value(raw)
 
-        # ===== Original / Calculated 标记 =====
+        # Original / Calculated 标记
         if col in PRICE_COLS and val != "Price Not Found":
             if col in calc_set:
                 val = f"{val} | Calculated"
             else:
                 val = f"{val} | Original"
 
-        # ===== 加粗关键列 =====
+        # 加粗关键列
         if col in BOLD_COLS:
             col_disp = f"\033[1m{col}\033[0m"
             val_disp = f"\033[1m{val}\033[0m"
@@ -138,7 +129,7 @@ def render_table(
 
 def build_status_line(result: Dict) -> str:
     """
-    根据结果构造一行“计算状态：...”的提示。
+    构造“计算状态：...”提示。
     """
     cat = result.get("category") or "UNKNOWN"
     series_display = result.get("series_display") or ""
@@ -146,10 +137,23 @@ def build_status_line(result: Dict) -> str:
     auto_success = bool(result.get("auto_success"))
 
     if not auto_success:
-        return "计算状态：自动化计算失败，已切换为原始价格（若存在）"
+        return "计算状态：自动化计算失败，已切换为原始价格"
 
     if calc_fields:
         return f"计算状态：自动化计算成功（产品线：{cat} | 系列：{series_display}）"
 
-    # auto_success=True 且没有任何字段需要计算 → 全部 Original
     return f"计算状态：无需自动补全，全部使用原始价格（产品线：{cat} | 系列：{series_display}）"
+
+
+def build_sys_calc_line(result: Dict) -> str:
+    """
+    只在“确实用 Sys 计算了 FOB”时输出一行，说明按哪个 Sales Type / 哪个价格列算的。
+    """
+    if not result.get("used_sys"):
+        return ""
+
+    sales = result.get("sys_sales_type") or "UNKNOWN"
+    basis = result.get("sys_basis_field") or "UNKNOWN"
+
+    # 输出示例：Sys FOB 基准：Sales Type=SMB -> Min Price
+    return f"[自动计算基准]：Sales Type = {sales} -> {basis}"

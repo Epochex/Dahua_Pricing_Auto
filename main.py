@@ -77,12 +77,10 @@ def _mode_label(mode: str) -> str:
     """
     把内部匹配模式翻译成可读中文。
     """
-    if mode == "exact_raw":
+    if mode == "exact":
         return "精确匹配"
-    if mode == "fallback_suffix_to_base":
-        return "输入带后缀，回退到无后缀基础料号"
-    if mode == "fallback_base_to_suffix":
-        return "输入无后缀，回退到带后缀国际料号"
+    if mode == "base":
+        return "前缀匹配"
     return "未匹配"
 
 
@@ -90,60 +88,53 @@ def _find_row_with_fallback(
     df: "pd.DataFrame",
     key_raw: str,
     key_base: str,
-    pn_col_name: str,
+    pn_col: str,
 ):
     """
-    在 df 中按“精确 → 兜底”的顺序找一行，且区分输入是否带后缀。
-
-    返回 (row_or_None, match_mode, matched_pn_str)
-
-    情况 1：输入不带后缀，例如 1.0.01.19.10564
-      1) 先按 _pn_key_raw == key_raw 精确匹配
-      2) 若找不到，再按 _pn_key_base == key_base 匹配
-         （可以匹配到 1.0.01.19.10564-9001 这类带国际后缀的行）
-
-    情况 2：输入带后缀，例如 1.0.01.19.10564-9001
-      1) 先按 _pn_key_raw == key_raw 精确匹配
-      2) 若找不到，再按 _pn_key_raw == key_base 匹配
-         （即只兜底到“不带后缀”的基础料号 1.0.01.19.10564）
+    先尝试精准匹配 key_raw（_pn_key_raw），若失败再用 key_base（_pn_key_base）兜底。
+    返回：(row or None, mode, matched_pn_value)
     """
-    if not key_raw and not key_base:
+    if df is None or df.empty:
         return None, "none", None
 
-    # 先尝试精确匹配
-    if key_raw:
-        m = df[df["_pn_key_raw"] == key_raw]
-        if not m.empty:
-            row = m.iloc[0]
-            matched_pn = row.get(pn_col_name)
-            return row, "exact_raw", matched_pn
+    # 精准匹配
+    hit = df[df["_pn_key_raw"] == key_raw]
+    if not hit.empty:
+        row = hit.iloc[0]
+        return row, "exact", row.get(pn_col)
 
-    if not key_base:
-        return None, "none", None
-
-    # 判断“输入是否带有可截断的后缀”
-    has_suffix = ("-" in key_raw) and (key_base != key_raw)
-
-    if has_suffix:
-        # 输入带后缀：兜底只找“没有后缀”的那一行（raw == base）
-        m = df[df["_pn_key_raw"] == key_base]
-        if not m.empty:
-            row = m.iloc[0]
-            matched_pn = row.get(pn_col_name)
-            return row, "fallback_suffix_to_base", matched_pn
-    else:
-        # 输入不带后缀：兜底找任意 base 相同的行（可以是带后缀的国际料号）
-        m = df[df["_pn_key_base"] == key_base]
-        if not m.empty:
-            row = m.iloc[0]
-            matched_pn = row.get(pn_col_name)
-            return row, "fallback_base_to_suffix", matched_pn
+    # 前缀兜底匹配
+    hit2 = df[df["_pn_key_base"] == key_base]
+    if not hit2.empty:
+        row = hit2.iloc[0]
+        return row, "base", row.get(pn_col)
 
     return None, "none", None
 
 
 # =========================
-# 导出 DataFrame 构造
+# 控制台额外告警
+# =========================
+
+def _print_black_model_warning(final_values: Dict[str, object]) -> None:
+    """
+    若 Internal Model 含有 'black'（忽略大小写），打印一条额外警告。
+    只做提示，不改任何计算逻辑/数据。
+    """
+    internal = final_values.get("Internal Model")
+    if internal is None:
+        return
+    try:
+        s = str(internal)
+    except Exception:
+        return
+
+    if "black" in s.lower():
+        print("WARNING: Internal Model 含 'Black'，请核对是否存在对应白色型号（White）并确认定价/映射是否一致。")
+
+
+# =========================
+# 导出工具
 # =========================
 
 def build_export_df(
@@ -154,8 +145,8 @@ def build_export_df(
     """
     rows: 每个元素形如
         {
-            "final_values": {...},
-            "calculated_fields": set([...]),
+            "final_values": {.},
+            "calculated_fields": set([.]),
         }
     level: "1" -> Country; "2" -> Country&Customer
 
@@ -238,6 +229,7 @@ def run_batch(
     sys_map: "pd.DataFrame",
     compute_prices_for_part,
     build_status_line,
+    build_sys_calc_line,
     render_table,
     round_price_number,
 ) -> None:
@@ -273,9 +265,9 @@ def run_batch(
         print("❌ List_PN.txt 为空，批量处理取消。")
         return
 
-    print(f"\n检测到批量模式，共 {len(pns)} 个 PN，将依次计算价格...\n")
+    print(f"\n检测到批量模式，共 {len(pns)} 个 PN，将依次计算价格.\n")
 
-    # 每个元素：{"final_values": {...}, "calculated_fields": set([...])}
+    # 每个元素：{"final_values": {.}, "calculated_fields": set([.])}
     results_for_export: List[Dict] = []
     not_found: List[str] = []
 
@@ -312,13 +304,20 @@ def run_batch(
         fv["Part No."] = pn
 
         print(build_status_line(result))
+        sys_line = build_sys_calc_line(result)
+        if sys_line:
+            print(sys_line)
         print()
         print(render_table(fv, result["calculated_fields"]))
         print()
 
-        # 简单检查：至少有 DDP A，否则基本没法上传
+        # 先输出 DDP 缺失告警（如果有）
         if fv.get("DDP A(EUR)") is None:
             print(f"[Warn] PN={pn} 未得到有效 DDP A 价格，仍写入导出表但需人工复核。")
+
+        # 最后输出 Black 型号核对告警（如触发）
+        _print_black_model_warning(fv)
+        print()
 
         results_for_export.append(
             {
@@ -373,7 +372,7 @@ def main() -> None:
     print(AUTHOR_INFO)
     print("=" * 80)
 
-    print("正在加载依赖库和数据，请稍候...\n", flush=True)
+    print("正在加载依赖库和数据，请稍候.\n", flush=True)
 
     # 这里 import 重型库
     import pandas as pd  # noqa: F401
@@ -384,23 +383,23 @@ def main() -> None:
         load_sys_mapping,
     )
     from core.pricing_engine import compute_prices_for_part
-    from core.formatter import render_table, build_status_line, round_price_number
+    from core.formatter import render_table, build_status_line, build_sys_calc_line, round_price_number
 
     # ===== 载入数据 =====
     try:
-        print("[1/5] 正在加载 FrancePrice.xlsx...", flush=True)
+        print("[1/5] 正在加载 FrancePrice.xlsx.", flush=True)
         france_df = load_france_price()
 
-        print("[2/5] 正在加载 SysPrice.xls...", flush=True)
+        print("[2/5] 正在加载 SysPrice.xls.", flush=True)
         sys_df = load_sys_price()
 
-        print("[3/5] 正在加载 Mapping 映射表...", flush=True)
+        print("[3/5] 正在加载 Mapping 映射表.", flush=True)
         france_map = load_france_mapping()
         sys_map = load_sys_mapping()
 
     except FileNotFoundError as e:
         print(f"❌ 载入数据失败：{e}")
-        input("按回车退出...")
+        input("按回车退出.")
         sys.exit(1)
 
     print("[4/5] 国家侧和系统侧数据载入完成", flush=True)
@@ -422,6 +421,7 @@ def main() -> None:
                 sys_map,
                 compute_prices_for_part,
                 build_status_line,
+                build_sys_calc_line,
                 render_table,
                 round_price_number,
             )
@@ -459,10 +459,15 @@ def main() -> None:
 
         print("\n查询结果如下：")
         print(build_status_line(result))
+        sys_line = build_sys_calc_line(result)
+        if sys_line:
+            print(sys_line)
         print()
         print(render_table(result["final_values"], result["calculated_fields"]))
+
+        # 单条查询：表格后直接追加 Black 告警作为最后一行
+        _print_black_model_warning(result["final_values"])
 
 
 if __name__ == "__main__":
     main()
-    
