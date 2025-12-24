@@ -387,13 +387,13 @@ def main() -> None:
 
     # ===== 载入数据 =====
     try:
-        print("[1/5] 正在加载 FrancePrice.xlsx.", flush=True)
+        print("[1/6] 正在加载 FrancePrice.xlsx.", flush=True)
         france_df = load_france_price()
 
-        print("[2/5] 正在加载 SysPrice.xls.", flush=True)
+        print("[2/6] 正在加载 SysPrice.xls.", flush=True)
         sys_df = load_sys_price()
 
-        print("[3/5] 正在加载 Mapping 映射表.", flush=True)
+        print("[3/6] 正在加载 Mapping 映射表.", flush=True)
         france_map = load_france_mapping()
         sys_map = load_sys_mapping()
 
@@ -402,15 +402,15 @@ def main() -> None:
         input("按回车退出.")
         sys.exit(1)
 
-    print("[4/5] 国家侧和系统侧数据载入完成", flush=True)
+    print("[4/6] 国家侧和系统侧数据载入完成", flush=True)
 
     # 标准化 PN 索引：同时生成 raw/base 两套 key
     france_df = _prepare_index(france_df, "Part No.")
     sys_df = _prepare_index(sys_df, "Part Num")
-    print("[5/5] 精准索引和模糊识别索引模块加载完成\n", flush=True)
-
+    print("[5/6] 精准索引和模糊识别索引模块加载完成", flush=True)
+    print("[6/6] 自动化计算模块加载完成\n", flush=True)
     while True:
-        part_no = input("\n请输入 Part No.（输入 quit 退出，直接回车进入批量模式）：").strip()
+        part_no = input("\n请输入 Part No.（输入 quit 退出，直接回车进入批量模式）：\n").strip()
 
         # 批量模式
         if part_no == "":
