@@ -113,6 +113,124 @@ def _find_row_with_fallback(
 
 
 # =========================
+# 价格缺失时：后缀 PN 的“去后缀补价”逻辑
+# =========================
+
+_PRICE_COLS = [
+    "FOB C(EUR)",
+    "DDP A(EUR)",
+    "Suggested Reseller(EUR)",
+    "Gold(EUR)",
+    "Silver(EUR)",
+    "Ivory(EUR)",
+    "MSRP(EUR)",
+]
+
+
+def _row_has_any_price(row) -> bool:
+    """
+    行里是否至少存在一个可用的价格字段（7 个价格列任一可转 float 即认为存在）。
+    """
+    if row is None:
+        return False
+    for c in _PRICE_COLS:
+        if c not in row:
+            continue
+        v = row.get(c)
+        if v is None:
+            continue
+        try:
+            # 空字符串 / NaN 都当作缺失
+            if isinstance(v, str) and not v.strip():
+                continue
+            fv = float(v)
+            if math.isnan(fv):
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _fill_missing_prices_from_base(
+    df,
+    row,
+    base_key_raw: str,
+) -> tuple:
+    """
+    如果 row 的价格缺失，则尝试用 base PN（去掉 -suffix）对应行的价格进行补全。
+    只补价格列，不改其他字段。
+    返回：(new_row, used_fallback: bool, fallback_pn_value_or_none)
+    """
+    if row is None:
+        return None, False, None
+
+    # row 已经有价格就不动
+    if _row_has_any_price(row):
+        return row, False, None
+
+    if df is None or df.empty or not base_key_raw:
+        return row, False, None
+
+    # base 精确查找：优先 _pn_key_raw
+    hit = df[df["_pn_key_raw"] == base_key_raw]
+    if hit.empty:
+        # 兜底：用 _pn_key_base（对某些数据源可能更稳）
+        hit = df[df["_pn_key_base"] == base_key_raw]
+
+    if hit.empty:
+        return row, False, None
+
+    base_row = hit.iloc[0]
+    new_row = row.copy()
+
+    changed = False
+    for c in _PRICE_COLS:
+        cur = new_row.get(c) if c in new_row else None
+        cur_ok = False
+        if cur is not None:
+            try:
+                if isinstance(cur, str) and not cur.strip():
+                    cur_ok = False
+                else:
+                    fcur = float(cur)
+                    cur_ok = not math.isnan(fcur)
+            except Exception:
+                cur_ok = False
+
+        if cur_ok:
+            continue
+
+        if c in base_row:
+            bv = base_row.get(c)
+            if bv is None:
+                continue
+            try:
+                if isinstance(bv, str) and not bv.strip():
+                    continue
+                fbv = float(bv)
+                if math.isnan(fbv):
+                    continue
+                new_row[c] = bv
+                changed = True
+            except Exception:
+                # base 值不可用就跳过
+                continue
+
+    if not changed:
+        return row, False, None
+
+    # 返回 base 行的 PN 字段（用于日志提示）
+    fallback_pn = None
+    for pn_col in ("Part No.", "Part Num"):
+        if pn_col in base_row:
+            fallback_pn = base_row.get(pn_col)
+            break
+
+    return new_row, True, fallback_pn
+
+
+# =========================
 # 控制台额外告警
 # =========================
 
@@ -282,6 +400,15 @@ def run_batch(
             sys_df, key_raw, key_base, "Part Num"
         )
 
+        # ===== 去后缀补价（仅当“精确命中但价格全空”时）=====
+        base_key_raw = key_base
+        if key_base and key_base != key_raw:
+            fr_row, used_fr_fb, fr_fb_pn = _fill_missing_prices_from_base(france_df, fr_row, base_key_raw)
+            sys_row, used_sys_fb, sys_fb_pn = _fill_missing_prices_from_base(sys_df, sys_row, base_key_raw)
+            if used_fr_fb or used_sys_fb:
+                fb_from = fr_fb_pn or sys_fb_pn or base_key_raw
+                print(f"[Fallback] PN={pn} 价格缺失，已尝试使用去后缀 PN={fb_from} 的价格列进行补全。")
+
         if fr_row is None and sys_row is None:
             # 暂时只记录，等所有 PN 处理完再统一输出
             not_found.append(pn)
@@ -440,6 +567,17 @@ def main() -> None:
         sys_row, sys_mode, sys_matched = _find_row_with_fallback(
             sys_df, key_raw, key_base, "Part Num"
         )
+
+        # ===== 去后缀补价（仅当“精确命中但价格全空”时）=====
+        # 场景：1.0.01.04.42701-0026 在 Sys/France 有行，但价格列为空；
+        # 这时尝试用 1.0.01.04.42701 的价格列来补齐（只补价格，不改型号/描述等元数据）。
+        base_key_raw = key_base  # normalize_pn_base 已去掉 -suffix（若可去）
+        if key_base and key_base != key_raw:
+            fr_row, used_fr_fb, fr_fb_pn = _fill_missing_prices_from_base(france_df, fr_row, base_key_raw)
+            sys_row, used_sys_fb, sys_fb_pn = _fill_missing_prices_from_base(sys_df, sys_row, base_key_raw)
+            if used_fr_fb or used_sys_fb:
+                fb_from = fr_fb_pn or sys_fb_pn or base_key_raw
+                print(f"[Fallback] PN={part_no} 价格缺失，已尝试使用去后缀 PN={fb_from} 的价格列进行补全。")
 
         if fr_row is None and sys_row is None:
             print("❌ France / Sys 中均未找到该 PN，请确认 PN 是否正确或联系 PM 新增。")

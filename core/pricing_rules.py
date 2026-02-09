@@ -30,7 +30,8 @@ DDP_RULES = {
 
     "ACCESSORY": (0.10, 0.011, 0.02, 0.000198),
     "ACCESSORY线缆": (0.10, 0.037, 0.02, 0.000198),
-
+    "WIFI相机": (0.05, 0.0, 0.02, 0.000198),
+    
     "监视器": (0.10, 0.0, 0.02, 0.000198),
     "IT监视器": (0.10, 0.0, 0.02, 0.000198),
     "商显/TV-WALL": (0.10, 0.14, 0.02, 0.000198),
@@ -48,6 +49,7 @@ DDP_RULES = {
     "安检机": (0.15, 0.0, 0.02, 0.000198),
     "电子白板": (0.15, 0.034, 0.02, 0.000198),
     "烟感": (0.10, 0.02, 0.02, 0.000198),
+    "Doorbell": (0.05, 0.0, 0.02, 0.000198),
 }
 
 # =========================
@@ -87,6 +89,11 @@ PRICE_RULES = {
     },
     # NVR / IVSS / EVS / XVR
     "NVR": {
+        # 你折扣表的两大类（即便折扣相同也保留 key，便于日志可追溯）
+        "IVSS / NVR6 / NVR5-I/L":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+        "NVR5-EI/ NVR4 / NVR 2":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
         "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
     },
     "IVSS": {
@@ -105,10 +112,6 @@ PRICE_RULES = {
     # Access Control
     "ACCESS CONTROL": {
         "_default_":   dict(reseller=0.12, gold=0.22, silver=0.35, ivory=0.40, msrp_on_installer=0.60),
-    },
-    # Alarm
-    "ALARM": {
-        "_default_":   dict(reseller=0.30, gold=0.30, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
     },
     # Transmission & IT 网络
     "TRANSMISSION": {
@@ -177,4 +180,16 @@ PRICE_RULES = {
     "充电桩": {
         "_default_":   dict(reseller=None, gold=0.15, silver=0.15, ivory=0.15, msrp_on_installer=0.20),
     },
+    # Alarm
+    "Alarm":{
+        "_default_":   dict(reseller=0.3, gold=0.3, silver=0.3, ivory=0.35, msrp_on_installer=0.60),
+    },
+    # WIFI相机
+    "WIFI相机":{
+        "_default_":   dict(reseller=0.12, gold=0.2, silver=0.2, ivory=0.2, msrp_on_installer=0.20),
+    },
+    # Doorbell
+    "Doorbell":{
+        "_default_":   dict(reseller=0.12, gold=0.2, silver=0.2, ivory=0.2, msrp_on_installer=0.20),
+    }
 }

@@ -166,10 +166,9 @@ def render_table(final_values: Dict[str, object], calculated_fields: Iterable[st
         else:
             val_txt = _sanitize_cell_text(val)
 
-        # 价格行：追加标签到 Value（并用一个明显但不破坏对齐的分隔）
+        # 价格行：追加标签到 Value
         if col in PRICE_COLS and val not in {"Value Not Found", "Price Not Found"}:
             tag = "Calculated" if col in calc_set else "Original"
-            # 用 " | " 会变成内容竖线（已被替换规则改成 ¦），所以这里用 "  •  " 更干净
             val_txt = f"{val_txt}  |  {tag}"
 
         if col in BOLD_COLS:
@@ -187,21 +186,34 @@ def render_table(final_values: Dict[str, object], calculated_fields: Iterable[st
 def build_status_line(result: Dict) -> str:
     cat = result.get("category") or "UNKNOWN"
     series_display = result.get("series_display") or ""
+    series_key = (result.get("series_key") or "").strip()
+    pricing_rule_name = (result.get("pricing_rule_name") or "").strip()  # NEW
     calc_fields = result.get("calculated_fields") or set()
     auto_success = bool(result.get("auto_success"))
 
     if not auto_success:
-        return "计算状态：自动化计算失败，已切换为原始价格（若存在）"
+        # 失败也照样把“本次原本会选用的规则”打印出来，方便排查
+        extra = f" | 定价公式：{pricing_rule_name}" if pricing_rule_name else ""
+        return f"计算状态：自动化计算失败，已切换为原始价格（若存在）{extra}"
+
+    cat_disp = cat
+    if series_key:
+        cat_disp = f"{cat} / 子线：{series_key}"
+
+    extra = f" | 定价公式：{pricing_rule_name}" if pricing_rule_name else ""
 
     if calc_fields:
-        return f"计算状态：自动化计算成功（产品线：{cat} | 系列：{series_display}）"
+        return f"计算状态：自动化计算成功（产品线：{cat_disp} | 系列：{series_display}{extra}）"
 
-    return f"计算状态：无需自动补全，全部使用原始价格（产品线：{cat} | 系列：{series_display}）"
+    return f"计算状态：无需自动补全，全部使用原始价格（产品线：{cat_disp} | 系列：{series_display}{extra}）"
 
 
 def build_sys_calc_line(result: Dict) -> str:
     if not result.get("used_sys"):
+        # 即使没用 Sys，这里也不强行输出公式，避免噪音
         return ""
     sales = result.get("sys_sales_type") or "UNKNOWN"
     basis = result.get("sys_basis_field") or "UNKNOWN"
-    return f"[计算层级]：{sales}（Sys 基准字段：{basis}）"
+    pricing_rule_name = (result.get("pricing_rule_name") or "").strip()  # NEW
+    extra = f" | 定价公式：{pricing_rule_name}" if pricing_rule_name else ""
+    return f"[计算层级]：{sales}（Sys 基准字段：{basis}{extra}）"

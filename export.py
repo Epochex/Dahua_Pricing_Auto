@@ -7,9 +7,7 @@ def export_py_files(root_dir, output_file="code_description.txt"):
                 if filename.endswith(".py"):
                     file_path = os.path.join(dirpath, filename)
 
-                    out.write("=" * 80 + "\n")
                     out.write(f"FILE: {file_path}\n")
-                    out.write("=" * 80 + "\n\n")
 
                     try:
                         with open(file_path, "r", encoding="utf-8") as f:
