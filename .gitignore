@@ -1,2 +1,28 @@
+# Python
 __pycache__/
 *.pyc
+
+# VSCode / 临时
+tempCodeRunnerFile.py
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 打包/构建产物（保险）
+*.exe
+*.toc
+*.pyz
+*.zip
+*.html
+*.log
+
+# 你这个项目的导出/中间产物（按需保留）
+code_description.txt
+List_PN.txt
+
+# Excel 产物（如果这些是“生成结果”，建议忽略；如果它是“模板”，别加这一条）
+# Country_import_upload_Model.xlsx
+# Country&Customer_import_upload_Model.xlsx
+# *.xlsx
