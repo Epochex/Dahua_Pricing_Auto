@@ -1,154 +1,188 @@
-# Dahua France Pricing Mini Tool
+# 大华法子定价标准作业流程
 
-大华法国驻地专用 **自动化 报价计算｜查询｜信息汇总 mini 软件**  
-通过本地 Excel 价格表与产品线映射规则，实现对 PN（Part No.）的半自动定价和批量导出。
+> [!IMPORTANT]
+> 该文档为大华法子定价标准作业流程，适用于大华法国子公司定价相关的工作流程和操作步骤。
+> 如无权限定价请直接找到相关定价人员，切勿擅自定价报价。
+> 对于无法拿准的部分，请及时与区域以及国内定价人员沟通确认。
 
+## 1. 定价流程概述
+定价分为法国国家侧定价和客户侧定价两部分，总共有如下定价层级  
+![alt text](img/image.png)  
+
+对于Partenaires de distribution,其定价与Country侧定价相同，且不区分客户类型。
+具体Partenaires de distribution列表可见
+https://www.dahuasecurity.com/fr/partners/DistributionPartner
+
+- Country侧定价：适用于所有客户的法国国家侧基础定价，并且对Partenaires de distribution直接生效  
+- Country&Customer侧定价：适用于特定客户的定价，在此层级下定价将同时更新Country侧和Customer侧定价  
+- Customer侧定价：适用于特定客户的定价，<u>仅对该客户生效，可能存在特殊的涨价系数或者折扣</u>
+- Customer Group：适用于特定客户群体的定价，主要针对一些特殊客户群体，如IT Monitor, IT/ProAV Distributor, <u>仅对该客户群体生效，可能存在特殊的涨价系数或者折扣</u>
 ---
+- Country & Customer Group侧定价：适用于特定客户群体的定价，在此层级下定价将同时更新Country侧和Customer Group侧定价, **从来不用**
+- Multi Country侧定价：适用于多个国家的定价，主要针对跨国客户, **从来不用**
 
-## 1. 功能概述
+> [!NOTE]
+> 对于部分小客户，比如PROTECPEO这些不在客户列表中的，需要咨询对应的销售和市场经历，很有可能也是与country侧定价相同
 
-- **单条查询**
-  - 输入一个 Part No.，在 France / Sys 价格表中自动匹配；
-  - 自动识别产品线与系列（category / price group / series）；
-  - 根据规则补全缺失的 FOB / DDP A / 渠道价；
-  - 以表格形式展示，并标记 **Original** / **Calculated** 字段。
+# 2. 定价操作步骤
+进入 GSP 系统  
+https://gsp.dahuasecurity.com/cpqMicro/#/
 
-- **批量处理**
-  - 读取根目录 `List_PN.txt` 中的多个 PN；
-  - 对每个 PN 执行同样的匹配与计算逻辑；
-  - 将结果导出为 Dahua Portal 上传模板：
-    - `Country_import_upload_Model.xlsx`
-    - `Country&Customer_import_upload_Model.xlsx`
+在收到销售或者市场的定价定价需求后，首先确认需求，常见两类为
+1. 产品释放需求  
+   
+   该产品可能已有定价价格，但是销售侧不可见，正确释放后可见, 如果不是样机下单需求，那么全部按照official release进行释放操作
+   具体操作步骤为：  
+    **GSP -> Product -> Product Managerment -> Search Product -> 点击勾选对应产品 -> Release**  
+   同时产品 Sale State为Delisting状态，那么**在产品右滑动侧 -> Edit 为Delisting Warning状态，然后修改其Delisting Time为下单日期之后**，确保正确下单，然后将操作告知销售，流程到此结束
 
-- **智能匹配**
-  - 支持带国际后缀的 PN（如 `-9001` / `-002`）与无后缀 PN 自动对应；
-  - France / Sys 双侧联合判断产品线；
-  - 特别处理 **Accessories / Accessory** 避免被误判为 IPC；
-  - 对无法识别的产品线输出警告，要求人工介入。
+2. 产品定价需求
+   该产品目前无定价，需要新增定价，或者该产品已有定价，但是需要修改定价价格，正确操作后销售侧可见, 
+   首先应当查看Product -> Product Category中搜索该产品， 在country视图或者customer视图中查看该产品是否已有定价，已有定价则去质问销售，流程到此结束  
+   ![alt text](img/image-1.png)
+   
+   如果没有定价或者需要修改定价价格，那么按照以下步骤进行操作：
+   
+   具体操作步骤为：  
+    **GSP -> Pricing -> Price List Application -> New Application -> Search Product -> 点击勾选对应产品**  
+    ![alt text](img/image-2.png)
 
----
+    只有产品在之前的步骤中被释放后，该页面下才可以进行定价  
+    然后根据该产品对应的sales Type进行定价
+    - SMB/Distribution -> FOB L 价格作为基础价格进行计算
+    - Project -> FOB N 价格作为基础价格进行计算
 
-## 2. 项目结构
+    计算细节如下
+    | 定价层级 | 计算方式 | 备注 |
+    |---|---|---|
+    | IPC / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | HAC / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | PTZ / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | Thermal / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | NVR / DDP A | FOB EURO*(1+10%)*(1+5.2%)*(1+2%)*(1+0.000198) |
+    | IVSS / DDP A | FOB EURO*(1+10%)*(1+5.2%)*(1+2%)*(1+0.000198) |
+    | EVS / DDP A | FOB EURO*(1+10%)*(1+5.2%)*(1+2%)*(1+0.000198) |
+    | XVR / DDP A | FOB EURO*(1+10%)*(1+5.2%)*(1+2%)*(1+0.000198) |
+    | Transmission / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | IT交换机 路由器 / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | VDP 可视对讲 / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | Alarm / DDP A | FOB EURO*(1+5%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | Access Control / DDP A | FOB EURO*(1+10%)*(1+2.1%)*(1+2%)*(1+0.000198) |
+    | Accessory / DDP A | FOB EURO*(1+10%)*(1+1.1%)*(1+2%)*(1+0.000198) |
+    | Accessory 线缆 / DDP A | FOB EURO*(1+10%)*(1+3.7%)*(1+2%)*(1+0.000198) |
+    | 监视器 / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | IT监视器 / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | 商显/TV-WALL / DDP A | FOB EURO*(1+10%)*(1+14%)*(1+2%)*(1+0.000198) |
+    | 键盘/解码器 / DDP A | FOB EURO*(1+10%)*(1+3.4%)*(1+2%)*(1+0.000198) |
+    | 交通 / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | 车载前端 / DDP A | FOB EURO*(1+10%)*(1+0.8%)*(1+2%)*(1+0.000198) |
+    | 车载后端 / DDP A | FOB EURO*(1+10%)*(1+5.2%)*(1+2%)*(1+0.000198) |
+    | 硬盘/存储介质 / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | 视频会议 / DDP A | FOB EURO*(1+10%)*(1+3.4%)*(1+2%)*(1+0.000198) |
+    | 电子防盗门 EAS / DDP A | FOB EURO*(1+10%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | 安检机 / DDP A | FOB EURO*(1+15%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | 电子白板 / DDP A | FOB EURO*(1+15%)*(1+3.4%)*(1+2%)*(1+0.000198) | 取消DDP A价格，仅对欧供库存开放
+    | 烟感 / DDP A | FOB EURO*(1+10%)*(1+2%)*(1+2%)*(1+0.000198) | 仅fob ddp
+    | 充电桩 / DDP A | FOB EURO*(1+10%)*(1+2%)*(1+2%)*(1+0.000198) | 仅fob ddp
+    | Alarm / DDP A | FOB EURO*(1+5%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | WIFI相机 / DDP A | FOB EURO*(1+5%)*(1+0%)*(1+2%)*(1+0.000198) |
+    | Doorbell / DDP A | FOB EURO*(1+5%)*(1+0%)*(1+2%)*(1+0.000198) |
 
-```text
-.
-├── main.py                        # 主入口：交互式查询 / 批量模式
-├── config.py                      # 全局配置与路径工具
-├── export.py                      # 辅助脚本：导出所有 .py 文件到一个文本（调试用）
-├── core
-│   ├── loader.py                  # 载入 Excel / CSV
-│   ├── classifier.py              # 产品线 / 价格组 / 系列 识别
-│   ├── pricing_rules.py           # DDP_RULES & PRICE_RULES 定价规则常量
-│   ├── pricing_engine.py          # 定价核心引擎：FOB / DDP / 渠道价计算
-│   └── formatter.py               # 控制台输出格式与统一“价格取整规则”
-├── data
-│   ├── FrancePrice.xlsx           # 法国价格表（FOB / DDP / 渠道价 原始数据）
-│   └── SysPrice.xls               # Sys Price 表（Min / Area / Standard Price 等）
-├── mapping
-│   ├── productline_map_france_full.csv   # France 侧产品线映射规则
-│   └── productline_map_sys_full.csv      # Sys 侧产品线映射规则
-├── List_PN.txt                    # 批量模式输入 PN 列表（每行一个）
-└── output (运行后生成)
-    ├── Country_import_upload_Model.xlsx
-    └── Country&Customer_import_upload_Model.xlsx
-```
+    在计算完成ddp价格后，按照以下步骤进行各层级定价操作：
+    
+    | 产品线 | 系列 | Reseller | Gold | Silver（SI） | Ivory（Installer） | MSRP |
+    |---|---|---|---|---|---|---|
+    | IPC | PSDW | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-50%) |
+    | IPC | 针孔 | DDP A / (1-12%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | IPC5 | DDP A / (1-12%) | DDP A / (1-27%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | IPC5/7/Multi-sensor / special | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | IPC3-S2 | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | ipc2-pro | DDP A / (1-12%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | IPC2 | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | IPC | IPC1 | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-25%) | DDP A / (1-30%) | Installer / (1-60%) |
+    | HAC | HAC | DDP A / (1-12%) | DDP A / (1-17%) | DDP A / (1-20%) | DDP A / (1-25%) | Installer / (1-60%) |
+    | PTZ | PTZ/SDT/Explosion proof / SD10/8 / 7 | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-50%) |
+    | PTZ | SD6/5/4/3/2/1 | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | Thermal | TPC | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-25%) | DDP A / (1-30%) | Installer / (1-20%) |
+    | Thermal | TPC4 TPC5 | DDP A / (1-12%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-20%) |
+    | NVR | IVSS / NVR6 / NVR5- I/L | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-50%) |
+    | NVR | NVR5- EI/ NVR4 / NVR 2 | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-50%) |
+    | EVS |  |  | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-40%) |
+    | XVR | XVR | DDP A / (1-12%) | DDP A / (1-17%) | DDP A / (1-20%) | DDP A / (1-25%) | Installer / (1-60%) |
+    | VDP |  | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-29%) | DDP A / (1-35%) | Installer / (1-50%) |
+    | Access Control |  | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-35%) | DDP A / (1-40%) | Installer / (1-60%) |
+    | Alarm |  | DDP A / (1-30%) | DDP A / (1-30%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | Transmission |  | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-23%) | DDP A / (1-25%) | Installer / (1-60%) |
+    | Transmission L3 |  | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-23%) | DDP A / (1-25%) | Installer / (1-40%) |
+    |  | 无线网桥 | DDP A / (1-12%) | DDP A / (1-16%) | DDP A / (1-21%) | DDP A / (1-26%) | Installer / (1-40%) |
+    | Accessory | Accessory | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | Accessory | Accessory 线缆 | DDP A / (1-12%) | DDP A / (1-22%) | DDP A / (1-25%) | DDP A / (1-30%) | Installer / (1-60%) |
+    | 监视器 / 商显 / LCD |  | DDP A / (1-12%) | DDP A / (1-15%) | DDP A / (1-20%) | DDP A / (1-25%) | Installer / (1-40%) |
+    | 监视器 / 商显 / LCD | CCTV监视器 | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-22%) | DDP A / (1-25%) | Installer / (1-40%) |
+    | 监视器 / 商显 / LCD | IT监视器 | DDP A / (1-12%) | DDP A / (1-15%) | DDP A / (1-15%) | DDP A / (1-15%) | Installer / (1-20%) |
+    | 键盘/解码器 |  | DDP A / (1-15%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-40%) |
+    | 交通 / 停车场 |  | DDP A / (1-15%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-40%) |
+    | 车载 |  | DDP A / (1-15%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-40%) |
+    | 软件 |  | DDP A / (1-15%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | 硬盘/存储介质 |  | DDP A / (1-10%) | DDP A / (1-10%) | DDP A / (1-15%) | DDP A / (1-20%) | Installer / (1-20%) |
+    | 视频会议 |  | DDP A / (1-15%) | DDP A / (1-25%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-40%) |
+    | 电子白板 |  | DDP A / (1-10%) | DDP A / (1-15%) | DDP A / (1-15%) | DDP A / (1-15%) | Installer / (1-20%) |
+    | 安检机 |  | DDP A / (1-15%) | DDP A / (1-30%) | DDP A / (1-35%) | DDP A / (1-40%) | Installer / (1-40%) |
+    | 电子防盗门 EAS |  | DDP A / (1-12%) | DDP A / (1-15%) | DDP A / (1-20%) | DDP A / (1-25%) | Installer / (1-40%) |
+    | ESL |  | DDP A / (1-5%) | DDP A / (1-5%) | DDP A / (1-10%) | DDP A / (1-15%) | Installer / (1-40%) |
+    | 充电桩 |  | DDP A / (1-10%) | DDP A / (1-15%) | DDP A / (1-15%) | DDP A / (1-15%) | Installer / (1-20%) |
+    | Alarm |  | DDP A / (1-30%) | DDP A / (1-30%) | DDP A / (1-30%) | DDP A / (1-35%) | Installer / (1-60%) |
+    | WIFI相机 |  | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-20%) | DDP A / (1-20%) | Installer / (1-20%) |
+    | Doorbell |  | DDP A / (1-12%) | DDP A / (1-20%) | DDP A / (1-20%) | DDP A / (1-20%) | Installer / (1-20%) |
 
-## 3. 运行环境与依赖
+      在根据上述公式完成定价后填入系统中或按照特定格式的Excel表格进行批量上传，其定价字段为
 
-本工具基于 Python 生态构建，推荐使用 Python 3.10+（已在 Python 3.12 环境充分验证）。运行依赖主要为四类：数据处理（pandas）、Excel 读写（openpyxl / xlrd）、控制台表格渲染（tabulate）。其中 FrancePrice.xlsx 为 xlsx 格式，SysPrice.xls 为旧版 Excel 格式，因此 openpyxl 与 xlrd 缺一不可。安装方式如下：
+      - Country 批量导入字段对应价格层级
 
-pip install pandas openpyxl xlrd tabulate
+      | xlsx字段 | 对应的价格层级和真实字段 |
+      |---|---|
+      | Part No. | PN |
+      | FOB C | FOB C |
+      | DDP A | DDP A |
+      | Reseller S | Reseller |
+      | SI-S | Gold |
+      | SI-A | Silver |
+      | MSTP | Ivory |
+      | MSRP | MSRP |
 
-程序目录无需特殊结构，只需确保 data/ 和 mapping/ 子目录中的 Excel 与 CSV 文件保持最新版本，即可在任意操作系统上独立运行。
+      - Customer 批量导入字段对应价格层级
 
----
+      | xlsx字段 | 对应的价格层级和真实字段 |
+      |---|---|
+      | Part No. | PN |
+      | FOB C | FOB C |
+      | DDP A | DDP A |
+      | Reseller S | Reseller |
+      | SI-S | Diamond |
+      | SI-A | Gold |
+      | MSTP | Ivory |
+      | MSRP | MSRP |
 
-## 4. PN 标准化与匹配策略
+     > [!IMPORTANT]
+     > Diamond 和 Gold 定价等价  
+    
+    当价格全部录入后，点击提交 -> Save and Submit  
+    进入Approval Workflow，然后写清理由后Submit进入审核流程
+    
+    完成后告知销售侧，流程到此结束，等待全部通过之后，价格会自动生效，销售侧可见
 
-为了处理不同文件、不同销售区域、不同阶段产生的料号差异，本工具采用“双层标准化”策略：raw key 与 base key。raw key 用于精确匹配，保持输入字符串的本来面貌（去空格、统一大小写）；base key 则负责去除国际后缀（如 -9001、-002、-S1 等），以捕捉 PN 的主体结构。
+# 3. 注意事项
+### 价格边上箭头作用
+当填写或者导入完成价格后，当出现上下箭头标或者0%时，说明该产品已有定价，销售仍然反应无法查看时应该检查是否已经正确释放  
 
-在查找 PN 时，程序按如下顺序匹配：  
-1）尝试 FrancePrice 与 SysPrice 的精确匹配（raw 层）；  
-2）若失败且输入带后缀，则自动退回其 base key 并重新查找；  
-3）若输入无后缀，则自动扩展匹配所有带后缀的 France/Sys 记录；  
-4）仍无法命中任何条目时，返回“未匹配”，并在查询结果中提示。
+![alt text](img/image-3.png)
 
-这种匹配策略允许用户在查询时不必精确记住后缀，也能对比 France 与 Sys 两侧的数据结构一致性。
+### Danger状态的产品
+一些产品状态为danger的时候，其实该产品的价格已经存在了，只是设置了生效时间，还未生效。所以可以先在Price List Application 系统里检查
 
----
+### 缺失系统价格
+极少数情况下部分产品底价会有缺失，比如1.0.01.19.10066-0007，那么此时可以参考其基础料号 1.0.01.19.10066 底价进行定价计算
 
-## 5. 产品线识别（Category / Price Group / Series）
+### 黑色型号定价
+部分产品黑色型号为其白色型号的特殊定制款，Internal Model 含 'Black'，请核对是否存在对应白色型号（White），如存在，极有可能其定价是基于白色定价基础上+2欧元
 
-产品线识别由 classifier.py 实现，主要流程包括：  
-1）优先依据 France 侧映射文件 productline_map_france_full.csv，通过 Catelog Name 和 First/Second Product Line 映射出 category 与 price group；  
-2）若 France 侧无法识别，则回退至 Sys 侧映射 productline_map_sys_full.csv；  
-3）对 Accessories/Accessory Cable 执行独立纠偏：只要 Sys 显示其所属附件类，即强制分类为 ACCESSORY 或 ACCESSORY 线缆，避免掉入默认 IPC 类；  
-4）在仍无法识别（或映射结果为 UNKNOWN）的情况下，程序不会套用 IPC 默认规则，而是停止自动计算并提示人工介入。
-
-Series 检测则基于 Series 字段（France/Sys 均可提供），用于选择 PRICE_RULES 中对应子规则；若无法识别，则回退到 "_default_"。在未匹配 Series 时，全流程仍可继续进行。
-
----
-
-## 6. 定价引擎（FOB / DDP A / 渠道价）
-
-定价主流程位于 pricing_engine.py，操作逻辑如下：
-
-（1）优先收集 France 侧所有原始价格字段（FOB、DDP A、Reseller/Gold/Silver/Installer/MSRP）。若 France 在该产品上提供了这 7 个关键价格字段，则视为“定价完整”，全程不做任何计算，也不读取 Sys 数据，这类值均标记为 Original。
-
-（2）若 France 缺少 FOB，则尝试从 Sys 侧读取 Min / Area / Standard Price，按 France 的 Sales Type 选择对应的基准价格，再乘以 0.9 得到 FOB（无 round）。若此步骤失败（例如 Sys 本身也无价格），FOB 将保持 None，后续定价链路也会被自动中断。
-
-（3）使用 category 对应的 DDP_RULES 计算 DDP A；不同产品线的参数项（如 10%、1.1%、2%、0.000198 等）可灵活调整，所有中间值保留全精度浮点，不执行四舍五入。若 France 已提供 DDP A，则使用其原始值。
-
-（4）依据 price group 与 series，从 PRICE_RULES 中选择渠道价规则，对 DDP A 计算 Reseller/Gold/Silver/Installer/MSRP。计算公式统一为：渠道价 = DDP A ÷ (1 - 折扣)。所有自动生成的值被标记为 Calculated。
-
-（5）若 category 无法识别（UNKNOWN），程序会立即终止当前 PN 的计算，只返回原始字段，并要求用户人工处理，避免产生错误定价。
-
----
-
-## 7. 统一价格格式化策略（formatter）
-
-为了实现 France 定价体系在展示端和批量导出端的一致性，工具强制采用以下取整策略，仅作用于 “Calculated 字段”，而不会改变 Original 字段：
-
-- 价格 < 30 欧：保留 1 位小数（ROUND_HALF_UP），用于保证小额件的一致性精度；
-- 价格 ≥ 30 欧：四舍五入到整数（ROUND_HALF_UP），符合门户录单习惯；
-- MSRP 等特殊字段适用相同策略，无例外情况。
-
-在控制台显示与 Excel 导出时，formatter 会一次性为所有 Calculated 字段应用格式化，但内部计算链路保留全精度数值，使定价计算在不同环境中保持可重复性。
-
----
-
-## 8. 批量导出流程
-
-批量模式将所有 PN 封装成统一结构（build_export_df），并根据 Dahua Portal 模板字段要求生成两份 Excel：
-
-1）Country_import_upload_Model.xlsx  
-2）Country&Customer_import_upload_Model.xlsx
-
-每条记录包含 Product Line、Internal Model、External Model、PN、Sales Status、Description、Series、Single Value（即 DDP A）、渠道价等字段。所有 Calculated 字段在进入 Excel 前都会经过统一格式化。Original 字段则保持原始展示方式。
-
-若某 PN 在 France / Sys 两侧均未识别出产品线，则其相应行会被标记为人工复核项，但仍保留在导出文件中，便于统一审核。
-
----
-
-## 9. 调试与辅助工具
-
-项目提供 export.py，用于在开发或排查复杂逻辑时将所有 .py 文件合并输出为一个整体文本，便于向同事或外部技术人员展示完整逻辑。该工具不会影响主流程，也不会修改任何运行环境。
-
-程序在运行过程中会自动打印匹配模式、产品线识别路径、是否使用 Sys 补全 FOB、是否命中 DDP_RULES 或 PRICE_RULES 等信息，便于定位异常情况。
-
----
-
-## 10. 注意事项与最佳实践
-
-- **France Price 的优先级永远高于 Sys Price**。只要 France 提供了某字段的原始值，就会覆盖所有自动计算逻辑。  
-- Accessories 类产品应保证 France 与 Sys 产品线映射文件持续同步，否则可能导致分类偏差，但程序已内置纠偏。  
-- 批量处理前建议人工检查 List_PN.txt，避免无效字符、空行或重复项降低处理效率。  
-- 所有生成的 Excel 均仅包含必要字段，若需附加内部注释或辅助列，建议在导出后手动添加，避免影响下次自动处理。  
-- 对于价格较敏感类（如存储介质、商显、VDP 等）的产品线，建议及时同步映射规则与 DDP/价格策略，以保证工具长期准确性。  
-
----
-
-## 11. 压缩打包代码
-```python
-pyinstaller --onefile --name DahuaPricingTool --add-data "data;data" --add-data "mapping;mapping" main.py
-```
