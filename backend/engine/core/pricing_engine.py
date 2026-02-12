@@ -1,12 +1,15 @@
-# core/pricing_engine.py
+# backend/engine/core/pricing_engine.py
+from __future__ import annotations
+
 import math
 import re
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
-from .classifier import detect_series, classify_category_and_price_group
-from .pricing_rules import DDP_RULES, PRICE_RULES
+from backend.engine.core.classifier import classify_category_and_price_group, detect_series
+from backend.engine.core.loader import DataBundle, normalize_pn_base, normalize_pn_raw
+from backend.engine.core.pricing_rules import DDP_RULES, PRICE_RULES
 
 
 PRICE_COLS = [
@@ -18,7 +21,6 @@ PRICE_COLS = [
     "Ivory(EUR)",
     "MSRP(EUR)",
 ]
-
 
 # =========================
 # Sys FOB Uplift（涨价系数）
@@ -513,10 +515,7 @@ def compute_prices_for_part(
 
     # 3.5) 无法识别产品线 → 不做任何自动计算
     if category is None or category == "UNKNOWN":
-        print(
-            f"[Warn] PN={part_no} 无法从 France/Sys 映射中识别产品线，"
-            "已保留原始价格字段，不进行自动计算，请人工介入确认。"
-        )
+        # server 端不强依赖 print，这里保留语义但不影响 API
         return {
             "final_values": final_values,
             "calculated_fields": calculated_fields,
@@ -605,3 +604,188 @@ def compute_prices_for_part(
         "sys_sales_type": sys_sales_type,
         "sys_basis_field": used_sys_basis_field,
     }
+
+
+# ======================================================================
+# Server-side matching helpers (exact/base + base fallback fill)
+# ======================================================================
+
+def _pick_pn_col(df: pd.DataFrame) -> str:
+    """
+    在不同表里 PN 列名可能不同：
+      - France: Part No.
+      - Sys:   Part Num / Part No.
+    这里做一个尽量稳的选择。
+    """
+    candidates = [
+        "Part No.",
+        "Part No",
+        "PartNum",
+        "Part Num",
+        "PN",
+        "P/N",
+        "PartNumber",
+        "Part Number",
+    ]
+    cols = list(df.columns)
+    # 先精确命中
+    for c in candidates:
+        if c in cols:
+            return c
+    # 再做不区分大小写的近似
+    low = {str(c).strip().lower(): c for c in cols}
+    for c in candidates:
+        k = c.strip().lower()
+        if k in low:
+            return low[k]
+    # 兜底：第一列
+    return cols[0]
+
+
+def _find_row_with_fallback(
+    df: pd.DataFrame,
+    idx_raw: Dict[str, int],
+    idx_base: Dict[str, int],
+    key_raw: str,
+    key_base: str,
+) -> Tuple[Optional[pd.Series], str, Optional[str]]:
+    """
+    返回 (row, mode, matched_pn)
+      mode: exact | base | none
+    """
+    if key_raw and key_raw in idx_raw:
+        i = idx_raw[key_raw]
+        try:
+            row = df.iloc[int(i)]
+            # matched_pn：尽量用表中 PN 列
+            pn_col = _pick_pn_col(df)
+            matched = str(row.get(pn_col)) if pn_col in row else key_raw
+            return row, "exact", matched
+        except Exception:
+            return None, "none", None
+
+    if key_base and key_base in idx_base:
+        i = idx_base[key_base]
+        try:
+            row = df.iloc[int(i)]
+            pn_col = _pick_pn_col(df)
+            matched = str(row.get(pn_col)) if pn_col in row else key_base
+            return row, "base", matched
+        except Exception:
+            return None, "none", None
+
+    return None, "none", None
+
+
+def _fill_missing_prices_from_base(
+    df: pd.DataFrame,
+    row: Optional[pd.Series],
+    base_key_raw: str,
+) -> Tuple[Optional[pd.Series], bool, Optional[str]]:
+    """
+    当输入 PN 带 -xxxx 后缀导致 exact 行缺价时，
+    用 base PN 的行把缺失的价格列补齐（只补 PRICE_COLS 中缺失者）。
+    返回 (patched_row, changed, fallback_pn)
+    """
+    if row is None:
+        return row, False, None
+    if not base_key_raw:
+        return row, False, None
+
+    pn_col = _pick_pn_col(df)
+    try:
+        series_pn = df[pn_col].astype(str).str.strip().str.lower()
+    except Exception:
+        return row, False, None
+
+    hits = df[series_pn == str(base_key_raw).strip().lower()]
+    if hits.empty:
+        return row, False, None
+
+    base_row = hits.iloc[0]
+
+    patched = row.copy()
+    changed = False
+    for c in PRICE_COLS:
+        if _to_float(patched.get(c)) is None:
+            v = base_row.get(c)
+            if _to_float(v) is not None:
+                patched[c] = v
+                changed = True
+
+    fb_pn = str(base_row.get(pn_col)) if pn_col in base_row else base_key_raw
+    return patched, changed, fb_pn
+
+
+# ======================================================================
+# Public server API functions
+# ======================================================================
+
+def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
+    """
+    server API：单个 PN 查询
+    """
+    key_raw = normalize_pn_raw(pn)
+    key_base = normalize_pn_base(pn)
+
+    fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+        data.france_df, data.fr_idx_raw, data.fr_idx_base, key_raw, key_base
+    )
+    sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+        data.sys_df, data.sys_idx_raw, data.sys_idx_base, key_raw, key_base
+    )
+
+    # 去后缀补价：仅当 base_key != raw_key（说明发生了可截断）
+    if key_base and key_base != key_raw:
+        fr_row, used_fr_fb, _fr_fb_pn = _fill_missing_prices_from_base(data.france_df, fr_row, key_base)
+        sys_row, used_sys_fb, _sys_fb_pn = _fill_missing_prices_from_base(data.sys_df, sys_row, key_base)
+        _ = used_fr_fb or used_sys_fb
+
+    if fr_row is None and sys_row is None:
+        return {
+            "pn": pn,
+            "status": "not_found",
+            "final_values": {},
+            "calculated_fields": [],
+            "warnings": [],
+        }
+
+    result = compute_prices_for_part(pn, fr_row, sys_row, data.map_fr, data.map_sys)
+    result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
+
+    return {
+        "pn": pn,
+        "status": "ok",
+        "final_values": result["final_values"],
+        "calculated_fields": sorted(list(result.get("calculated_fields") or [])),
+        "meta": {
+            "category": result.get("category"),
+            "price_group": result.get("price_group"),
+            "series_display": result.get("series_display"),
+            "series_key": result.get("series_key"),
+            "pricing_rule_name": result.get("pricing_rule_name"),
+            "used_sys": result.get("used_sys"),
+            "sys_sales_type": result.get("sys_sales_type"),
+            "sys_basis_field": result.get("sys_basis_field"),
+            "fr_match_mode": fr_mode,
+            "sys_match_mode": sys_mode,
+            "fr_matched_pn": fr_matched,
+            "sys_matched_pn": sys_matched,
+        },
+        "warnings": [],
+    }
+
+
+def compute_many(data: DataBundle, pns: List[str], level: str) -> List[Dict[str, Any]]:
+    """
+    batch：按输入 PN 顺序返回
+    level: country | country_customer（此处仅透传给导出层；计算逻辑不依赖 level）
+    """
+    _ = level
+    out: List[Dict[str, Any]] = []
+    for pn in pns:
+        s = str(pn).strip()
+        if not s:
+            continue
+        out.append(compute_one(data, s))
+    return out

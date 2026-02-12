@@ -1,0 +1,3058 @@
+FILE: ./main.py
+from __future__ import annotations
+
+import sys
+import time
+import os
+from typing import TYPE_CHECKING, List, Dict
+import math
+
+from config import APP_TITLE, DATA_DATE, AUTHOR_INFO, get_file_in_base
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+# =========================
+# PN 标准化工具
+# =========================
+
+def normalize_pn_raw(raw) -> str:
+    """
+    原样标准化：
+    - 转字符串
+    - strip 去空格
+    - lower 小写
+    不做任何截断，用于“完全匹配”。
+    """
+    if raw is None:
+        return ""
+    return str(raw).strip().lower()
+
+
+def normalize_pn_base(raw) -> str:
+    """
+    “前缀 key” 标准化，用于兜底匹配。
+
+    需求：1.0.01.01.16317-9002 == 1.0.01.01.16317
+
+    规则：
+    1) 先做 normalize_pn_raw 得到 s
+    2) 若 s 中包含 '-'，拆成 base-suffix：
+       - 如果 base 只由 [0-9 .] 组成，且包含至少一个 '.'，
+         认为是 Dahua 内部编码：返回 base 作为前缀 key
+       - 否则不截断，直接返回 s
+    3) 没有 '-' 就直接返回 s
+    """
+    s = normalize_pn_raw(raw)
+    if not s:
+        return ""
+
+    base, sep, suffix = s.partition("-")
+    if sep and base and suffix:
+        base_compact = base.replace(" ", "")
+        # 限定：只在“点分数字”风格编码上去掉后缀，避免误伤其他真带“-”的料号
+        if base_compact and all((c.isdigit() or c == ".") for c in base_compact) and "." in base_compact:
+            return base
+
+    return s
+
+
+def _prepare_index(df: "pd.DataFrame", col_name: str) -> "pd.DataFrame":
+    """
+    给 DataFrame 增加两个 key：
+    - _pn_key_raw  : 用于完全匹配
+    - _pn_key_base : 用于前缀兜底匹配
+    """
+    df = df.copy()
+    df["_pn_key_raw"] = df[col_name].apply(normalize_pn_raw)   # 精准匹配
+    df["_pn_key_base"] = df[col_name].apply(normalize_pn_base)  # 前缀兜底
+    return df
+
+
+# =========================
+# 匹配工具
+# =========================
+
+def _mode_label(mode: str) -> str:
+    """
+    把内部匹配模式翻译成可读中文。
+    """
+    if mode == "exact":
+        return "精确匹配"
+    if mode == "base":
+        return "前缀匹配"
+    return "未匹配"
+
+
+def _find_row_with_fallback(
+    df: "pd.DataFrame",
+    key_raw: str,
+    key_base: str,
+    pn_col: str,
+):
+    """
+    先尝试精准匹配 key_raw（_pn_key_raw），若失败再用 key_base（_pn_key_base）兜底。
+    返回：(row or None, mode, matched_pn_value)
+    """
+    if df is None or df.empty:
+        return None, "none", None
+
+    # 精准匹配
+    hit = df[df["_pn_key_raw"] == key_raw]
+    if not hit.empty:
+        row = hit.iloc[0]
+        return row, "exact", row.get(pn_col)
+
+    # 前缀兜底匹配
+    hit2 = df[df["_pn_key_base"] == key_base]
+    if not hit2.empty:
+        row = hit2.iloc[0]
+        return row, "base", row.get(pn_col)
+
+    return None, "none", None
+
+
+# =========================
+# 价格缺失时：后缀 PN 的“去后缀补价”逻辑
+# =========================
+
+_PRICE_COLS = [
+    "FOB C(EUR)",
+    "DDP A(EUR)",
+    "Suggested Reseller(EUR)",
+    "Gold(EUR)",
+    "Silver(EUR)",
+    "Ivory(EUR)",
+    "MSRP(EUR)",
+]
+
+
+def _row_has_any_price(row) -> bool:
+    """
+    行里是否至少存在一个可用的价格字段（7 个价格列任一可转 float 即认为存在）。
+    """
+    if row is None:
+        return False
+    for c in _PRICE_COLS:
+        if c not in row:
+            continue
+        v = row.get(c)
+        if v is None:
+            continue
+        try:
+            # 空字符串 / NaN 都当作缺失
+            if isinstance(v, str) and not v.strip():
+                continue
+            fv = float(v)
+            if math.isnan(fv):
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _fill_missing_prices_from_base(
+    df,
+    row,
+    base_key_raw: str,
+) -> tuple:
+    """
+    如果 row 的价格缺失，则尝试用 base PN（去掉 -suffix）对应行的价格进行补全。
+    只补价格列，不改其他字段。
+    返回：(new_row, used_fallback: bool, fallback_pn_value_or_none)
+    """
+    if row is None:
+        return None, False, None
+
+    # row 已经有价格就不动
+    if _row_has_any_price(row):
+        return row, False, None
+
+    if df is None or df.empty or not base_key_raw:
+        return row, False, None
+
+    # base 精确查找：优先 _pn_key_raw
+    hit = df[df["_pn_key_raw"] == base_key_raw]
+    if hit.empty:
+        # 兜底：用 _pn_key_base（对某些数据源可能更稳）
+        hit = df[df["_pn_key_base"] == base_key_raw]
+
+    if hit.empty:
+        return row, False, None
+
+    base_row = hit.iloc[0]
+    new_row = row.copy()
+
+    changed = False
+    for c in _PRICE_COLS:
+        cur = new_row.get(c) if c in new_row else None
+        cur_ok = False
+        if cur is not None:
+            try:
+                if isinstance(cur, str) and not cur.strip():
+                    cur_ok = False
+                else:
+                    fcur = float(cur)
+                    cur_ok = not math.isnan(fcur)
+            except Exception:
+                cur_ok = False
+
+        if cur_ok:
+            continue
+
+        if c in base_row:
+            bv = base_row.get(c)
+            if bv is None:
+                continue
+            try:
+                if isinstance(bv, str) and not bv.strip():
+                    continue
+                fbv = float(bv)
+                if math.isnan(fbv):
+                    continue
+                new_row[c] = bv
+                changed = True
+            except Exception:
+                # base 值不可用就跳过
+                continue
+
+    if not changed:
+        return row, False, None
+
+    # 返回 base 行的 PN 字段（用于日志提示）
+    fallback_pn = None
+    for pn_col in ("Part No.", "Part Num"):
+        if pn_col in base_row:
+            fallback_pn = base_row.get(pn_col)
+            break
+
+    return new_row, True, fallback_pn
+
+
+# =========================
+# 控制台额外告警
+# =========================
+
+def _print_black_model_warning(final_values: Dict[str, object]) -> None:
+    """
+    若 Internal Model 含有 'black'（忽略大小写），打印一条额外警告。
+    只做提示，不改任何计算逻辑/数据。
+    """
+    internal = final_values.get("Internal Model")
+    if internal is None:
+        return
+    try:
+        s = str(internal)
+    except Exception:
+        return
+
+    if "black" in s.lower():
+        print("WARNING: Internal Model 含 'Black'，请核对是否存在对应白色型号（White）并确认定价/映射是否一致。")
+
+
+# =========================
+# 导出工具
+# =========================
+
+def build_export_df(
+    rows: List[Dict],
+    level: str,
+    round_price_number,
+) -> "pd.DataFrame":
+    """
+    rows: 每个元素形如
+        {
+            "final_values": {.},
+            "calculated_fields": set([.]),
+        }
+    level: "1" -> Country; "2" -> Country&Customer
+
+    导出时对“Calculated 的价格列”应用与控制台一致的取整规则：
+      - < 30 → 四舍五入到 1 位小数
+      - ≥ 30 → 四舍五入到整数
+    Original 列保持原始数值。
+    """
+    import pandas as pd  # 这里本身很轻量，只是构造 DataFrame
+
+    data = []
+
+    for item in rows:
+        fv = item.get("final_values", {}) or {}
+        calc_set = set(item.get("calculated_fields") or [])
+
+        def fmt(col_name: str):
+            raw = fv.get(col_name)
+            if col_name not in calc_set:
+                return raw
+
+            try:
+                num = float(raw)
+                if math.isnan(num):
+                    return None
+                return round_price_number(num)
+            except (TypeError, ValueError):
+                return raw
+
+        pn = fv.get("Part No.")
+        fob = fmt("FOB C(EUR)")
+        ddp = fmt("DDP A(EUR)")
+        reseller = fmt("Suggested Reseller(EUR)")
+        gold = fmt("Gold(EUR)")
+        silver = fmt("Silver(EUR)")
+        ivory = fmt("Ivory(EUR)")
+        msrp = fmt("MSRP(EUR)")
+
+        if level == "1":
+            # Country 模板
+            row = {
+                "Part No.": pn,
+                "FOB C": fob,
+                "DDP A": ddp,
+                "Reseller S": reseller,
+                "SI-S": gold,     # Gold
+                "SI-A": silver,   # Silver
+                "MSTP": ivory,    # MSTP = Ivory
+                "MSRP": msrp,
+            }
+        else:
+            # Country & Customer 模板
+            si_a = gold  # Gold
+            si_s = si_a  # Diamond = Gold
+            row = {
+                "Part No.": pn,
+                "FOB C": fob,
+                "DDP A": ddp,
+                "Reseller S": reseller,
+                "SI-S": si_s,     # Diamond (同 Gold)
+                "SI-A": si_a,     # Gold
+                "SI-B": silver,   # Silver
+                "MSTP": ivory,    # Ivory
+                "MSRP": msrp,
+            }
+
+        data.append(row)
+
+    return pd.DataFrame(data)
+
+
+# =========================
+# 批量模式
+# =========================
+
+def run_batch(
+    france_df: "pd.DataFrame",
+    sys_df: "pd.DataFrame",
+    france_map: "pd.DataFrame",
+    sys_map: "pd.DataFrame",
+    compute_prices_for_part,
+    build_status_line,
+    build_sys_calc_line,
+    render_table,
+    round_price_number,
+) -> None:
+    """
+    批量模式：
+      - 读取根目录 List_PN.txt，每行一个 PN
+      - 对每个 PN 计算价格
+      - 在控制台打印每个 PN 的表格结果（含 Original/Calculated 标记）
+      - 导出 Country / Country&Customer 模板
+      - 所有 PN 处理完后，再一次性汇总输出“找不到的 PN 列表”
+    """
+    list_path = get_file_in_base("List_PN.txt")
+    if not os.path.exists(list_path):
+        # 第一次使用：自动创建模板文件
+        with open(list_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# List_PN.txt 模板\n"
+                "# 每行一个 Part No.\n"
+                "# 示例：\n"
+                "# 1.1.02.08.14034-002\n"
+                "# 1.0.01.19.10564\n"
+                "\n"
+            )
+        print(f"❌ 未找到批量 PN 列表文件\n")
+        print(f"✅ 已在当前目录创建模板文件：{list_path}")
+        print("  请编辑该文件，填入每行一个 PN 后，再次进入批量模式。")
+        return
+
+    with open(list_path, "r", encoding="utf-8") as f:
+        pns = [line.strip() for line in f if line.strip()]
+
+    if not pns:
+        print("❌ List_PN.txt 为空，批量处理取消。")
+        return
+
+    print(f"\n检测到批量模式，共 {len(pns)} 个 PN，将依次计算价格.\n")
+
+    # 每个元素：{"final_values": {.}, "calculated_fields": set([.])}
+    results_for_export: List[Dict] = []
+    not_found: List[str] = []
+
+    for idx, pn in enumerate(pns, start=1):
+        key_raw = normalize_pn_raw(pn)
+        key_base = normalize_pn_base(pn)
+
+        fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+            france_df, key_raw, key_base, "Part No."
+        )
+        sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+            sys_df, key_raw, key_base, "Part Num"
+        )
+
+        # ===== 去后缀补价（仅当“精确命中但价格全空”时）=====
+        base_key_raw = key_base
+        if key_base and key_base != key_raw:
+            fr_row, used_fr_fb, fr_fb_pn = _fill_missing_prices_from_base(france_df, fr_row, base_key_raw)
+            sys_row, used_sys_fb, sys_fb_pn = _fill_missing_prices_from_base(sys_df, sys_row, base_key_raw)
+            if used_fr_fb or used_sys_fb:
+                fb_from = fr_fb_pn or sys_fb_pn or base_key_raw
+                print(f"[Fallback] PN={pn} 价格缺失，已尝试使用去后缀 PN={fb_from} 的价格列进行补全。")
+
+        if fr_row is None and sys_row is None:
+            # 暂时只记录，等所有 PN 处理完再统一输出
+            not_found.append(pn)
+            continue
+
+        # ===== 匹配信息提示 =====
+        print("=" * 80)
+        print(f"[Batch {idx}/{len(pns)}] PN = {pn}")
+        print(
+            f"[Match] France: {fr_matched if fr_matched is not None else '未命中'} "
+            f"({ _mode_label(fr_mode) }) | "
+            f"Sys: {sys_matched if sys_matched is not None else '未命中'} "
+            f"({ _mode_label(sys_mode) })"
+        )
+
+        result = compute_prices_for_part(pn, fr_row, sys_row, france_map, sys_map)
+
+        # 报价维度一律使用“输入的 PN”，而不是底层匹配到的 France/Sys PN
+        fv = result["final_values"]
+        fv["Part No."] = pn
+
+        print(build_status_line(result))
+        sys_line = build_sys_calc_line(result)
+        if sys_line:
+            print(sys_line)
+        print()
+        print(render_table(fv, result["calculated_fields"]))
+        print()
+
+        # 先输出 DDP 缺失告警（如果有）
+        if fv.get("DDP A(EUR)") is None:
+            print(f"[Warn] PN={pn} 未得到有效 DDP A 价格，仍写入导出表但需人工复核。")
+
+        # 最后输出 Black 型号核对告警（如触发）
+        _print_black_model_warning(fv)
+        print()
+
+        results_for_export.append(
+            {
+                "final_values": fv,
+                "calculated_fields": set(result.get("calculated_fields") or []),
+            }
+        )
+
+    # 先输出“完全找不到”的 PN 汇总信息
+    if not_found:
+        print("\n以下 PN 在 France / Sys 中均未找到（已跳过）：")
+        for pn in not_found:
+            print(f"[Skip] PN={pn} 在 France / Sys 中均未找到，跳过。")
+
+    if not results_for_export:
+        print("\n❌ 没有任何 PN 计算成功，批量处理结束。")
+        return
+
+    # 选择导出模板层级
+    print("\n价格处理完成，即将导出为上传模板，定价层级为？")
+    print("  Country 层级输入 1")
+    print("  Country & Customer 层级输入 2")
+
+    level = input("请输入 1 / 2（输入 q 放弃导出）：").strip()
+    while level not in {"1", "2"}:
+        if level.lower() in {"q", "quit", "exit"}:
+            print("已放弃导出。")
+            return
+        level = input("请输入 1 或 2（输入 q 放弃导出）：").strip()
+
+    # 这里把 round_price_number 透传给 build_export_df
+    df_export = build_export_df(results_for_export, level, round_price_number)
+
+    if level == "1":
+        out_name = "Country_import_upload_Model.xlsx"
+    else:
+        out_name = "Country&Customer_import_upload_Model.xlsx"
+
+    out_path = get_file_in_base(out_name)
+    df_export.to_excel(out_path, index=False)
+    print(f"\n✅ 导出完成：{out_path}\n")
+
+
+# =========================
+# 交互主循环
+# =========================
+
+def main() -> None:
+    print("=" * 80)
+    print(APP_TITLE)
+    print(f"当前价格数据源更新日期：{DATA_DATE}")
+    print(AUTHOR_INFO)
+    print("=" * 80)
+
+    print("正在加载依赖库和数据，请稍候.\n", flush=True)
+
+    # 这里 import 重型库
+    import pandas as pd  # noqa: F401
+    from core.loader import (
+        load_france_price,
+        load_sys_price,
+        load_france_mapping,
+        load_sys_mapping,
+    )
+    from core.pricing_engine import compute_prices_for_part
+    from core.formatter import render_table, build_status_line, build_sys_calc_line, round_price_number
+
+    # ===== 载入数据 =====
+    try:
+        print("[1/6] 正在加载 FrancePrice.xlsx.", flush=True)
+        france_df = load_france_price()
+
+        print("[2/6] 正在加载 SysPrice.xls.", flush=True)
+        sys_df = load_sys_price()
+
+        print("[3/6] 正在加载 Mapping 映射表.", flush=True)
+        france_map = load_france_mapping()
+        sys_map = load_sys_mapping()
+
+    except FileNotFoundError as e:
+        print(f"❌ 载入数据失败：{e}")
+        input("按回车退出.")
+        sys.exit(1)
+
+    print("[4/6] 国家侧和系统侧数据载入完成", flush=True)
+
+    # 标准化 PN 索引：同时生成 raw/base 两套 key
+    france_df = _prepare_index(france_df, "Part No.")
+    sys_df = _prepare_index(sys_df, "Part Num")
+    print("[5/6] 精准索引和模糊识别索引模块加载完成", flush=True)
+    print("[6/6] 自动化计算模块加载完成\n", flush=True)
+    while True:
+        part_no = input("\n请输入 Part No.（输入 quit 退出，直接回车进入批量模式）：\n").strip()
+
+        # 批量模式
+        if part_no == "":
+            run_batch(
+                france_df,
+                sys_df,
+                france_map,
+                sys_map,
+                compute_prices_for_part,
+                build_status_line,
+                build_sys_calc_line,
+                render_table,
+                round_price_number,
+            )
+            continue
+
+        if part_no.lower() in {"quit", "exit", "q"}:
+            print("程序已退出，Merci Auvoir！")
+            break
+
+        key_raw = normalize_pn_raw(part_no)
+        key_base = normalize_pn_base(part_no)
+
+        fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+            france_df, key_raw, key_base, "Part No."
+        )
+        sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+            sys_df, key_raw, key_base, "Part Num"
+        )
+
+        # ===== 去后缀补价（仅当“精确命中但价格全空”时）=====
+        # 场景：1.0.01.04.42701-0026 在 Sys/France 有行，但价格列为空；
+        # 这时尝试用 1.0.01.04.42701 的价格列来补齐（只补价格，不改型号/描述等元数据）。
+        base_key_raw = key_base  # normalize_pn_base 已去掉 -suffix（若可去）
+        if key_base and key_base != key_raw:
+            fr_row, used_fr_fb, fr_fb_pn = _fill_missing_prices_from_base(france_df, fr_row, base_key_raw)
+            sys_row, used_sys_fb, sys_fb_pn = _fill_missing_prices_from_base(sys_df, sys_row, base_key_raw)
+            if used_fr_fb or used_sys_fb:
+                fb_from = fr_fb_pn or sys_fb_pn or base_key_raw
+                print(f"[Fallback] PN={part_no} 价格缺失，已尝试使用去后缀 PN={fb_from} 的价格列进行补全。")
+
+        if fr_row is None and sys_row is None:
+            print("❌ France / Sys 中均未找到该 PN，请确认 PN 是否正确或联系 PM 新增。")
+            continue
+
+        print(
+            f"[Match] France: {fr_matched if fr_matched is not None else '未命中'} "
+            f"({ _mode_label(fr_mode) }) | "
+            f"Sys: {sys_matched if sys_matched is not None else '未命中'} "
+            f"({ _mode_label(sys_mode) })"
+        )
+
+        result = compute_prices_for_part(part_no, fr_row, sys_row, france_map, sys_map)
+
+        # 同样在单条查询里覆盖 Part No. 为“输入的 PN”
+        result["final_values"]["Part No."] = part_no
+
+        print("\n查询结果如下：")
+        print(build_status_line(result))
+        sys_line = build_sys_calc_line(result)
+        if sys_line:
+            print(sys_line)
+        print()
+        print(render_table(result["final_values"], result["calculated_fields"]))
+
+        # 单条查询：表格后直接追加 Black 告警作为最后一行
+        _print_black_model_warning(result["final_values"])
+
+
+if __name__ == "__main__":
+    main()
+
+
+FILE: ./export.py
+import os
+
+def export_py_files(root_dir, output_file="code_description.txt"):
+    with open(output_file, "w", encoding="utf-8") as out:
+        for dirpath, _, filenames in os.walk(root_dir):
+            for filename in filenames:
+                if filename.endswith(".py"):
+                    file_path = os.path.join(dirpath, filename)
+
+                    out.write(f"FILE: {file_path}\n")
+
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except UnicodeDecodeError:
+                        # 回退到 latin-1 防止非 UTF-8 文件直接 crash
+                        with open(file_path, "r", encoding="latin-1") as f:
+                            content = f.read()
+
+                    out.write(content)
+                    out.write("\n\n")
+
+    print(f"Done. All .py files exported to {output_file}")
+
+
+if __name__ == "__main__":
+    # 修改为你要扫描的目录，例如当前目录 "."
+    export_py_files(".")
+
+
+FILE: ./config.py
+import os
+import sys
+import time
+# =========================
+# 基本信息
+# =========================
+
+APP_TITLE = "大华法国驻地 产品定价解析计算自动化CLI软件"
+DATA_DATE = "2026.1.14"
+AUTHOR_INFO = (
+    "当前仍处于测试阶段,若对数据产生疑问请立刻联系对应PM和技术人员进行价格核对\n"
+    "对于硬盘存储类设备，近期价格波动频繁，请注意实时报价\n"
+    "使用中发现任何问题，请联系开发人员 林建克 LIN Jianke\n"
+    "Huachat: Jianke LIN | 微信: Epochex404"
+)
+
+
+# =========================
+# 路径工具（内部资源）
+# =========================
+
+def get_base_dir() -> str:
+    """
+    返回“内部资源”的根目录：
+    - 源码运行：config.py 所在目录
+    - PyInstaller 打包：sys._MEIPASS （解压后的临时目录）
+    用于 data/、mapping/ 这类随程序一起打包进去的资源。
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_data_path(filename: str) -> str:
+    """
+    data 目录下文件（随 exe 打包）：
+        data/FrancePrice.xlsx
+        data/SysPrice.xls
+    """
+    base_dir = get_base_dir()
+    data_dir = os.path.join(base_dir, "data")
+    return os.path.join(data_dir, filename)
+
+
+def get_mapping_path(filename: str) -> str:
+    """
+    mapping 目录下文件（随 exe 打包）：
+        mapping/productline_map_france_full.csv
+        mapping/productline_map_sys_full.csv
+    """
+    base_dir = get_base_dir()
+    mapping_dir = os.path.join(base_dir, "mapping")
+    return os.path.join(mapping_dir, filename)
+
+
+# =========================
+# 路径工具（外部可见文件）
+# =========================
+
+def _get_exe_dir() -> str:
+    """
+    返回“可写目录”（外部可见）：
+    - 打包后：exe 所在目录（os.path.dirname(sys.executable)）
+    - 源码运行：config.py 所在目录（方便开发调试）
+    用于：
+      - List_PN.txt（对外暴露可编辑）
+      - 导出的 Country_import_upload_Model.xlsx / Country&Customer_import_upload_Model.xlsx
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, 'executable'):
+        # PyInstaller 打包后的 exe
+        return os.path.dirname(sys.executable)
+    # 源码运行时：就用当前文件所在目录，方便调试
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_file_in_base(filename: str) -> str:
+    """
+    exe 同目录下的外部文件：
+        List_PN.txt
+        Country_import_upload_Model.xlsx
+        Country&Customer_import_upload_Model.xlsx
+    注意：打包后，这些文件不会放在 sys._MEIPASS 中，而是放在 exe 同目录。
+    """
+    base_dir = _get_exe_dir()
+    return os.path.join(base_dir, filename)
+
+
+FILE: ./gui_app_dark.py
+# gui_app.py
+from __future__ import annotations
+
+import sys
+import re
+import queue
+import threading
+import builtins
+
+from PyQt6.QtCore import QObject, pyqtSignal, Qt
+from PyQt6.QtGui import QFont, QFontDatabase, QGuiApplication, QFontMetricsF
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPlainTextEdit,
+    QLineEdit,
+    QLabel,
+    QPushButton,
+    QFrame,
+)
+
+
+# 你的 CLI 里可能有 ANSI（加粗/颜色）；GUI 不解释，直接移除
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# 统一字号（你要更大就改这里）
+FONT_PT = 13
+
+
+class EmittingStream(QObject):
+    text_written = pyqtSignal(str)
+
+    def write(self, s: str) -> None:
+        if not s:
+            return
+        # 1) 去 ANSI
+        s = ANSI_RE.sub("", s)
+        # 2) 去掉 \r（carriage return），避免 GUI 行覆盖导致的“竖线漂移/残影”
+        s = s.replace("\r", "")
+        self.text_written.emit(s)
+
+    def flush(self) -> None:
+        pass
+
+
+class CliWorker(QObject):
+    finished = pyqtSignal(int)
+
+    def __init__(self, input_queue: "queue.Queue[str]"):
+        super().__init__()
+        self.input_queue = input_queue
+
+    def run(self) -> None:
+        import os
+        os.environ["DAHUA_NO_ANSI"] = "1"
+        try:
+            import main as cli_main  # 你的 main.py
+        except Exception as e:
+            print(f"❌ 无法 import main.py：{e}\n")
+            self.finished.emit(1)
+            return
+
+        original_input = builtins.input
+
+        def gui_input(prompt: str = "") -> str:
+            if prompt:
+                print(prompt, end="")
+            return self.input_queue.get()
+
+        builtins.input = gui_input
+
+        try:
+            cli_main.main()
+            self.finished.emit(0)
+        except SystemExit as e:
+            code = int(getattr(e, "code", 0) or 0)
+            self.finished.emit(code)
+        except Exception as e:
+            print(f"\n❌ 程序异常：{e}\n")
+            self.finished.emit(2)
+        finally:
+            builtins.input = original_input
+
+
+def _fixed_mono_font(point_size: int = FONT_PT) -> QFont:
+    """
+    关键：用 Qt 系统固定宽度字体（FixedFont），避免 fallback 到非等宽字体导致对齐崩溃。
+    """
+    f = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    f.setPointSize(point_size)
+    f.setStyleHint(QFont.StyleHint.Monospace)
+    f.setFixedPitch(True)
+    return f
+
+
+METRO_QSS = """
+QWidget {
+    background: #0F172A;
+    color: #E5E7EB;
+    font-family: "Segoe UI";
+    font-size: 12px;
+}
+
+QFrame#Header {
+    background: #111C33;
+    border: 1px solid #1F2A44;
+    border-radius: 14px;
+}
+QLabel#Title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #F9FAFB;
+}
+QLabel#SubTitle, QLabel#Status {
+    color: #9CA3AF;
+}
+
+QPlainTextEdit#Console {
+    background: #0B1224;
+    border: 1px solid #1F2A44;
+    border-radius: 14px;
+    padding: 12px;
+    selection-background-color: #0EA5E9;
+    selection-color: #081018;
+
+    /* 关键：强制等宽字体，否则 tabulate 必错位 */
+    font-family: "Cascadia Mono", "Consolas", "Courier New";
+    font-size: 13pt;
+}
+
+QFrame#CommandBar {
+    background: #0B1224;
+    border: 1px solid #1F2A44;
+    border-radius: 14px;
+}
+
+/* ===== Command input ===== */
+QLineEdit#CommandInput {
+    background: #0F172A;
+    border: 1px solid #24324F;
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #E5E7EB;
+
+    /* 输入也用等宽，观感一致 */
+    font-family: "Cascadia Mono", "Consolas", "Courier New";
+    font-size: 13pt;
+}
+
+QLineEdit#CommandInput:focus {
+    border: 1px solid #38BDF8;
+}
+
+QPushButton {
+    background: #111C33;
+    border: 1px solid #24324F;
+    border-radius: 12px;
+    padding: 10px 14px;
+    color: #E5E7EB;
+}
+QPushButton:hover {
+    border: 1px solid #38BDF8;
+}
+QPushButton:pressed {
+    background: #0F172A;
+}
+QPushButton#Primary {
+    background: #0EA5E9;
+    border: 1px solid #0EA5E9;
+    color: #081018;
+    font-weight: 600;
+}
+QPushButton#Primary:hover {
+    background: #38BDF8;
+    border: 1px solid #38BDF8;
+}
+QPushButton#Danger {
+    background: #EF4444;
+    border: 1px solid #EF4444;
+    color: #0B1224;
+    font-weight: 600;
+}
+QPushButton#Danger:hover {
+    background: #F87171;
+    border: 1px solid #F87171;
+}
+"""
+
+
+class CliWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Dahua Pricing Automation")
+        self.resize(1050, 760)
+        self.setStyleSheet(METRO_QSS)
+
+        root = QVBoxLayout()
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        # Header
+        header = QFrame()
+        header.setObjectName("Header")
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(16, 14, 16, 14)
+        header_layout.setSpacing(12)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+
+        self.title = QLabel("大华法国驻地专用产品自动化计算查询软件")
+        self.title.setObjectName("Title")
+        self.subtitle = QLabel("CLI Wrapper (Metro UI) — Unicode-safe output")
+        self.subtitle.setObjectName("SubTitle")
+
+        title_box.addWidget(self.title)
+        title_box.addWidget(self.subtitle)
+
+        header_layout.addLayout(title_box)
+        header_layout.addStretch(1)
+
+        self.btn_copy_all = QPushButton("Copy")
+        self.btn_copy_all.clicked.connect(self.copy_all)
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear_console)
+
+        header_layout.addWidget(self.btn_copy_all)
+        header_layout.addWidget(self.btn_clear)
+        header.setLayout(header_layout)
+        root.addWidget(header)
+
+        # Console (必须：等宽 + NoWrap)
+        self.console = QPlainTextEdit()
+        self.console.setObjectName("Console")
+        self.console.setReadOnly(True)
+        self.console.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        mono = _fixed_mono_font(FONT_PT)
+        self.console.setFont(mono)
+        self.console.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.console.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # 如果输出里存在 TAB，强制固定 tab stop（可选，但稳）
+        fm = QFontMetricsF(mono)
+        self.console.setTabStopDistance(fm.horizontalAdvance(" ") * 4)
+
+        root.addWidget(self.console, 1)
+
+        # Command bar
+        cmd_bar = QFrame()
+        cmd_bar.setObjectName("CommandBar")
+        cmd_layout = QHBoxLayout()
+        cmd_layout.setContentsMargins(12, 10, 12, 10)
+        cmd_layout.setSpacing(10)
+
+        self.input = QLineEdit()
+        self.input.setObjectName("CommandInput")
+        self.input.setFont(mono)  # 输入也用等宽
+        self.input.setPlaceholderText("输入 Part No. 回车发送；直接回车进入批量；输入 quit 退出。")
+        self.input.returnPressed.connect(self.on_send)
+
+        self.btn_send = QPushButton("Send")
+        self.btn_send.setObjectName("Primary")
+        self.btn_send.clicked.connect(self.on_send)
+
+        self.btn_quit = QPushButton("Quit")
+        self.btn_quit.setObjectName("Danger")
+        self.btn_quit.clicked.connect(self.send_quit)
+
+        cmd_layout.addWidget(self.input, 1)
+        cmd_layout.addWidget(self.btn_send)
+        cmd_layout.addWidget(self.btn_quit)
+
+        cmd_bar.setLayout(cmd_layout)
+        root.addWidget(cmd_bar)
+
+        self.status = QLabel("Ready")
+        self.status.setObjectName("Status")
+        root.addWidget(self.status)
+
+        self.setLayout(root)
+
+        # CLI plumbing
+        self.input_queue: "queue.Queue[str]" = queue.Queue()
+
+        self.stdout_stream = EmittingStream()
+        self.stderr_stream = EmittingStream()
+        self.stdout_stream.text_written.connect(self.append_text)
+        self.stderr_stream.text_written.connect(self.append_text)
+
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = self.stdout_stream  # type: ignore[assignment]
+        sys.stderr = self.stderr_stream  # type: ignore[assignment]
+
+        self.worker = CliWorker(self.input_queue)
+        self.worker.finished.connect(self.on_finished)  # type: ignore[attr-defined]
+        self.thread = threading.Thread(target=self.worker.run, daemon=True)
+        self.thread.start()
+
+        self.input.setFocus()
+
+    def append_text(self, s: str) -> None:
+        # 追加输出
+        self.console.moveCursor(self.console.textCursor().MoveOperation.End)
+        self.console.insertPlainText(s)
+        self.console.moveCursor(self.console.textCursor().MoveOperation.End)
+
+    def on_send(self) -> None:
+        text = self.input.text()
+        self.input.clear()
+        self.input_queue.put(text)
+        self.status.setText(f"Sent: {text}")
+
+    def send_quit(self) -> None:
+        self.input.clear()
+        self.input_queue.put("quit")
+        self.status.setText("Sent: quit")
+
+    def clear_console(self) -> None:
+        self.console.clear()
+        self.status.setText("Console cleared")
+
+    def copy_all(self) -> None:
+        QGuiApplication.clipboard().setText(self.console.toPlainText())
+        self.status.setText("Copied console text to clipboard")
+
+    def on_finished(self, code: int) -> None:
+        self.status.setText(f"CLI finished with code={code}")
+
+    def closeEvent(self, event) -> None:
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    w = CliWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
+
+FILE: ./gui_app.py
+# gui_app.py
+from __future__ import annotations
+
+import sys
+import re
+import queue
+import threading
+import builtins
+
+from PyQt6.QtCore import QObject, pyqtSignal, Qt
+from PyQt6.QtGui import QFont, QFontDatabase, QGuiApplication, QFontMetricsF
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPlainTextEdit,
+    QLineEdit,
+    QLabel,
+    QPushButton,
+    QFrame,
+)
+
+
+# 你的 CLI 里可能有 ANSI（加粗/颜色）；GUI 不解释，直接移除
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# 统一字号（你要更大就改这里）
+FONT_PT = 13
+
+
+class EmittingStream(QObject):
+    text_written = pyqtSignal(str)
+
+    def write(self, s: str) -> None:
+        if not s:
+            return
+        # 1) 去 ANSI
+        s = ANSI_RE.sub("", s)
+        # 2) 去掉 \r（carriage return），避免 GUI 行覆盖导致的“竖线漂移/残影”
+        s = s.replace("\r", "")
+        self.text_written.emit(s)
+
+    def flush(self) -> None:
+        pass
+
+
+class CliWorker(QObject):
+    finished = pyqtSignal(int)
+
+    def __init__(self, input_queue: "queue.Queue[str]"):
+        super().__init__()
+        self.input_queue = input_queue
+
+    def run(self) -> None:
+        import os
+        os.environ["DAHUA_NO_ANSI"] = "1"
+        try:
+            import main as cli_main  # 你的 main.py
+        except Exception as e:
+            print(f"❌ 无法 import main.py：{e}\n")
+            self.finished.emit(1)
+            return
+
+        original_input = builtins.input
+
+        def gui_input(prompt: str = "") -> str:
+            if prompt:
+                print(prompt, end="")
+            return self.input_queue.get()
+
+        builtins.input = gui_input
+
+        try:
+            cli_main.main()
+            self.finished.emit(0)
+        except SystemExit as e:
+            code = int(getattr(e, "code", 0) or 0)
+            self.finished.emit(code)
+        except Exception as e:
+            print(f"\n❌ 程序异常：{e}\n")
+            self.finished.emit(2)
+        finally:
+            builtins.input = original_input
+
+
+def _fixed_mono_font(point_size: int = FONT_PT) -> QFont:
+    """
+    关键：用 Qt 系统固定宽度字体（FixedFont），避免 fallback 到非等宽字体导致对齐崩溃。
+    """
+    f = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    f.setPointSize(point_size)
+    f.setStyleHint(QFont.StyleHint.Monospace)
+    f.setFixedPitch(True)
+    return f
+
+
+METRO_QSS = r"""
+/* =========================
+   Vintage Minimal Theme
+   ========================= */
+
+QWidget {
+    background: #F4F0E8;           /* warm paper */
+    color: #1B1B1B;
+    font-family: "Segoe UI";
+    font-size: 12px;
+}
+
+/* ---------- Header ---------- */
+QFrame#Header {
+    background: #F7F2EA;
+    border: 1px solid #D8D1C5;
+    border-radius: 14px;
+}
+QLabel#Title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #1B1B1B;
+}
+QLabel#SubTitle {
+    color: #5A5A5A;
+}
+QLabel#Status {
+    color: #5A5A5A;
+}
+
+/* ---------- Console ---------- */
+QPlainTextEdit#Console {
+    background: #FBF7F1;           /* lighter paper for content */
+    border: 1px solid #D8D1C5;
+    border-radius: 14px;
+    padding: 14px;
+    selection-background-color: #C9B58B; /* brass */
+    selection-color: #1B1B1B;
+
+    /* 关键：Console 强制等宽，避免表格对齐再次崩 */
+    font-family: "Cascadia Mono", "Consolas", "Courier New";
+    font-size: 13pt;
+}
+
+/* ---------- Command bar ---------- */
+QFrame#CommandBar {
+    background: #F7F2EA;
+    border: 1px solid #D8D1C5;
+    border-radius: 14px;
+}
+
+/* 输入框：纸张+墨绿描边 */
+QLineEdit#CommandInput {
+    background: #FBF7F1;
+    border: 1px solid #2B4A3F;     /* deep green */
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #1B1B1B;
+
+    font-family: "Cascadia Mono", "Consolas", "Courier New";
+    font-size: 13pt;
+}
+QLineEdit#CommandInput:focus {
+    border: 2px solid #C9B58B;     /* brass focus ring */
+}
+
+/* ---------- Buttons ---------- */
+QPushButton {
+    background: #2B4A3F;           /* deep green */
+    border: 1px solid #21382F;
+    border-radius: 12px;
+    padding: 10px 14px;
+    color: #F4F0E8;                /* paper */
+    font-weight: 600;
+}
+QPushButton:hover {
+    background: #345A4D;
+}
+QPushButton:pressed {
+    background: #21382F;
+}
+
+/* Primary：黄铜按钮 */
+QPushButton#Primary {
+    background: #C9B58B;           /* brass */
+    border: 1px solid #B7A57E;
+    color: #1B1B1B;
+    font-weight: 700;
+}
+QPushButton#Primary:hover {
+    background: #D6C49B;
+}
+QPushButton#Primary:pressed {
+    background: #B7A57E;
+}
+
+/* Danger：暗红（复古） */
+QPushButton#Danger {
+    background: #8C3A3A;
+    border: 1px solid #6F2E2E;
+    color: #FBF7F1;
+    font-weight: 700;
+}
+QPushButton#Danger:hover {
+    background: #9B4444;
+}
+QPushButton#Danger:pressed {
+    background: #6F2E2E;
+}
+
+/* 可选：滚动条做复古细条 */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 4px 2px 4px 2px;
+}
+QScrollBar::handle:vertical {
+    background: #D8D1C5;
+    border-radius: 5px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #C9B58B;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+    subcontrol-origin: margin;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+"""
+
+
+
+class CliWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Dahua Pricing Automation")
+        self.resize(1050, 760)
+        self.setStyleSheet(METRO_QSS)
+
+        root = QVBoxLayout()
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        # Header
+        header = QFrame()
+        header.setObjectName("Header")
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(16, 14, 16, 14)
+        header_layout.setSpacing(12)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+
+        self.title = QLabel("大华法国驻地专用产品自动化计算查询软件")
+        self.title.setObjectName("Title")
+        self.subtitle = QLabel("CLI Wrapper (CLASSI UI) — Unicode-safe output")
+        self.subtitle.setObjectName("SubTitle")
+
+        title_box.addWidget(self.title)
+        title_box.addWidget(self.subtitle)
+
+        header_layout.addLayout(title_box)
+        header_layout.addStretch(1)
+
+        self.btn_copy_all = QPushButton("Copy")
+        self.btn_copy_all.clicked.connect(self.copy_all)
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear_console)
+
+        header_layout.addWidget(self.btn_copy_all)
+        header_layout.addWidget(self.btn_clear)
+        header.setLayout(header_layout)
+        root.addWidget(header)
+
+        # Console (必须：等宽 + NoWrap)
+        self.console = QPlainTextEdit()
+        self.console.setObjectName("Console")
+        self.console.setReadOnly(True)
+        self.console.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        mono = _fixed_mono_font(FONT_PT)
+        self.console.setFont(mono)
+        self.console.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.console.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # 如果输出里存在 TAB，强制固定 tab stop（可选，但稳）
+        fm = QFontMetricsF(mono)
+        self.console.setTabStopDistance(fm.horizontalAdvance(" ") * 4)
+
+        root.addWidget(self.console, 1)
+
+        # Command bar
+        cmd_bar = QFrame()
+        cmd_bar.setObjectName("CommandBar")
+        cmd_layout = QHBoxLayout()
+        cmd_layout.setContentsMargins(12, 10, 12, 10)
+        cmd_layout.setSpacing(10)
+
+        self.input = QLineEdit()
+        self.input.setObjectName("CommandInput")
+        self.input.setFont(mono)  # 输入也用等宽
+        self.input.setPlaceholderText("输入 Part No. 回车发送；直接回车进入批量；输入 quit 退出。")
+        self.input.returnPressed.connect(self.on_send)
+
+        self.btn_send = QPushButton("Send")
+        self.btn_send.setObjectName("Primary")
+        self.btn_send.clicked.connect(self.on_send)
+
+        self.btn_quit = QPushButton("Quit")
+        self.btn_quit.setObjectName("Danger")
+        self.btn_quit.clicked.connect(self.send_quit)
+
+        cmd_layout.addWidget(self.input, 1)
+        cmd_layout.addWidget(self.btn_send)
+        cmd_layout.addWidget(self.btn_quit)
+
+        cmd_bar.setLayout(cmd_layout)
+        root.addWidget(cmd_bar)
+
+        self.status = QLabel("Ready")
+        self.status.setObjectName("Status")
+        root.addWidget(self.status)
+
+        self.setLayout(root)
+
+        # CLI plumbing
+        self.input_queue: "queue.Queue[str]" = queue.Queue()
+
+        self.stdout_stream = EmittingStream()
+        self.stderr_stream = EmittingStream()
+        self.stdout_stream.text_written.connect(self.append_text)
+        self.stderr_stream.text_written.connect(self.append_text)
+
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = self.stdout_stream  # type: ignore[assignment]
+        sys.stderr = self.stderr_stream  # type: ignore[assignment]
+
+        self.worker = CliWorker(self.input_queue)
+        self.worker.finished.connect(self.on_finished)  # type: ignore[attr-defined]
+        self.thread = threading.Thread(target=self.worker.run, daemon=True)
+        self.thread.start()
+
+        self.input.setFocus()
+
+    def append_text(self, s: str) -> None:
+        # 追加输出
+        self.console.moveCursor(self.console.textCursor().MoveOperation.End)
+        self.console.insertPlainText(s)
+        self.console.moveCursor(self.console.textCursor().MoveOperation.End)
+
+    def on_send(self) -> None:
+        text = self.input.text()
+        self.input.clear()
+        self.input_queue.put(text)
+        self.status.setText(f"Sent: {text}")
+
+    def send_quit(self) -> None:
+        self.input.clear()
+        self.input_queue.put("quit")
+        self.status.setText("Sent: quit")
+
+    def clear_console(self) -> None:
+        self.console.clear()
+        self.status.setText("Console cleared")
+
+    def copy_all(self) -> None:
+        QGuiApplication.clipboard().setText(self.console.toPlainText())
+        self.status.setText("Copied console text to clipboard")
+
+    def on_finished(self, code: int) -> None:
+        self.status.setText(f"CLI finished with code={code}")
+
+    def closeEvent(self, event) -> None:
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    w = CliWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
+
+FILE: ./tests/__init__.py
+# tests package — add unit tests here
+
+
+FILE: ./backend/app/main.py
+# backend/app/main.py
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from backend.engine.engine import PricingEngine, EngineConfig
+
+
+APP_ROOT = Path(__file__).resolve().parents[2]  # .../backend
+REPO_ROOT = APP_ROOT.parent  # repo root
+RUNTIME_DIR = REPO_ROOT / "runtime"
+UPLOADS_DIR = RUNTIME_DIR / "uploads"
+OUTPUTS_DIR = RUNTIME_DIR / "outputs"
+LOGS_DIR = RUNTIME_DIR / "logs"
+DATA_DIR = RUNTIME_DIR / "data"  # 真实数据放这里（FrancePrice/SysPrice/mapping）
+
+# 产物文件名保持与你原先一致
+OUT_COUNTRY = "Country_import_upload_Model.xlsx"
+OUT_COUNTRY_CUSTOMER = "Country&Customer_import_upload_Model.xlsx"
+
+STATE_NAME = "state.json"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_dirs() -> None:
+    for d in (UPLOADS_DIR, OUTPUTS_DIR, LOGS_DIR, DATA_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _job_dirs(job_id: str) -> Tuple[Path, Path, Path]:
+    up = UPLOADS_DIR / job_id
+    out = OUTPUTS_DIR / job_id
+    lg = LOGS_DIR / job_id
+    up.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    lg.mkdir(parents=True, exist_ok=True)
+    return up, out, lg
+
+
+def _state_path(job_id: str) -> Path:
+    return (OUTPUTS_DIR / job_id) / STATE_NAME
+
+
+def _write_state(job_id: str, state: Dict[str, Any]) -> None:
+    p = _state_path(job_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _read_state(job_id: str) -> Dict[str, Any]:
+    p = _state_path(job_id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="job_id not found")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+class QueryReq(BaseModel):
+    pn: str = Field(..., description="Part No.")
+
+
+app = FastAPI(title="Dahua Pricing Auto (Deploy Server)", version="0.1.0")
+
+_engine: Optional[PricingEngine] = None
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    _ensure_dirs()
+    global _engine
+    # 配置：真实数据与 mapping 都规划到 runtime/data 下
+    # 约定：
+    #   runtime/data/FrancePrice.xlsx
+    #   runtime/data/SysPrice.xls
+    #   runtime/data/productline_map_france_full.csv
+    #   runtime/data/productline_map_sys_full.csv
+    cfg = EngineConfig(runtime_dir=RUNTIME_DIR)
+    _engine = PricingEngine(cfg)
+    _engine.load()
+
+
+@app.get("/api/meta")
+def meta() -> Dict[str, Any]:
+    assert _engine is not None
+    return _engine.meta()
+
+
+@app.post("/api/query")
+def query_one(req: QueryReq) -> Dict[str, Any]:
+    assert _engine is not None
+    pn = (req.pn or "").strip()
+    if not pn:
+        raise HTTPException(status_code=400, detail="pn is empty")
+    return _engine.query_one(pn)
+
+
+@app.post("/api/batch")
+def batch(
+    level: str = Form(..., description="country | country_customer"),
+    file: UploadFile = File(...),
+) -> Dict[str, Any]:
+    """
+    批量：上传 PN 列表（txt / xlsx / csv），生成导出 xlsx。
+    level:
+      - country            -> Country_import_upload_Model.xlsx
+      - country_customer   -> Country&Customer_import_upload_Model.xlsx
+    """
+    assert _engine is not None
+    level_norm = (level or "").strip().lower()
+    if level_norm not in ("country", "country_customer"):
+        raise HTTPException(status_code=400, detail="level must be country or country_customer")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file name missing")
+
+    job_id = uuid.uuid4().hex[:16]
+    up_dir, out_dir, lg_dir = _job_dirs(job_id)
+
+    # 保存上传文件
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in (".txt", ".csv", ".xlsx", ".xls"):
+        raise HTTPException(status_code=400, detail="only .txt/.csv/.xlsx/.xls supported")
+
+    input_path = up_dir / f"input{suffix}"
+    with input_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    state = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": _utc_now_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "level": level_norm,
+        "input_name": file.filename,
+        "input_path": str(input_path),
+        "output_files": [],
+        "report": None,
+        "error": None,
+    }
+    _write_state(job_id, state)
+
+    # 先做同步闭环：直接跑批处理
+    try:
+        state["status"] = "running"
+        state["started_at"] = _utc_now_iso()
+        _write_state(job_id, state)
+
+        report = _engine.run_batch(
+            input_path=input_path,
+            level=level_norm,
+            out_dir=out_dir,
+        )
+
+        out_name = OUT_COUNTRY if level_norm == "country" else OUT_COUNTRY_CUSTOMER
+        out_file = out_dir / out_name
+        if not out_file.exists():
+            raise RuntimeError(f"output file missing: {out_file}")
+
+        state["status"] = "done"
+        state["finished_at"] = _utc_now_iso()
+        state["output_files"] = [str(out_file)]
+        state["report"] = report
+        _write_state(job_id, state)
+
+        return {"job_id": job_id, "status": "done"}
+    except Exception as e:
+        state["status"] = "failed"
+        state["finished_at"] = _utc_now_iso()
+        state["error"] = f"{type(e).__name__}: {e}"
+        _write_state(job_id, state)
+        raise HTTPException(status_code=500, detail=state["error"])
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> Dict[str, Any]:
+    return _read_state(job_id)
+
+
+@app.get("/api/jobs/{job_id}/download")
+def download(job_id: str) -> FileResponse:
+    st = _read_state(job_id)
+    if st.get("status") != "done":
+        raise HTTPException(status_code=409, detail=f"job not done, status={st.get('status')}")
+    level = st.get("level")
+    out_name = OUT_COUNTRY if level == "country" else OUT_COUNTRY_CUSTOMER
+
+    out_dir = OUTPUTS_DIR / job_id
+    out_file = out_dir / out_name
+    if not out_file.exists():
+        raise HTTPException(status_code=404, detail="output file not found")
+
+    return FileResponse(
+        path=str(out_file),
+        filename=out_name,  # 浏览器下载名保持原样
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+FILE: ./backend/engine/engine.py
+# backend/engine/engine.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+from backend.engine.core.loader import (
+    DataBundle,
+    load_all_data,
+    parse_pn_list_file,
+)
+from backend.engine.core.pricing_engine import (
+    compute_one,
+    compute_many,
+)
+from backend.engine.core.formatter import (
+    build_export_frames,
+    write_export_xlsx,
+)
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    runtime_dir: Path
+
+    @property
+    def data_dir(self) -> Path:
+        return self.runtime_dir / "data"
+
+    @property
+    def outputs_dir(self) -> Path:
+        return self.runtime_dir / "outputs"
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.runtime_dir / "uploads"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.runtime_dir / "logs"
+
+
+class PricingEngine:
+    """
+    薄 class：持有 DataBundle（大表 + 索引 + 映射），服务启动时 load 一次。
+    """
+
+    def __init__(self, cfg: EngineConfig):
+        self.cfg = cfg
+        self.data: Optional[DataBundle] = None
+        self._loaded_at: Optional[float] = None
+
+    def load(self) -> None:
+        self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        self.data = load_all_data(self.cfg.data_dir)
+        self._loaded_at = time.time()
+        _ = t0  # keep
+        # 不做 print；API 层需要 meta() 获取信息
+
+    def meta(self) -> Dict[str, Any]:
+        if self.data is None:
+            return {"loaded": False}
+        return {
+            "loaded": True,
+            "loaded_at_epoch": self._loaded_at,
+            "data_dir": str(self.cfg.data_dir),
+            "france_price_file": str(self.data.france_price_path) if self.data.france_price_path else None,
+            "sys_price_file": str(self.data.sys_price_path) if self.data.sys_price_path else None,
+            "map_fr_file": str(self.data.map_fr_path) if self.data.map_fr_path else None,
+            "map_sys_file": str(self.data.map_sys_path) if self.data.map_sys_path else None,
+            "rows_france": int(self.data.france_df.shape[0]),
+            "rows_sys": int(self.data.sys_df.shape[0]),
+        }
+
+    def query_one(self, pn: str) -> Dict[str, Any]:
+        if self.data is None:
+            raise RuntimeError("engine not loaded")
+        return compute_one(self.data, pn)
+
+    def run_batch(self, input_path: Path, level: str, out_dir: Path) -> Dict[str, Any]:
+        """
+        input_path: 上传文件路径（txt/csv/xlsx/xls）
+        level: country | country_customer
+        out_dir: /runtime/outputs/{job_id}
+        产出文件名保持原样（在 out_dir 内）
+        """
+        if self.data is None:
+            raise RuntimeError("engine not loaded")
+        level = (level or "").strip().lower()
+        if level not in ("country", "country_customer"):
+            raise ValueError("level must be country or country_customer")
+
+        pns = parse_pn_list_file(input_path)
+        results = compute_many(self.data, pns, level=level)
+
+        # 生成导出 DF（两个层级都可生成；但这里只写一个）
+        frames = build_export_frames(results)
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_export_xlsx(frames, out_dir=out_dir, level=level)
+
+        # report：not_found、warnings、统计
+        not_found = [r["pn"] for r in results if r.get("status") == "not_found"]
+        warnings = []
+        for r in results:
+            ws = r.get("warnings") or []
+            warnings.extend([{"pn": r.get("pn"), "w": w} for w in ws])
+
+        return {
+            "count_total": len(results),
+            "count_not_found": len(not_found),
+            "not_found": not_found,
+            "warnings": warnings,
+        }
+
+
+FILE: ./backend/engine/core/pricing_rules.py
+"""
+定价规则常量：DDP_RULES & PRICE_RULES
+
+注意：
+- DDP_RULES 的 key = 产品线 category（映射表里的 category）
+- PRICE_RULES 的第一层 key = price_group_hint（映射表里的 price_group_hint）
+"""
+
+# =========================
+# ① DDP A 计算规则
+# =========================
+DDP_RULES = {
+    "IPC": (0.10, 0.008, 0.02, 0.000198),
+    "HAC": (0.10, 0.008, 0.02, 0.000198),
+    "PTZ": (0.10, 0.008, 0.02, 0.000198),
+    "THERMAL": (0.10, 0.008, 0.02, 0.000198),
+
+    "NVR": (0.10, 0.052, 0.02, 0.000198),
+    "IVSS": (0.10, 0.052, 0.02, 0.000198),
+    "EVS": (0.10, 0.052, 0.02, 0.000198),
+    "XVR": (0.10, 0.052, 0.02, 0.000198),
+
+    "TRANSMISSION": (0.10, 0.0, 0.02, 0.000198),
+    "IT交换机路由器": (0.10, 0.0, 0.02, 0.000198),
+    "VDP": (0.10, 0.0, 0.02, 0.000198),
+
+    "ALARM": (0.05, 0.0, 0.02, 0.000198),
+
+    "ACCESS CONTROL": (0.10, 0.021, 0.02, 0.000198),
+
+    "ACCESSORY": (0.10, 0.011, 0.02, 0.000198),
+    "ACCESSORY线缆": (0.10, 0.037, 0.02, 0.000198),
+    "WIFI相机": (0.05, 0.0, 0.02, 0.000198),
+    
+    "监视器": (0.10, 0.0, 0.02, 0.000198),
+    "IT监视器": (0.10, 0.0, 0.02, 0.000198),
+    "商显/TV-WALL": (0.10, 0.14, 0.02, 0.000198),
+
+    "键盘/解码器": (0.10, 0.034, 0.02, 0.000198),
+    "交通": (0.10, 0.008, 0.02, 0.000198),
+    "车载前端": (0.10, 0.008, 0.02, 0.000198),
+    "车载后端": (0.10, 0.052, 0.02, 0.000198),
+
+    "硬盘/存储介质": (0.10, 0.0, 0.02, 0.000198),
+
+    "视频会议": (0.10, 0.034, 0.02, 0.000198),
+
+    "电子防盗门": (0.10, 0.0, 0.02, 0.000198),
+    "安检机": (0.15, 0.0, 0.02, 0.000198),
+    "电子白板": (0.15, 0.034, 0.02, 0.000198),
+    "烟感": (0.10, 0.02, 0.02, 0.000198),
+    "Doorbell": (0.05, 0.0, 0.02, 0.000198),
+    "软件": (0.10, 0.052, 0.02, 0.000198),
+}
+
+# =========================
+# ② 渠道价规则（基于 DDP A）
+# =========================
+PRICE_RULES = {
+    # IPC
+    "IPC": {
+        "PSDW":        dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+        "针孔":         dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC5":        dict(reseller=0.12, gold=0.27, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC5/7/MULTI-SENSOR / SPECIAL":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC3-S2":     dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC2-PRO":    dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC2":        dict(reseller=0.12, gold=0.20, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC1":        dict(reseller=0.12, gold=0.20, silver=0.25, ivory=0.30, msrp_on_installer=0.60),
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+    },
+    # HAC
+    "HAC": {
+        "_default_":   dict(reseller=0.12, gold=0.17, silver=0.20, ivory=0.25, msrp_on_installer=0.60),
+    },
+    # PTZ
+    "PTZ": {
+        "PTZ/SDT/EXPLOSION PROOF / SD10/8 / 7":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+        "SD6/5/4/3/2/1":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+    },
+    # Thermal
+    "THERMAL": {
+        "TPC":         dict(reseller=0.12, gold=0.20, silver=0.25, ivory=0.30, msrp_on_installer=0.20),
+        "TPC4 TPC5":   dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.20),
+        "_default_":   dict(reseller=0.12, gold=0.20, silver=0.25, ivory=0.30, msrp_on_installer=0.20),
+    },
+    # NVR / IVSS / EVS / XVR
+    "NVR": {
+        # 你折扣表的两大类（即便折扣相同也保留 key，便于日志可追溯）
+        "IVSS / NVR6 / NVR5-I/L":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+        "NVR5-EI/ NVR4 / NVR 2":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+    },
+    "IVSS": {
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
+    },
+    "EVS": {
+        "_default_":   dict(reseller=0.00, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+    },
+    "XVR": {
+        "_default_":   dict(reseller=0.12, gold=0.17, silver=0.20, ivory=0.25, msrp_on_installer=0.60),
+    },
+    # VDP
+    "VDP": {
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.29, ivory=0.35, msrp_on_installer=0.50),
+    },
+    # Access Control
+    "ACCESS CONTROL": {
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.35, ivory=0.40, msrp_on_installer=0.60),
+    },
+    # Transmission & IT 网络
+    "TRANSMISSION": {
+        "_default_":   dict(reseller=0.12, gold=0.20, silver=0.23, ivory=0.25, msrp_on_installer=0.60),
+    },
+    "TRANSMISSION L3": {
+        "_default_":   dict(reseller=0.12, gold=0.20, silver=0.23, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "无线网桥": {
+        "_default_":   dict(reseller=0.12, gold=0.16, silver=0.21, ivory=0.26, msrp_on_installer=0.40),
+    },
+    # Accessory
+    "ACCESSORY": {
+        "ACCESSORY":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "ACCESSORY 线缆":
+                       dict(reseller=0.12, gold=0.22, silver=0.25, ivory=0.30, msrp_on_installer=0.60),
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+    },
+    # 监视器 / 商显 / LCD
+    "监视器/商显/LCD": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "CCTV监视器": {
+        "_default_":   dict(reseller=0.12, gold=0.20, silver=0.22, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "IT监视器": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.15, ivory=0.15, msrp_on_installer=0.20),
+    },
+    # 键盘/解码器
+    "键盘/解码器": {
+        "_default_":   dict(reseller=0.15, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+    },
+    # 交通 / 停车场
+    "交通/停车场": {
+        "_default_":   dict(reseller=0.15, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+    },
+    # 车载
+    "车载": {
+        "_default_":   dict(reseller=0.15, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+    },
+    # 软件
+    "软件": {
+        "_default_":   dict(reseller=0.15, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+    },
+    # 硬盘/存储介质
+    "硬盘/存储介质": {
+        "_default_":   dict(reseller=0.10, gold=0.10, silver=0.15, ivory=0.20, msrp_on_installer=0.20),
+    },
+    # 电子白板
+    "电子白板": {
+        "_default_":   dict(reseller=0.10, gold=0.15, silver=0.15, ivory=0.15, msrp_on_installer=0.20),
+    },
+    # 安检
+    "安检": {
+        "_default_":   dict(reseller=0.15, gold=0.30, silver=0.35, ivory=0.40, msrp_on_installer=0.40),
+    },
+    # EAS
+    "EAS": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
+    },
+    # ESL
+    "ESL": {
+        "_default_":   dict(reseller=0.05, gold=0.05, silver=0.10, ivory=0.15, msrp_on_installer=0.40),
+    },
+    # 充电桩
+    "充电桩": {
+        "_default_":   dict(reseller=None, gold=0.15, silver=0.15, ivory=0.15, msrp_on_installer=0.20),
+    },
+    # Alarm
+    "Alarm":{
+        "_default_":   dict(reseller=0.3, gold=0.3, silver=0.3, ivory=0.35, msrp_on_installer=0.60),
+    },
+    # WIFI相机
+    "WIFI相机":{
+        "_default_":   dict(reseller=0.12, gold=0.2, silver=0.2, ivory=0.2, msrp_on_installer=0.20),
+    },
+    # Doorbell
+    "Doorbell":{
+        "_default_":   dict(reseller=0.12, gold=0.2, silver=0.2, ivory=0.2, msrp_on_installer=0.20),
+    }
+}
+
+
+FILE: ./backend/engine/core/formatter.py
+# backend/engine/core/loader.py
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
+
+import pandas as pd
+
+
+def safe_upper(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v).strip().upper()
+
+
+def normalize_pn_raw(pn: str) -> str:
+    """raw key：仅做 strip + upper。"""
+    return safe_upper(pn)
+
+
+def normalize_pn_base(pn: str) -> str:
+    """
+    base key：用于“同系列/同基底”匹配
+    - 去空格
+    - 保留 '-'（与你现有习惯一致）
+    - 若你本地有更复杂规则（例如去掉末尾 -xxxx），就在这里统一实现
+    """
+    s = safe_upper(pn)
+    s = s.replace(" ", "")
+    return s
+
+
+def _read_excel_any(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        return pd.read_excel(path, engine="xlrd")
+    return pd.read_excel(path)
+
+
+def _pick_pn_column(df: pd.DataFrame) -> str:
+    candidates = [
+        "Part No.",
+        "Part No",
+        "PART NO.",
+        "PART NO",
+        "PartNo",
+        "PN",
+        "pn",
+        "Part Number",
+    ]
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    for c in cols:
+        uc = str(c).upper()
+        if "PART" in uc and "NO" in uc:
+            return c
+    raise ValueError("cannot find PN column in dataframe")
+
+
+def _build_index(df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[str, int]]:
+    pn_col = _pick_pn_column(df)
+    raw_map: Dict[str, int] = {}
+    base_map: Dict[str, int] = {}
+    for i, v in enumerate(df[pn_col].tolist()):
+        r = normalize_pn_raw(v)
+        b = normalize_pn_base(v)
+        if r and r not in raw_map:
+            raw_map[r] = i
+        if b and b not in base_map:
+            base_map[b] = i
+    return raw_map, base_map
+
+
+@dataclass
+class DataBundle:
+    france_df: pd.DataFrame
+    sys_df: pd.DataFrame
+    map_fr: pd.DataFrame
+    map_sys: pd.DataFrame
+
+    france_price_path: Optional[Path] = None
+    sys_price_path: Optional[Path] = None
+    map_fr_path: Optional[Path] = None
+    map_sys_path: Optional[Path] = None
+
+    fr_idx_raw: Dict[str, int] = None
+    fr_idx_base: Dict[str, int] = None
+    sys_idx_raw: Dict[str, int] = None
+    sys_idx_base: Dict[str, int] = None
+
+
+def load_all_data(data_dir: Path) -> DataBundle:
+    """
+    约定：
+      runtime_dir/data/FrancePrice.xlsx
+      runtime_dir/data/SysPrice.xls 或 SysPrice.xlsx
+      runtime_dir/../mapping/productline_map_france_full.csv
+      runtime_dir/../mapping/productline_map_sys_full.csv
+
+    你现在 repo 根目录就有 mapping/，runtime 在 repo/runtime/，
+    所以默认 mapping_dir = runtime_dir.parent / "mapping"
+    """
+    data_dir = Path(data_dir)
+    runtime_dir = data_dir.parent
+    mapping_dir = runtime_dir.parent / "mapping"
+
+    france_path = data_dir / "FrancePrice.xlsx"
+    if not france_path.exists():
+        raise FileNotFoundError(f"FrancePrice.xlsx not found: {france_path}")
+
+    sys_candidates = [data_dir / "SysPrice.xls", data_dir / "SysPrice.xlsx"]
+    sys_path = None
+    for p in sys_candidates:
+        if p.exists():
+            sys_path = p
+            break
+    if sys_path is None:
+        tried = "\n".join([str(x) for x in sys_candidates])
+        raise FileNotFoundError("未找到 SysPrice 数据文件，已尝试以下路径：\n" + tried)
+
+    map_fr_path = mapping_dir / "productline_map_france_full.csv"
+    map_sys_path = mapping_dir / "productline_map_sys_full.csv"
+    if not map_fr_path.exists():
+        raise FileNotFoundError(f"mapping file missing: {map_fr_path}")
+    if not map_sys_path.exists():
+        raise FileNotFoundError(f"mapping file missing: {map_sys_path}")
+
+    france_df = _read_excel_any(france_path)
+    sys_df = _read_excel_any(sys_path)
+    map_fr = pd.read_csv(map_fr_path)
+    map_sys = pd.read_csv(map_sys_path)
+
+    fr_idx_raw, fr_idx_base = _build_index(france_df)
+    sys_idx_raw, sys_idx_base = _build_index(sys_df)
+
+    return DataBundle(
+        france_df=france_df,
+        sys_df=sys_df,
+        map_fr=map_fr,
+        map_sys=map_sys,
+        france_price_path=france_path,
+        sys_price_path=sys_path,
+        map_fr_path=map_fr_path,
+        map_sys_path=map_sys_path,
+        fr_idx_raw=fr_idx_raw,
+        fr_idx_base=fr_idx_base,
+        sys_idx_raw=sys_idx_raw,
+        sys_idx_base=sys_idx_base,
+    )
+
+
+def parse_pn_list_file(path: Path) -> List[str]:
+    """
+    支持：
+      - .txt：逐行 PN
+      - .csv：读第一列或名为 Part No./PN 的列
+      - .xlsx/.xls：读包含 PN 的列（同 _pick_pn_column 逻辑）
+    """
+    path = Path(path)
+    suf = path.suffix.lower()
+
+    if suf == ".txt":
+        pns = []
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # 允许用户粘贴带空格/制表符的内容
+            s = re.split(r"[\s,\t;]+", s)[0].strip()
+            if s:
+                pns.append(s)
+        return pns
+
+    if suf == ".csv":
+        df = pd.read_csv(path)
+        if df.empty:
+            return []
+        # 优先找 PN 列
+        try:
+            col = _pick_pn_column(df)
+            series = df[col]
+        except Exception:
+            series = df.iloc[:, 0]
+        return [str(x).strip() for x in series.tolist() if str(x).strip()]
+
+    if suf in (".xlsx", ".xls"):
+        df = _read_excel_any(path)
+        if df.empty:
+            return []
+        col = _pick_pn_column(df)
+        return [str(x).strip() for x in df[col].tolist() if str(x).strip()]
+
+    raise ValueError("only .txt/.csv/.xlsx/.xls supported")
+
+
+FILE: ./backend/engine/core/pricing_engine.py
+# backend/engine/core/pricing_engine.py
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import pandas as pd
+
+from backend.engine.core.loader import DataBundle, normalize_pn_base, normalize_pn_raw
+from backend.engine.core.classifier import detect_series, classify_category_and_price_group
+from backend.engine.core.pricing_rules import DDP_RULES, PRICE_RULES
+
+
+PRICE_COLS = [
+    "FOB C(EUR)",
+    "DDP A(EUR)",
+    "Suggested Reseller(EUR)",
+    "Gold(EUR)",
+    "Silver(EUR)",
+    "Ivory(EUR)",
+    "MSRP(EUR)",
+]
+
+# =========================
+# Sys FOB Uplift（涨价系数）
+# =========================
+# 仅在“使用 Sys 计算 FOB”时生效：France 国家表已给出价格时不动。
+# pct = 0.10 表示 +10%
+UPLIFT_PCT_BY_LINE = {
+    # IPC
+    "IPC1": 0.00,
+    "IPC2": 0.05,
+    "IPC3": 0.10,
+    "IPC5": 0.05,
+    "IPC7": 0.10,
+    "IPC8": 0.10,
+    # NVR / IVSS / EVS / IVD
+    "NVR4": 0.05,
+    "NVR5 EI2": 0.10,
+    "NVR6 XI": 0.10,
+    "IVD/IVSS/EVS": 0.10,
+    # PTZ / ITC / SCP / TPC
+    "PTZ": 0.05,
+    "ITC": 0.05,
+    "SCP": 0.05,
+    "TPC": 0.05,
+}
+
+
+def _get_row(df: pd.DataFrame, idx: Optional[int]) -> Optional[pd.Series]:
+    if idx is None:
+        return None
+    try:
+        return df.iloc[int(idx)]
+    except Exception:
+        return None
+
+
+def _match_one(data: DataBundle, pn: str) -> Dict[str, Any]:
+    key_r = normalize_pn_raw(pn)
+    key_b = normalize_pn_base(pn)
+
+    fr = {"mode": "none", "idx": None}
+    sy = {"mode": "none", "idx": None}
+
+    if key_r in data.fr_idx_raw:
+        fr["mode"] = "exact"
+        fr["idx"] = data.fr_idx_raw[key_r]
+    elif key_b in data.fr_idx_base:
+        fr["mode"] = "base"
+        fr["idx"] = data.fr_idx_base[key_b]
+
+    if key_r in data.sys_idx_raw:
+        sy["mode"] = "exact"
+        sy["idx"] = data.sys_idx_raw[key_r]
+    elif key_b in data.sys_idx_base:
+        sy["mode"] = "base"
+        sy["idx"] = data.sys_idx_base[key_b]
+
+    return {"france_match": fr, "sys_match": sy}
+
+
+def _num(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+        if math.isnan(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _calc_ddp_from_fob(category: str, fob: float) -> Optional[float]:
+    if fob is None:
+        return None
+    if category not in DDP_RULES:
+        return None
+    a, b, c, d = DDP_RULES[category]
+    # 你的规则：FOB*(1+a)*(1+b)*(1+c)*(1+d)
+    return fob * (1 + a) * (1 + b) * (1 + c) * (1 + d)
+
+
+def _apply_price_rule(ddp: float, rule: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    rule: dict(reseller=?, gold=?, silver=?, ivory=?, msrp_on_installer=?)
+    返回：reseller/gold/silver/ivory/msrp
+    """
+    if ddp is None:
+        return dict(reseller=None, gold=None, silver=None, ivory=None, msrp=None)
+
+    def mul(pct):
+        if pct is None:
+            return None
+        return ddp * (1 + float(pct))
+
+    reseller = mul(rule.get("reseller"))
+    gold = mul(rule.get("gold"))
+    silver = mul(rule.get("silver"))
+    ivory = mul(rule.get("ivory"))
+
+    msrp_on_installer = rule.get("msrp_on_installer")
+    if msrp_on_installer is None:
+        msrp = None
+    else:
+        # MSRP 相对 installer（这里按 gold 作为 installer 基准）
+        if gold is None:
+            msrp = None
+        else:
+            msrp = gold * (1 + float(msrp_on_installer))
+
+    return dict(reseller=reseller, gold=gold, silver=silver, ivory=ivory, msrp=msrp)
+
+
+def _detect_uplift_line_key(category: str, series_display: str) -> Optional[str]:
+    """
+    这里按你本地逻辑来：通常是把 IPC2/IPC3/NVR4... 这种“系列 key”提出来。
+    如果你本地是更复杂的识别（从 series_display / model 里拆），就在这里替换成你本地实现。
+    """
+    s = (series_display or "").strip()
+    if not s:
+        return None
+
+    # 最常见：series_display 就是 IPC2 / NVR4 这种
+    if s in UPLIFT_PCT_BY_LINE:
+        return s
+
+    # 兼容一些 display 里带额外文本的情况
+    for k in UPLIFT_PCT_BY_LINE.keys():
+        if k in s:
+            return k
+    return None
+
+
+def compute_prices_for_part(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+    category: str,
+    price_group_hint: Optional[str],
+    series_key: str,
+) -> Tuple[Dict[str, Any], Set[str], Dict[str, Any]]:
+    """
+    返回：
+      final_values: dict(Part No., FOB C(EUR), DDP A(EUR), Suggested Reseller(EUR), Gold(EUR), Silver(EUR), Ivory(EUR), MSRP(EUR))
+      calculated_fields: set([...])  # 哪些字段是自动计算出来的
+      meta: 用于 debug/报表
+    """
+    calculated: Set[str] = set()
+
+    # 1) 先取 France 的价格（若存在）
+    final_values: Dict[str, Any] = {}
+    if france_row is not None:
+        for c in PRICE_COLS:
+            if c in france_row.index:
+                final_values[c] = france_row.get(c)
+
+    # 2) 再补 Sys 的基础字段（FOB 基准通常来自 Sys）
+    # 你本地逻辑：如果 France 没给 FOB，就用 Sys FOB（并可能 uplift）
+    used_sys = False
+    sys_basis_field = None
+
+    if _num(final_values.get("FOB C(EUR)")) is None and sys_row is not None:
+        # Sys 侧可能叫 FOB 或其他字段；这里按你当前数据常见列名处理
+        # 如果你本地有更精确的 basis 选择逻辑，请替换这里
+        cand_fields = ["FOB C(EUR)", "FOB", "FOB(EUR)", "FOB C"]
+        for f in cand_fields:
+            if f in sys_row.index and _num(sys_row.get(f)) is not None:
+                final_values["FOB C(EUR)"] = sys_row.get(f)
+                sys_basis_field = f
+                used_sys = True
+                break
+
+        # uplift：仅对“使用 Sys 计算 FOB”生效
+        if used_sys:
+            fob = _num(final_values.get("FOB C(EUR)"))
+            line_key = _detect_uplift_line_key(category=category, series_display=series_key)
+            pct = UPLIFT_PCT_BY_LINE.get(line_key, 0.0)
+            if fob is not None and pct:
+                final_values["FOB C(EUR)"] = fob * (1 + float(pct))
+                calculated.add("FOB C(EUR)")
+
+    # 3) 计算 DDP（若 France 没给）
+    if _num(final_values.get("DDP A(EUR)")) is None:
+        fob = _num(final_values.get("FOB C(EUR)"))
+        ddp = _calc_ddp_from_fob(category=price_group_hint or category, fob=fob)
+        if ddp is not None:
+            final_values["DDP A(EUR)"] = ddp
+            calculated.add("DDP A(EUR)")
+
+    # 4) 价格系数（reseller/gold/silver/ivory/msrp）
+    # PRICE_RULES：按 price_group_hint -> series_key -> rule
+    pg = price_group_hint or category
+    rule_group = PRICE_RULES.get(pg, {}) if isinstance(PRICE_RULES, dict) else {}
+    rule = rule_group.get(series_key) or rule_group.get("_default_")
+    ddp = _num(final_values.get("DDP A(EUR)"))
+
+    if rule and ddp is not None:
+        computed = _apply_price_rule(ddp=ddp, rule=rule)
+
+        def set_if_missing(field: str, value: Optional[float]):
+            if _num(final_values.get(field)) is None and value is not None:
+                final_values[field] = value
+                calculated.add(field)
+
+        set_if_missing("Suggested Reseller(EUR)", computed.get("reseller"))
+        set_if_missing("Gold(EUR)", computed.get("gold"))
+        set_if_missing("Silver(EUR)", computed.get("silver"))
+        set_if_missing("Ivory(EUR)", computed.get("ivory"))
+        set_if_missing("MSRP(EUR)", computed.get("msrp"))
+
+    meta = {
+        "used_sys": used_sys,
+        "sys_basis_field": sys_basis_field,
+        "category": category,
+        "price_group_hint": price_group_hint,
+        "series_key": series_key,
+    }
+    return final_values, calculated, meta
+
+
+def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
+    pn = str(pn).strip()
+    m = _match_one(data, pn)
+
+    fr_row = _get_row(data.france_df, m["france_match"]["idx"])
+    sy_row = _get_row(data.sys_df, m["sys_match"]["idx"])
+
+    # 分类：category + price_group_hint（你 server 的 classifier 已包含兜底识别）
+    category, price_group_hint = classify_category_and_price_group(
+        france_row=fr_row, sys_row=sy_row, france_map=data.map_fr, sys_map=data.map_sys
+    )
+
+    # 系列识别（series_display + series_key）
+    series_display, series_key = detect_series(
+        price_group_hint=price_group_hint or "",
+        france_row=fr_row,
+        sys_row=sy_row,
+    )
+
+    # 计算
+    final_values, calculated_fields, meta_calc = compute_prices_for_part(
+        france_row=fr_row,
+        sys_row=sy_row,
+        category=category,
+        price_group_hint=price_group_hint,
+        series_key=(series_key or series_display or "_default_"),
+    )
+
+    # Part No.
+    final_values["Part No."] = pn
+
+    status = "ok"
+    if (m["france_match"]["idx"] is None) and (m["sys_match"]["idx"] is None):
+        status = "not_found"
+
+    return {
+        "pn": pn,
+        "status": status,
+        "france_match": m["france_match"],
+        "sys_match": m["sys_match"],
+        "category": category,
+        "price_group_hint": price_group_hint,
+        "series_display": series_display,
+        "series_key": series_key,
+        "final_values": final_values,
+        "calculated_fields": sorted(list(calculated_fields)),
+        "meta": meta_calc,
+        "warnings": [],
+    }
+
+
+def compute_many(data: DataBundle, pns: List[str], level: str) -> List[Dict[str, Any]]:
+    """
+    level: country | country_customer
+    这里 level 主要影响导出列映射（formatter 处理），计算本身一致。
+    """
+    out = []
+    for pn in pns:
+        r = compute_one(data, pn)
+        out.append(r)
+    return out
+
+
+FILE: ./backend/engine/core/classifier.py
+# core/classifier.py
+import re
+from typing import Optional, Tuple
+
+import pandas as pd
+
+
+def safe_upper(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
+    return str(v).strip().upper()
+
+
+def _normalize_field_name(f) -> str:
+    if not isinstance(f, str):
+        return ""
+    f = f.strip()
+    if not f or f.lower() == "nan":
+        return ""
+    return f
+
+
+def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[str]]:
+    """
+    通用映射逻辑：
+      - 按 priority 从小到大匹配
+      - 支持 equals / contains 两种模式
+      - 返回 (category, price_group_hint)
+    """
+    if mapping is None or mapping.empty:
+        return "UNKNOWN", None
+
+    if "priority" in mapping.columns:
+        iter_rules = mapping.sort_values("priority", ascending=True).iterrows()
+    else:
+        iter_rules = mapping.iterrows()
+
+    for _, rule in iter_rules:
+        field1 = _normalize_field_name(rule.get("field1"))
+        if not field1:
+            continue
+        match_type1 = str(rule.get("match_type1") or "").strip().lower()
+        pattern1 = safe_upper(rule.get("pattern1"))
+        value1 = safe_upper(row.get(field1))
+
+        if match_type1 == "equals":
+            if value1 != pattern1:
+                continue
+        elif match_type1 == "contains":
+            if pattern1 not in value1:
+                continue
+        else:
+            continue
+
+        field2 = _normalize_field_name(rule.get("field2"))
+        if field2:
+            match_type2 = str(rule.get("match_type2") or "").strip().lower()
+            pattern2 = safe_upper(rule.get("pattern2"))
+            value2 = safe_upper(row.get(field2))
+
+            if match_type2 == "equals":
+                if value2 != pattern2:
+                    continue
+            elif match_type2 == "contains":
+                if pattern2 not in value2:
+                    continue
+            else:
+                continue
+
+        category = str(rule.get("category") or "").strip()
+        if not category:
+            category = "UNKNOWN"
+
+        price_group_hint = rule.get("price_group_hint")
+        price_group_hint = str(price_group_hint).strip() if price_group_hint else None
+        return category, price_group_hint
+
+    return "UNKNOWN", None
+
+
+def _heuristic_detect_category_for_recorder(big: str) -> Tuple[str, Optional[str]]:
+    """
+    当 France/Sys mapping 都未命中时，强兜底识别录像机大类：
+    - 优先识别 IVSS / EVS / XVR（比 NVR 更“专名”）
+    - 其次识别 NVR
+    返回 (category, price_group_hint)
+    """
+    s = safe_upper(big)
+
+    # IVSS / EVS / XVR
+    if "IVSS" in s:
+        return "IVSS", "IVSS"
+    if re.search(r"\bEVS\b", s) or "EVS" in s:
+        return "EVS", "EVS"
+    if re.search(r"\bXVR\b", s) or "XVR" in s:
+        return "XVR", "XVR"
+
+    # NVR：覆盖 NVR4104HS / NVR4216 / NVR5xxx / NVR6xxx 等
+    if re.search(r"\bNVR\b", s) or re.search(r"\bNVR[0-9]", s):
+        return "NVR", "NVR"
+
+    return "UNKNOWN", None
+
+
+def _build_big_text(france_row: Optional[pd.Series], sys_row: Optional[pd.Series]) -> str:
+    parts = []
+
+    if france_row is not None:
+        for col in ("Internal Model", "External Model", "Series", "系列", "Description", "Second Product Line"):
+            if col in france_row and pd.notna(france_row[col]):
+                parts.append(str(france_row[col]))
+
+    if sys_row is not None:
+        for col in ("Internal Model", "External Model", "Second Product Line", "Catelog Name", "First Product Line"):
+            if col in sys_row and pd.notna(sys_row[col]):
+                parts.append(str(sys_row[col]))
+
+    return " ".join(parts)
+
+
+def _detect_ipc_series_key(big: str) -> str:
+    # IPC 代际：优先看 IPCx 字样，再兜底看 HFW/HDW 的首位数字
+    if "IPC8" in big:
+        return "IPC8"
+    if "IPC7" in big:
+        return "IPC7"
+    if "IPC5" in big:
+        return "IPC5"
+    if "IPC3" in big:
+        return "IPC3"
+    if "IPC2" in big:
+        return "IPC2"
+    if "IPC1" in big:
+        return "IPC1"
+
+    m = re.search(r"H[DF]W([0-9])", big)
+    if not m:
+        return ""
+
+    d = m.group(1)
+    if d == "8":
+        return "IPC8"
+    if d == "7":
+        return "IPC7"
+    if d == "5":
+        return "IPC5"
+    if d == "3":
+        return "IPC3"
+    if d == "2":
+        return "IPC2"
+    if d == "1":
+        return "IPC1"
+
+    return ""
+
+
+def _strip_vendor_prefix(model: str) -> str:
+    s = safe_upper(model)
+    s = re.sub(r"^(DHI|DH)\s*-\s*", "", s)
+    return s.strip()
+
+
+def _detect_ptz_series_key(big: str) -> str:
+    m = re.search(r"\b(?:DHI|DH)\s*-\s*([A-Z0-9]+(?:-[A-Z0-9]+)*)\b", big)
+    cand = ""
+    if m:
+        cand = m.group(1)
+    else:
+        m2 = re.search(r"\b(SD[0-9A-Z]+(?:-[A-Z0-9]+)*)\b", big)
+        if m2:
+            cand = m2.group(1)
+        else:
+            m3 = re.search(r"\b(PTZ[0-9A-Z]+(?:-[A-Z0-9]+)*)\b", big)
+            if m3:
+                cand = m3.group(1)
+
+    cand = _strip_vendor_prefix(cand)
+    if not cand:
+        return ""
+    token = cand.split("-", 1)[0].strip()
+    return token
+
+
+def _detect_nvr_pricing_group(big: str) -> str:
+    """
+    把 NVR/IVSS 相关型号映射到两大类 key，用于 PRICE_RULES 选子规则：
+
+      A) "IVSS / NVR6 / NVR5-I/L"
+      B) "NVR5-EI/ NVR4 / NVR 2"
+    """
+    s = big
+
+    # 1) IVSS
+    if "IVSS" in s:
+        return "IVSS / NVR6 / NVR5-I/L"
+
+    # 2) NVR 代际（NVR 后第一个数字）
+    m = re.search(r"\bNVR\s*([0-9])", s)
+    gen = m.group(1) if m else ""
+
+    if gen == "6":
+        return "IVSS / NVR6 / NVR5-I/L"
+    if gen in {"4", "2"}:
+        return "NVR5-EI/ NVR4 / NVR 2"
+
+    if gen == "5":
+        # EI
+        if re.search(r"\bEI\b", s) or re.search(r"-EI\b", s):
+            return "NVR5-EI/ NVR4 / NVR 2"
+
+        # I/L
+        if re.search(r"-I/L\b", s):
+            return "IVSS / NVR6 / NVR5-I/L"
+
+        # -I 或 -L（避免 IR 误判：要求连字符边界）
+        if re.search(r"-I\b", s) or re.search(r"-L\b", s):
+            return "IVSS / NVR6 / NVR5-I/L"
+
+        return "NVR5-EI/ NVR4 / NVR 2"
+
+    return ""
+
+
+def detect_series(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+    price_group: Optional[str],
+) -> Tuple[str, str]:
+    """
+    返回 (series_display, series_key_for_price_rules)
+    """
+    series_display = ""
+    if france_row is not None:
+        for col in ("Series", "系列"):
+            if col in france_row and pd.notna(france_row[col]):
+                series_display = str(france_row[col]).strip()
+                break
+    if not series_display and sys_row is not None:
+        for col in ("Second Product Line", "Catelog Name"):
+            if col in sys_row and pd.notna(sys_row[col]):
+                series_display = str(sys_row[col]).strip()
+                break
+
+    series_key = ""
+    pg = (price_group or "").strip().upper()
+
+    if pg == "IPC":
+        pieces = []
+        if france_row is not None:
+            for col in ("Series", "系列", "External Model", "Internal Model", "Description"):
+                if col in france_row and pd.notna(france_row[col]):
+                    pieces.append(str(france_row[col]))
+        if sys_row is not None:
+            for col in ("Internal Model", "External Model", "Second Product Line", "Catelog Name"):
+                if col in sys_row and pd.notna(sys_row[col]):
+                    pieces.append(str(sys_row[col]))
+        big = safe_upper(" ".join(pieces))
+        series_key = _detect_ipc_series_key(big)
+
+    if pg == "PTZ":
+        pieces = []
+        if france_row is not None:
+            for col in ("Internal Model", "External Model", "Series", "系列", "Description"):
+                if col in france_row and pd.notna(france_row[col]):
+                    pieces.append(str(france_row[col]))
+        if sys_row is not None:
+            for col in ("Internal Model", "External Model", "Second Product Line", "Catelog Name"):
+                if col in sys_row and pd.notna(sys_row[col]):
+                    pieces.append(str(sys_row[col]))
+        big = safe_upper(" ".join(pieces))
+        series_key = _detect_ptz_series_key(big)
+
+    if pg in {"NVR", "IVSS", "EVS", "XVR"}:
+        pieces = []
+        if france_row is not None:
+            for col in ("Internal Model", "External Model", "Series", "系列", "Description"):
+                if col in france_row and pd.notna(france_row[col]):
+                    pieces.append(str(france_row[col]))
+        if sys_row is not None:
+            for col in ("Internal Model", "External Model", "Second Product Line", "Catelog Name"):
+                if col in sys_row and pd.notna(sys_row[col]):
+                    pieces.append(str(sys_row[col]))
+        big = safe_upper(" ".join(pieces))
+        series_key = _detect_nvr_pricing_group(big) or series_key
+
+    if pg == "THERMAL":
+        if france_row is not None:
+            s_up = safe_upper(france_row.get("Series") or france_row.get("系列"))
+            if "TPC4" in s_up or "TPC5" in s_up:
+                series_key = "TPC4 TPC5"
+            elif "TPC" in s_up:
+                series_key = "TPC"
+
+    return series_display, series_key or ""
+
+
+def classify_category_and_price_group(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+    france_map: pd.DataFrame,
+    sys_map: pd.DataFrame,
+) -> Tuple[str, Optional[str]]:
+    """
+    综合 France + Sys 两侧信息确定 category & price_group_hint。
+    优先使用 France 映射，失败再用 Sys。
+    两边都失败时：对录像机大类（NVR/IVSS/EVS/XVR）做强兜底识别，避免 UNKNOWN 直接中断自动定价。
+    """
+    # 1) France 优先
+    if france_row is not None:
+        cat, pg = apply_mapping(france_row, france_map)
+        if cat != "UNKNOWN":
+            return cat, pg
+
+    # 2) Sys 其次
+    if sys_row is not None:
+        cat, pg = apply_mapping(sys_row, sys_map)
+        if cat != "UNKNOWN":
+            return cat, pg
+
+    # 3) 两边都失败：强兜底（仅限录像机大类，避免误伤其他品类）
+    big = _build_big_text(france_row, sys_row)
+    cat, pg = _heuristic_detect_category_for_recorder(big)
+    return cat, pg
+
+
+FILE: ./backend/engine/core/loader.py
+# backend/engine/core/loader.py
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import pandas as pd
+
+
+def safe_upper(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v).strip().upper()
+
+
+def pn_key_raw(pn: str) -> str:
+    return safe_upper(pn)
+
+
+def pn_key_base(pn: str) -> str:
+    """
+    base key：去掉空白 + 去掉末尾标准后缀（-0001 / -0026 这类）。
+
+    目标：对齐你本地 CLI 的 normalize_pn_base 行为，使：
+      - 1.0.01.04.42701-0026  的 base key = 1.0.01.04.42701
+      - 1.0.01.04.42701       的 base key = 1.0.01.04.42701
+
+    说明：这里只“去掉最后一段 -dddd（4位数字）”，不做更激进的改写，避免误伤。
+    """
+    s = safe_upper(pn).replace(" ", "")
+    m = re.match(r"^(.*?)-([0-9]{4})$", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+@dataclass
+class DataBundle:
+    france_df: pd.DataFrame
+    sys_df: pd.DataFrame
+    map_fr: pd.DataFrame
+    map_sys: pd.DataFrame
+
+    france_price_path: Optional[Path] = None
+    sys_price_path: Optional[Path] = None
+    map_fr_path: Optional[Path] = None
+    map_sys_path: Optional[Path] = None
+
+    # 索引：raw/base -> row index（first match）
+    fr_idx_raw: dict = None
+    fr_idx_base: dict = None
+    sys_idx_raw: dict = None
+    sys_idx_base: dict = None
+
+
+def _pick_pn_column(df: pd.DataFrame) -> str:
+    """
+    在不同表结构里找到 PN 列名。
+    你原表里可能是 'Part No.' 或 'Part No' 或 'PartNo' 等。
+    """
+    candidates = [
+        "Part No.",
+        "Part No",
+        "PART NO.",
+        "PART NO",
+        "PartNo",
+        "PN",
+        "pn",
+        "Part Number",
+        "Part Num",
+        "PART NUM",
+    ]
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    # fallback：尝试包含关键词
+    for c in cols:
+        uc = str(c).upper()
+        if "PART" in uc and "NO" in uc:
+            return c
+        if "PART" in uc and "NUM" in uc:
+            return c
+    raise ValueError("cannot find PN column in dataframe")
+
+
+def _build_index(df: pd.DataFrame) -> Tuple[dict, dict]:
+    pn_col = _pick_pn_column(df)
+    raw_map = {}
+    base_map = {}
+    for i, v in enumerate(df[pn_col].tolist()):
+        r = pn_key_raw(v)
+        b = pn_key_base(v)
+        if r and r not in raw_map:
+            raw_map[r] = i
+        if b and b not in base_map:
+            base_map[b] = i
+    return raw_map, base_map
+
+
+def _read_excel_any(path: Path) -> pd.DataFrame:
+    # .xls/.xlsx：统一用 pandas 读
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        return pd.read_excel(path, engine="xlrd")
+    return pd.read_excel(path)
+
+
+def load_all_data(data_dir: Path) -> DataBundle:
+    """
+    约定 runtime/data 内文件名：
+      - FrancePrice.xlsx
+      - SysPrice.xls 或 SysPrice.xlsx
+      - productline_map_france_full.csv
+      - productline_map_sys_full.csv
+    """
+    data_dir = Path(data_dir)
+    fr_path = data_dir / "FrancePrice.xlsx"
+    sys_xls = data_dir / "SysPrice.xls"
+    sys_xlsx = data_dir / "SysPrice.xlsx"
+    map_fr_path = data_dir / "productline_map_france_full.csv"
+    map_sys_path = data_dir / "productline_map_sys_full.csv"
+
+    if not fr_path.exists():
+        raise FileNotFoundError(f"missing {fr_path}")
+    if sys_xls.exists():
+        sys_path = sys_xls
+    elif sys_xlsx.exists():
+        sys_path = sys_xlsx
+    else:
+        raise FileNotFoundError(f"missing {sys_xls} or {sys_xlsx}")
+
+    if not map_fr_path.exists():
+        raise FileNotFoundError(f"missing {map_fr_path}")
+    if not map_sys_path.exists():
+        raise FileNotFoundError(f"missing {map_sys_path}")
+
+    france_df = _read_excel_any(fr_path)
+    sys_df = _read_excel_any(sys_path)
+    map_fr = pd.read_csv(map_fr_path)
+    map_sys = pd.read_csv(map_sys_path)
+
+    fr_idx_raw, fr_idx_base = _build_index(france_df)
+    sys_idx_raw, sys_idx_base = _build_index(sys_df)
+
+    return DataBundle(
+        france_df=france_df,
+        sys_df=sys_df,
+        map_fr=map_fr,
+        map_sys=map_sys,
+        france_price_path=fr_path,
+        sys_price_path=sys_path,
+        map_fr_path=map_fr_path,
+        map_sys_path=map_sys_path,
+        fr_idx_raw=fr_idx_raw,
+        fr_idx_base=fr_idx_base,
+        sys_idx_raw=sys_idx_raw,
+        sys_idx_base=sys_idx_base,
+    )
+
+
+def parse_pn_list_file(path: Path) -> List[str]:
+    """
+    支持：
+      - .txt：每行一个 PN
+      - .csv：第一列/或含 PN 字段
+      - .xlsx/.xls：第一列/或含 PN 字段
+    """
+    path = Path(path)
+    suf = path.suffix.lower()
+
+    if suf == ".txt":
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        pns = []
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            pns.append(s)
+        return pns
+
+    if suf == ".csv":
+        df = pd.read_csv(path)
+        col = df.iloc[:, 0]
+        return [str(x).strip() for x in col.tolist() if str(x).strip()]
+
+    if suf in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+        col = df.iloc[:, 0]
+        return [str(x).strip() for x in col.tolist() if str(x).strip()]
+
+    raise ValueError("unsupported pn list file")
+
+
