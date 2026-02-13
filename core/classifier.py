@@ -16,6 +16,7 @@ def safe_upper(v) -> str:
     return str(v).strip().upper()
 
 
+
 def _normalize_field_name(f) -> str:
     if not isinstance(f, str):
         return ""
@@ -25,60 +26,120 @@ def _normalize_field_name(f) -> str:
     return f
 
 
+
+def safe_upper(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v).strip().upper()
+
+
+def _normalize_field_name(f) -> str:
+    if not isinstance(f, str):
+        return ""
+    f = f.strip()
+    if not f or f.lower() == "nan":
+        return ""
+    return f
+
+
+def _row_get_with_aliases(row: pd.Series, primary: str, aliases: list[str]) -> str:
+    """
+    兼容列名拼写差异（比如 Catalog Name / Catelog Name）。
+    找到就返回 safe_upper(value)，找不到返回空串。
+    """
+    keys = [primary] + aliases
+    for k in keys:
+        if k in row:
+            return safe_upper(row.get(k))
+    return ""
+
+
 def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[str]]:
     """
     通用映射逻辑：
-      - 按 priority 从小到大匹配
+      - 先执行硬路由（pre-route），用于“Accessory 线缆/HDMI Extender”等关键字规则
+      - 再按 mapping.csv 的 priority 从小到大匹配
       - 支持 equals / contains 两种模式
       - 返回 (category, price_group_hint)
     """
+
+    # =========================
+    # 0) Pre-route: ACCESSORY线缆关键字优先规则（比CSV的70/71/75更优先）
+    # =========================
+    first_pl = safe_upper(row.get("First Product Line"))
+    if first_pl == "ACCESSORY":
+        # 注意：你 SysPrice 表头里是 “Catelog Name”（拼写就这样），这里做了别名兼容
+        cat_name = _row_get_with_aliases(row, "Catelog Name", ["Catalog Name", "Catalogue Name"])
+        ext_model = safe_upper(row.get("External Model"))
+        int_model = safe_upper(row.get("Internal Model"))
+
+        haystack = " | ".join([cat_name, ext_model, int_model])
+
+        # 你指定的关键字：PFM / HDMI / EXTENDER
+        if ("PFM" in haystack) or ("HDMI" in haystack) or ("EXTENDER" in haystack):
+            return "ACCESSORY线缆", "ACCESSORY线缆"
+
+    # =========================
+    # 1) 正常 CSV Mapping 规则匹配
+    # =========================
     if mapping is None or mapping.empty:
         return "UNKNOWN", None
 
+    # 统一列名、去空
+    mapping = mapping.copy()
+    mapping["field1"] = mapping["field1"].apply(_normalize_field_name)
+    mapping["match_type1"] = mapping["match_type1"].apply(_normalize_field_name)
+    mapping["pattern1"] = mapping["pattern1"].apply(_normalize_field_name)
+
+    mapping["field2"] = mapping["field2"].apply(_normalize_field_name)
+    mapping["match_type2"] = mapping["match_type2"].apply(_normalize_field_name)
+    mapping["pattern2"] = mapping["pattern2"].apply(_normalize_field_name)
+
+    # priority 从小到大
     if "priority" in mapping.columns:
-        iter_rules = mapping.sort_values("priority", ascending=True).iterrows()
-    else:
-        iter_rules = mapping.iterrows()
+        mapping = mapping.sort_values(by="priority", ascending=True, kind="mergesort")
 
-    for _, rule in iter_rules:
-        field1 = _normalize_field_name(rule.get("field1"))
-        if not field1:
-            continue
-        match_type1 = str(rule.get("match_type1") or "").strip().lower()
-        pattern1 = safe_upper(rule.get("pattern1"))
-        value1 = safe_upper(row.get(field1))
+    # 逐条匹配
+    for _, rule in mapping.iterrows():
+        f1 = rule.get("field1", "")
+        t1 = safe_upper(rule.get("match_type1", ""))
+        p1 = safe_upper(rule.get("pattern1", ""))
 
-        if match_type1 == "equals":
-            if value1 != pattern1:
-                continue
-        elif match_type1 == "contains":
-            if pattern1 not in value1:
-                continue
-        else:
+        f2 = rule.get("field2", "")
+        t2 = safe_upper(rule.get("match_type2", ""))
+        p2 = safe_upper(rule.get("pattern2", ""))
+
+        # rule 目标
+        category = str(rule.get("category", "")).strip()
+        price_group_hint = str(rule.get("price_group_hint", "")).strip()
+        if not category or category.lower() == "nan":
             continue
 
-        field2 = _normalize_field_name(rule.get("field2"))
-        if field2:
-            match_type2 = str(rule.get("match_type2") or "").strip().lower()
-            pattern2 = safe_upper(rule.get("pattern2"))
-            value2 = safe_upper(row.get(field2))
+        def _match(field: str, mtype: str, pattern: str) -> bool:
+            if not field:
+                return True  # 该条件不存在，视为通过
+            v = _row_get_with_aliases(row, field, [])  # CSV里写什么列名就按那个；别名只在 pre-route 里用
+            if not v:
+                return False
+            if mtype == "EQUALS":
+                return v == pattern
+            if mtype == "CONTAINS":
+                return pattern in v
+            return False
 
-            if match_type2 == "equals":
-                if value2 != pattern2:
-                    continue
-            elif match_type2 == "contains":
-                if pattern2 not in value2:
-                    continue
-            else:
-                continue
+        ok1 = _match(f1, t1, p1)
+        if not ok1:
+            continue
+        ok2 = _match(f2, t2, p2)
+        if not ok2:
+            continue
 
-        category = str(rule.get("category") or "").strip()
-        if not category:
-            category = "UNKNOWN"
-
-        price_group_hint = rule.get("price_group_hint")
-        price_group_hint = str(price_group_hint).strip() if price_group_hint else None
-        return category, price_group_hint
+        return category, (price_group_hint if price_group_hint and price_group_hint.lower() != "nan" else None)
 
     return "UNKNOWN", None
 

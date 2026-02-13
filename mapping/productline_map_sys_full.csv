@@ -51,9 +51,10 @@ priority,field1,match_type1,pattern1,field2,match_type2,pattern2,category,price_
 74,First Product Line,equals,Accessory,Second Product Line,equals,Detector,ACCESSORY,ACCESSORY,"Accessory / Detector → ACCESSORY"
 75,First Product Line,equals,Accessory,,,,ACCESSORY,ACCESSORY,"Accessory 兜底 → ACCESSORY"
 
-80,First Product Line,equals,Commercial Display,Second Product Line,equals,Monitor,监视器,监视器,"Commercial Display / Monitor → 监视器"
-81,First Product Line,equals,Commercial Display,Second Product Line,equals,TV,监视器,监视器,"Commercial Display / TV → 监视器"
-82,First Product Line,equals,Commercial Display,Second Product Line,equals,Display,商显/TV-WALL,商显/TV-WALL,"Commercial Display / Display → 商显/TV-WALL"
+80,First Product Line,equals,Commercial Display,Second Product Line,equals,Monitor,监视器,监视器/商显/LCD,"Commercial Display / Monitor → DDP按监视器；渠道价按监视器/商显/LCD"
+81,First Product Line,equals,Commercial Display,Second Product Line,equals,TV,监视器,监视器/商显/LCD,"Commercial Display / TV → DDP按监视器；渠道价按监视器/商显/LCD"
+82,First Product Line,equals,Commercial Display,Second Product Line,equals,Display,商显/TV-WALL,监视器/商显/LCD,"Commercial Display / Display → DDP按商显/TV-WALL；渠道价按监视器/商显/LCD"
+
 83,First Product Line,equals,Commercial Display,Second Product Line,equals,Indoor LED Display,商显/TV-WALL,商显/TV-WALL,"Commercial Display / Indoor LED Display → 商显/TV-WALL"
 84,First Product Line,equals,Commercial Display,Second Product Line,equals,Outdoor LED Display,商显/TV-WALL,商显/TV-WALL,"Commercial Display / Outdoor LED Display → 商显/TV-WALL"
 85,First Product Line,equals,Commercial Display,Second Product Line,equals,Rental LED Display,商显/TV-WALL,商显/TV-WALL,"Commercial Display / Rental LED Display → 商显/TV-WALL"
@@ -121,7 +122,7 @@ priority,field1,match_type1,pattern1,field2,match_type2,pattern2,category,price_
 
 190,First Product Line,equals,Intelligent Building,,,,ACCESS CONTROL,ACCESS CONTROL,"Intelligent Building 未命中细分规则时，兜底按门禁处理"
 191,First Product Line,equals,Intelligent Traffic,,,,交通,交通/停车场,"Intelligent Traffic 未命中细分规则时，兜底按交通处理"
-192,First Product Line,equals,Commercial Display,,,,商显/TV-WALL,商显/TV-WALL,"Commercial Display 兜底 → 商显/TV-WALL"
+192,First Product Line,equals,Commercial Display,,,,商显/TV-WALL,监视器/商显/LCD,"Commercial Display 兜底 → DDP按商显/TV-WALL；渠道价按监视器/商显/LCD"
 193,First Product Line,equals,Accessory,,,,ACCESSORY,ACCESSORY,"Accessory 兜底 → ACCESSORY"
 194,First Product Line,equals,Dahua,,,,ACCESSORY,ACCESSORY,"Dahua 其他非 HDD 行兜底 → ACCESSORY"
 
@@ -131,7 +132,7 @@ priority,field1,match_type1,pattern1,field2,match_type2,pattern2,category,price_
 403,First Product Line,equals,Thermal Camera,,,,THERMAL,THERMAL,"最终兜底：Thermal Camera → THERMAL"
 404,First Product Line,equals,TPC Camera,,,,THERMAL,THERMAL,"最终兜底：TPC Camera → THERMAL"
 405,First Product Line,equals,General Storage,,,,NVR,NVR,"最终兜底：General Storage → NVR"
-406,First Product Line,equals,Commercial Display,,,,商显/TV-WALL,商显/TV-WALL,"最终兜底：Commercial Display → 商显/TV-WALL"
+406,First Product Line,equals,Commercial Display,,,,商显/TV-WALL,监视器/商显/LCD,"最终兜底：Commercial Display → DDP按商显/TV-WALL；渠道价按监视器/商显/LCD"
 407,First Product Line,equals,Intelligent Building,,,,ACCESS CONTROL,ACCESS CONTROL,"最终兜底：Intelligent Building → ACCESS CONTROL"
 408,First Product Line,equals,Intelligent Traffic,,,,交通,交通/停车场,"最终兜底：Intelligent Traffic → 交通"
 409,First Product Line,equals,Accessory,,,,ACCESSORY,ACCESSORY,"最终兜底：Accessory → ACCESSORY"
