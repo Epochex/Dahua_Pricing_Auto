@@ -1,5 +1,35 @@
+# -----------------------------
+# Backend runtime (FastAPI)
+# -----------------------------
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# file upload (FastAPI UploadFile depends on this for multipart/form-data)
+python-multipart>=0.0.9
+
+# CORS middleware is inside starlette (brought by fastapi), keep explicit for clarity
+starlette>=0.36.0
+
+# -----------------------------
+# Data / Excel IO
+# -----------------------------
 pandas>=2.0.0
+
+# .xlsx read/write (FrancePrice.xlsx, output xlsx)
+openpyxl>=3.1.0
+
+# .xls read (SysPrice.xls)  IMPORTANT: xlrd>=2 only supports .xls (NOT .xlsx)
+xlrd>=2.0.1
+
+# Optional: if future csv encoding / speed needed
+# pyarrow>=14.0.0
+
+# -----------------------------
+# Formatting / CLI printing
+# -----------------------------
 tabulate>=0.9.0
-openpyxl>=3.1.0   # 读写 .xlsx（FrancePrice.xlsx）
-xlrd>=2.0.1       # 读 .xls（SysPrice.xls）
+
+# -----------------------------
+# (Optional) Packaging
+# -----------------------------
 pyinstaller>=6.11.0

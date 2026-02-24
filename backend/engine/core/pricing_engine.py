@@ -720,7 +720,6 @@ def _fill_missing_prices_from_base(
 # ======================================================================
 # Public server API functions
 # ======================================================================
-
 def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
     """
     server API：单个 PN 查询
@@ -735,11 +734,28 @@ def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
         data.sys_df, data.sys_idx_raw, data.sys_idx_base, key_raw, key_base
     )
 
+    warnings: List[str] = []
+
     # 去后缀补价：仅当 base_key != raw_key（说明发生了可截断）
+    used_fb = False
+    fb_from: Optional[str] = None
+    used_fr_fb = False
+    used_sys_fb = False
+    fr_fb_pn: Optional[str] = None
+    sys_fb_pn: Optional[str] = None
+
     if key_base and key_base != key_raw:
-        fr_row, used_fr_fb, _fr_fb_pn = _fill_missing_prices_from_base(data.france_df, fr_row, key_base)
-        sys_row, used_sys_fb, _sys_fb_pn = _fill_missing_prices_from_base(data.sys_df, sys_row, key_base)
-        _ = used_fr_fb or used_sys_fb
+        fr_row, used_fr_fb, fr_fb_pn = _fill_missing_prices_from_base(
+            data.france_df, fr_row, key_base
+        )
+        sys_row, used_sys_fb, sys_fb_pn = _fill_missing_prices_from_base(
+            data.sys_df, sys_row, key_base
+        )
+
+        used_fb = bool(used_fr_fb or used_sys_fb)
+        if used_fb:
+            fb_from = str(fr_fb_pn or sys_fb_pn or key_base)
+            warnings.append(f"price_fallback_from_base_pn={fb_from}")
 
     if fr_row is None and sys_row is None:
         return {
@@ -747,11 +763,18 @@ def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
             "status": "not_found",
             "final_values": {},
             "calculated_fields": [],
-            "warnings": [],
+            "warnings": warnings,
         }
 
     result = compute_prices_for_part(pn, fr_row, sys_row, data.map_fr, data.map_sys)
     result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
+
+    # Black 型号提醒（不影响计算，只做可追溯 warning）
+    internal = result.get("final_values", {}).get("Internal Model")
+    if internal is not None:
+        s = str(internal)
+        if "black" in s.lower():
+            warnings.append("internal_model_contains_black_check_white_variant")
 
     return {
         "pn": pn,
@@ -771,8 +794,14 @@ def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
             "sys_match_mode": sys_mode,
             "fr_matched_pn": fr_matched,
             "sys_matched_pn": sys_matched,
+
+            # 新增：fallback 可追溯信息（对并发/审计很关键）
+            "used_price_fallback": used_fb,
+            "fallback_base_pn": fb_from,
+            "used_fr_fallback": bool(used_fr_fb),
+            "used_sys_fallback": bool(used_sys_fb),
         },
-        "warnings": [],
+        "warnings": warnings,
     }
 
 

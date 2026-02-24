@@ -85,24 +85,24 @@ class PricingEngine:
     def run_batch(self, input_path: Path, level: str, out_dir: Path) -> Dict[str, Any]:
         """
         input_path: 上传文件路径（txt/csv/xlsx/xls）
-        level: country | country_customer
+        level: 保留参数仅兼容旧调用；导出结构统一按 country
         out_dir: /runtime/outputs/{job_id}
-        产出文件名保持原样（在 out_dir 内）
+        产出文件名统一：Country_import_upload_Model.xlsx
         """
         if self.data is None:
             raise RuntimeError("engine not loaded")
-        level = (level or "").strip().lower()
-        if level not in ("country", "country_customer"):
-            raise ValueError("level must be country or country_customer")
+
+        # 计算逻辑本身不依赖导出层级；这里统一导出 country 模板
+        level_norm = "country"
 
         pns = parse_pn_list_file(input_path)
-        results = compute_many(self.data, pns, level=level)
+        results = compute_many(self.data, pns, level=level_norm)
 
-        # 生成导出 DF（两个层级都可生成；但这里只写一个）
+        # 生成导出 DF
         frames = build_export_frames(results)
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_export_xlsx(frames, out_dir=out_dir, level=level)
+        write_export_xlsx(frames, out_dir=out_dir, level=level_norm)
 
         # report：not_found、warnings、统计
         not_found = [r["pn"] for r in results if r.get("status") == "not_found"]

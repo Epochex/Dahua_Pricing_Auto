@@ -1,12 +1,144 @@
-# runtime outputs
-runtime/
-srv/
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.tmp
+
+# =========================
+# Python (backend)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# test / cache / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# logs
 *.log
 
-# generated excel outputs
-*import_upload_Model*.xlsx
+# =========================
+# Node / Frontend (React/Vite)
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/.eslintcache
 
-# python caches
-__pycache__/
-*.pyc
-.venv/
+# optional package manager caches / lock debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Runtime data (VERY IMPORTANT)
+# 你的后端运行时目录在 /data/runtime（容器/服务器绝对路径）
+# 仓库内如果也有 runtime/ 或 data runtime 镜像目录，也一律忽略
+# =========================
+runtime/
+data/runtime/
+uploads/
+outputs/
+logs/
+tmp/
+temp/
+
+# backend runtime-like dirs (防止后续改成相对路径时误提交)
+backend/runtime/
+backend/uploads/
+backend/outputs/
+backend/logs/
+backend/app/runtime/
+
+# =========================
+# Dahua pricing project generated files / exported artifacts
+# =========================
+*.xlsx
+*.xls
+*.csv
+
+# 如果你仓库里有“模板xlsx”需要保留，请在下面用 ! 反向包含
+# 示例（按实际路径改）：
+# !backend/engine/templates/*.xlsx
+# !templates/*.xlsx
+
+# 批处理导出常见命名（冗余保护）
+Country_import_upload_Model.xlsx
+Country&Customer_import_upload_Model.xlsx
+
+# 代码导出快照（你经常生成）
+code_description.txt
+code_snapshot.txt
+code_description_server.txt
+
+# =========================
+# Secrets / local config
+# =========================
+.env
+.env.*
+!.env.example
+
+# 私钥 / 凭据（不要提交）
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# SSH keys (防误提交)
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# =========================
+# Database / local state
+# =========================
+*.sqlite
+*.sqlite3
+*.db
+
+# =========================
+# Misc binary / archives
+# =========================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# =========================
+# Keep placeholders if needed
+# =========================
+!.gitkeep
