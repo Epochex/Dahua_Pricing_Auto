@@ -77,10 +77,24 @@ class PricingEngine:
             "rows_sys": int(self.data.sys_df.shape[0]),
         }
 
-    def query_one(self, pn: str) -> Dict[str, Any]:
+    def query_one(
+        self,
+        pn: str,
+        force_category: Optional[str] = None,
+        force_price_group: Optional[str] = None,
+        force_series_key: Optional[str] = None,
+        force_full_recalc: bool = False,
+    ) -> Dict[str, Any]:
         if self.data is None:
             raise RuntimeError("engine not loaded")
-        return compute_one(self.data, pn)
+        return compute_one(
+            self.data,
+            pn,
+            force_category=force_category,
+            force_price_group=force_price_group,
+            force_series_key=force_series_key,
+            force_full_recalc=force_full_recalc,
+        )
 
     def run_batch(self, input_path: Path, level: str, out_dir: Path) -> Dict[str, Any]:
         """

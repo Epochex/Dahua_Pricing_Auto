@@ -5,6 +5,47 @@
 > 如无权限定价请直接找到相关定价人员，切勿擅自定价报价。
 > 对于无法拿准的部分，请及时与区域以及国内定价人员沟通确认。
 
+# 前端（Vite 5173）
+cd /data/Dahua_Pricing_Auto/frontend
+fuser -k 5173/tcp 2>/dev/null
+npm run dev -- --host 0.0.0.0 --port 5173
+
+
+# 后端（FastAPI/Uvicorn 8000）
+cd /data/Dahua_Pricing_Auto
+fuser -k 8000/tcp 2>/dev/null
+python3 -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+## 内网持久化部署（Nginx + systemd）
+适用场景：办公室内网长期运行，机器重启后自动恢复。
+
+### 一键部署
+```bash
+cd /data/Dahua_Pricing_Auto
+sudo bash deploy/scripts/deploy_persistent.sh
+```
+
+可选参数（默认值已写好）：
+```bash
+sudo DOMAIN=www.dahuafrance-auto-pricing.com BACKEND_PORT=8000 bash deploy/scripts/deploy_persistent.sh
+```
+
+### 访问方式
+- 已配置内网 DNS 时：`http://www.dahuafrance-auto-pricing.com`
+- 未配置 DNS 时：先通过服务器 IP 访问（部署脚本会打印 IP），并可在客户端临时加 hosts：
+```text
+<服务器内网IP>  www.dahuafrance-auto-pricing.com dahuafrance-auto-pricing.com
+```
+
+### 服务管理
+```bash
+sudo systemctl status dahua-pricing-backend --no-pager
+sudo systemctl restart dahua-pricing-backend
+sudo systemctl status nginx --no-pager
+sudo systemctl restart nginx
+```
+
+
 ## 1. 定价流程概述
 定价分为法国国家侧定价和客户侧定价两部分，总共有如下定价层级  
 ![alt text](img/image.png)  
@@ -185,4 +226,3 @@ https://gsp.dahuasecurity.com/cpqMicro/#/
 
 ### 黑色型号定价
 部分产品黑色型号为其白色型号的特殊定制款，Internal Model 含 'Black'，请核对是否存在对应白色型号（White），如存在，极有可能其定价是基于白色定价基础上+2欧元
-

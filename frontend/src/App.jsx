@@ -93,6 +93,33 @@ function renderFieldValue(v) {
   return String(v);
 }
 
+function formatMatchMode(mode, matchedPn) {
+  const m = String(mode || "").toLowerCase();
+  const hit = safeStr(matchedPn);
+  if (m === "exact") {
+    return hit ? `精准匹配（${hit}）` : "精准匹配";
+  }
+  if (m === "base") {
+    return hit ? `回退查找（去国际化后缀，命中 ${hit}）` : "回退查找（去国际化后缀）";
+  }
+  if (m === "none") return "未匹配";
+  return safeStr(mode);
+}
+
+function parseFilenameFromContentDisposition(value) {
+  const s = String(value || "");
+  const utf8 = s.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8 && utf8[1]) {
+    try {
+      return decodeURIComponent(utf8[1]);
+    } catch {
+      return utf8[1];
+    }
+  }
+  const basic = s.match(/filename=\"?([^\";]+)\"?/i);
+  return basic && basic[1] ? basic[1] : "";
+}
+
 function QueryPriceTable({ resp }) {
   const fv = resp?.final_values || {};
   const calculated = new Set(resp?.calculated_fields || []);
@@ -166,6 +193,9 @@ function QueryDiagnosticBlock({ resp }) {
   if (!resp) return null;
   const meta = resp?.meta || {};
   const statusOk = String(resp?.status || "").toLowerCase() === "ok";
+  const manualOverride = Boolean(meta?.manual_override);
+  const frMatchText = formatMatchMode(meta.fr_match_mode, meta.fr_matched_pn);
+  const sysMatchText = formatMatchMode(meta.sys_match_mode, meta.sys_matched_pn);
 
   const calcStatusText = statusOk
     ? `自动化计算成功（产品线：${safeStr(meta.category)} / 子线：${safeStr(
@@ -188,12 +218,12 @@ function QueryDiagnosticBlock({ resp }) {
 
         <div className="diagItem">
           <div className="diagLabel">法国国家侧匹配</div>
-          <div className="diagValue">{safeStr(meta.fr_match_mode)}</div>
+          <div className="diagValue">{frMatchText}</div>
         </div>
 
         <div className="diagItem">
           <div className="diagLabel">系统侧匹配</div>
-          <div className="diagValue">{safeStr(meta.sys_match_mode)}</div>
+          <div className="diagValue">{sysMatchText}</div>
         </div>
 
         <div className="diagItem diagSpan2">
@@ -212,12 +242,30 @@ function QueryDiagnosticBlock({ resp }) {
           <div className="diagInlineWarn">
             务必严格核对产品描述与识别产品线是否符合
           </div>
+          <div className="small" style={{ marginTop: 6 }}>
+            取价策略：国家侧优先；缺失或层级不全时，系统侧按底价补算。
+          </div>
         </div>
       </div>
 
       <div className="diagTextRow">
         <div className="diagTextLabel">计算层级</div>
         <div className="diagTextValue">{calcLevelText}</div>
+      </div>
+
+      <div className="diagTextRow">
+        <div className="diagTextLabel">重算模式</div>
+        <div className="diagTextValue">
+          {manualOverride ? (
+            <span className="bigPill monoInline">
+              MANUAL OVERRIDE · category={safeStr(meta?.forced_category)} · price_group={safeStr(
+                meta?.forced_price_group
+              )} · series_key={safeStr(meta?.forced_series_key)}
+            </span>
+          ) : (
+            <span className="bigPill monoInline">AUTO</span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -226,8 +274,86 @@ function QueryDiagnosticBlock({ resp }) {
 function SingleQuery() {
   const [pn, setPn] = useState("");
   const [loading, setLoading] = useState(false);
+  const [recalcLoading, setRecalcLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [resp, setResp] = useState(null);
   const [err, setErr] = useState("");
+  const [optionsErr, setOptionsErr] = useState("");
+  const [queryOptions, setQueryOptions] = useState({
+    categories: [],
+    price_groups: [],
+    category_price_groups: {},
+    group_rule_keys: {},
+  });
+  const [manualCategory, setManualCategory] = useState("");
+  const [manualPriceGroup, setManualPriceGroup] = useState("");
+  const [manualSeriesKey, setManualSeriesKey] = useState("_default_");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await apiGetJson("/api/query/options");
+        setQueryOptions({
+          categories: Array.isArray(r?.categories) ? r.categories : [],
+          price_groups: Array.isArray(r?.price_groups) ? r.price_groups : [],
+          category_price_groups:
+            r?.category_price_groups && typeof r.category_price_groups === "object"
+              ? r.category_price_groups
+              : {},
+          group_rule_keys:
+            r?.group_rule_keys && typeof r.group_rule_keys === "object" ? r.group_rule_keys : {},
+        });
+      } catch (e) {
+        setOptionsErr(String(e.message || e));
+      }
+    })();
+  }, []);
+
+  const categoryOptions = useMemo(() => {
+    const set = new Set([
+      ...(Array.isArray(queryOptions.categories) ? queryOptions.categories : []),
+      safeStr(resp?.meta?.category),
+    ]);
+    return Array.from(set).filter((x) => x).sort();
+  }, [queryOptions, resp]);
+
+  const priceGroupOptions = useMemo(() => {
+    const set = new Set([
+      ...(Array.isArray(queryOptions.price_groups) ? queryOptions.price_groups : []),
+      safeStr(resp?.meta?.price_group),
+    ]);
+    return Array.from(set).filter((x) => x).sort();
+  }, [queryOptions, resp]);
+
+  const categoryPriceGroups = useMemo(() => {
+    const map = queryOptions?.category_price_groups || {};
+    const arr = Array.isArray(map?.[manualCategory]) ? map[manualCategory] : [];
+    if (arr.length > 0) return arr;
+    if (manualCategory && priceGroupOptions.includes(manualCategory)) return [manualCategory];
+    return manualPriceGroup ? [manualPriceGroup] : [];
+  }, [queryOptions, manualCategory, manualPriceGroup, priceGroupOptions]);
+
+  const seriesKeyOptions = useMemo(() => {
+    const map = queryOptions?.group_rule_keys || {};
+    const arr = Array.isArray(map?.[manualPriceGroup]) ? map[manualPriceGroup] : [];
+    if (arr.length === 0) return ["_default_"];
+    return arr.includes("_default_") ? arr : ["_default_", ...arr];
+  }, [queryOptions, manualPriceGroup]);
+
+  useEffect(() => {
+    if (!manualCategory) return;
+    if (categoryPriceGroups.length === 0) return;
+    if (!categoryPriceGroups.includes(manualPriceGroup)) {
+      setManualPriceGroup(categoryPriceGroups[0]);
+    }
+  }, [manualCategory, manualPriceGroup, categoryPriceGroups]);
+
+  useEffect(() => {
+    if (seriesKeyOptions.length === 0) return;
+    if (!seriesKeyOptions.includes(manualSeriesKey)) {
+      setManualSeriesKey(seriesKeyOptions[0]);
+    }
+  }, [seriesKeyOptions, manualSeriesKey]);
 
   async function run() {
     setErr("");
@@ -240,10 +366,99 @@ function SingleQuery() {
     try {
       const r = await apiPostJson("/api/query", { pn: s });
       setResp(r);
+      const nextCategory = safeStr(r?.meta?.category);
+      const nextPriceGroup = safeStr(r?.meta?.price_group);
+      const nextSeriesKey = safeStr(r?.meta?.series_key) || "_default_";
+      setManualCategory(nextCategory);
+      setManualPriceGroup(nextPriceGroup);
+      setManualSeriesKey(nextSeriesKey);
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function recalc() {
+    if (!resp) return;
+    const s = (pn || safeStr(resp?.pn)).trim();
+    if (!s) return;
+
+    if (!manualCategory) {
+      setErr("请先选择产品线大类");
+      return;
+    }
+
+    setErr("");
+    setRecalcLoading(true);
+    try {
+      const r = await apiPostJson("/api/query/recompute", {
+        pn: s,
+        force_category: manualCategory || null,
+        force_price_group: manualPriceGroup || null,
+        force_series_key: manualSeriesKey || null,
+      });
+      setResp(r);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setRecalcLoading(false);
+    }
+  }
+
+  async function exportOne() {
+    if (!resp) return;
+    const s = (pn || safeStr(resp?.pn)).trim();
+    if (!s) return;
+
+    const meta = resp?.meta || {};
+    const manualOverride = Boolean(meta?.manual_override);
+
+    const payload = {
+      pn: s,
+      force_category: null,
+      force_price_group: null,
+      force_series_key: null,
+      force_full_recalc: false,
+    };
+
+    if (manualOverride) {
+      payload.force_category = safeStr(meta?.forced_category) || null;
+      payload.force_price_group = safeStr(meta?.forced_price_group) || null;
+      payload.force_series_key = safeStr(meta?.forced_series_key) || null;
+      payload.force_full_recalc = Boolean(meta?.force_full_recalc);
+    }
+
+    setErr("");
+    setExporting(true);
+    try {
+      const r = await fetch("/api/query/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`POST /api/query/export -> ${r.status} ${txt}`);
+      }
+      const blob = await r.blob();
+      const cd = r.headers.get("Content-Disposition") || r.headers.get("content-disposition");
+      const fromServer = parseFilenameFromContentDisposition(cd);
+      const fallback = `${s.replace(/[^a-zA-Z0-9._-]+/g, "_")}_Country_import_upload_Model.xlsx`;
+      const filename = fromServer || fallback;
+
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -270,6 +485,9 @@ function SingleQuery() {
         <button className="btn primary" onClick={run} disabled={loading}>
           {loading ? "RUNNING..." : "RUN"}
         </button>
+        <button className="btn" onClick={exportOne} disabled={!resp || exporting || loading}>
+          {exporting ? "EXPORTING..." : "EXPORT"}
+        </button>
       </div>
 
       {err ? (
@@ -292,6 +510,93 @@ function SingleQuery() {
           <Hr />
           <div className="sectionTitle">PRICE FIELDS</div>
           <QueryPriceTable resp={resp} />
+
+          <Hr />
+          <div className="sectionTitle">MANUAL RECALCULATE</div>
+          <div className="diagBlock">
+            <div className="diagHeader">
+              <div className="diagTitle">RE-CALCULATE WITH MANUAL PRODUCT LINE</div>
+              <span className="small monoInline">POST /api/query/recompute</span>
+            </div>
+
+            <div className="diagTextRow">
+              <div className="diagTextLabel">当前自动识别</div>
+              <div className="diagTextValue">
+                <span className="bigPill monoInline">category: {safeStr(resp?.meta?.category)}</span>
+                <span className="bigPill monoInline">price_group: {safeStr(resp?.meta?.price_group)}</span>
+                <span className="bigPill monoInline">series_key: {safeStr(resp?.meta?.series_key)}</span>
+              </div>
+            </div>
+
+            <div className="diagTextRow">
+              <div className="diagTextLabel">手动重算</div>
+              <div className="diagTextValue">
+                <div className="row wrap">
+                  <select
+                    className="input mono"
+                    style={{ maxWidth: 320 }}
+                    value={manualCategory}
+                    onChange={(e) => setManualCategory(e.target.value)}
+                  >
+                    <option value="">(选择产品线大类)</option>
+                    {categoryOptions.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    className="input mono"
+                    style={{ maxWidth: 360 }}
+                    value={manualSeriesKey}
+                    onChange={(e) => setManualSeriesKey(e.target.value)}
+                  >
+                    {seriesKeyOptions.map((k) => (
+                      <option key={k} value={k}>
+                        {k}
+                      </option>
+                    ))}
+                  </select>
+
+                  <button
+                    className="btn primary"
+                    onClick={recalc}
+                    disabled={recalcLoading}
+                  >
+                    {recalcLoading ? "RECALCULATING..." : "RECALCULATE"}
+                  </button>
+                </div>
+
+                <div className="small" style={{ marginTop: 8 }}>
+                  逻辑：先选产品线大类，再选子产品线（无细分时使用 `_default_`），再全量重算。
+                </div>
+                <div className="small monoInline" style={{ marginTop: 6 }}>
+                  price_group(auto): {safeStr(manualPriceGroup || "(auto unresolved)")}
+                </div>
+
+                {categoryPriceGroups.length > 1 ? (
+                  <div className="row wrap" style={{ marginTop: 8 }}>
+                    <span className="small monoInline">高级：切换 price_group</span>
+                    <select
+                      className="input mono"
+                      style={{ maxWidth: 360 }}
+                      value={manualPriceGroup}
+                      onChange={(e) => setManualPriceGroup(e.target.value)}
+                    >
+                      {categoryPriceGroups.map((g) => (
+                        <option key={g} value={g}>
+                          {g}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+
+                {optionsErr ? <div className="small err">{optionsErr}</div> : null}
+              </div>
+            </div>
+          </div>
 
           {/* <Hr />
           <div className="sectionTitle">RAW DEBUG</div>

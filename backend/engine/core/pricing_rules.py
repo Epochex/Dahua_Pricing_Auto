@@ -49,6 +49,7 @@ DDP_RULES = {
     "安检机": (0.15, 0.0, 0.02, 0.000198),
     "电子白板": (0.15, 0.034, 0.02, 0.000198),
     "烟感": (0.10, 0.02, 0.02, 0.000198),
+    "充电桩": (0.10, 0.02, 0.02, 0.000198),
     "Doorbell": (0.05, 0.0, 0.02, 0.000198),
     "软件": (0.10, 0.052, 0.02, 0.000198),
 }
@@ -131,8 +132,17 @@ PRICE_RULES = {
                        dict(reseller=0.12, gold=0.22, silver=0.25, ivory=0.30, msrp_on_installer=0.60),
         "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
     },
+    "ACCESSORY线缆": {
+        "_default_":   dict(reseller=0.12, gold=0.22, silver=0.25, ivory=0.30, msrp_on_installer=0.60),
+    },
     # 监视器 / 商显 / LCD
     "监视器/商显/LCD": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "监视器": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "商显/TV-WALL": {
         "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
     },
     "CCTV监视器": {
@@ -169,20 +179,35 @@ PRICE_RULES = {
     "安检": {
         "_default_":   dict(reseller=0.15, gold=0.30, silver=0.35, ivory=0.40, msrp_on_installer=0.40),
     },
+    "安检机": {
+        "_default_":   dict(reseller=0.15, gold=0.30, silver=0.35, ivory=0.40, msrp_on_installer=0.40),
+    },
     # EAS
     "EAS": {
+        "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
+    },
+    "电子防盗门": {
         "_default_":   dict(reseller=0.12, gold=0.15, silver=0.20, ivory=0.25, msrp_on_installer=0.40),
     },
     # ESL
     "ESL": {
         "_default_":   dict(reseller=0.05, gold=0.05, silver=0.10, ivory=0.15, msrp_on_installer=0.40),
     },
+    "视频会议": {
+        "_default_":   dict(reseller=0.15, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+    },
     # 充电桩
     "充电桩": {
         "_default_":   dict(reseller=None, gold=0.15, silver=0.15, ivory=0.15, msrp_on_installer=0.20),
     },
+    "烟感": {
+        "_default_":   dict(reseller=0.30, gold=0.30, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+    },
     # Alarm
     "Alarm":{
+        "_default_":   dict(reseller=0.3, gold=0.3, silver=0.3, ivory=0.35, msrp_on_installer=0.60),
+    },
+    "ALARM":{
         "_default_":   dict(reseller=0.3, gold=0.3, silver=0.3, ivory=0.35, msrp_on_installer=0.60),
     },
     # WIFI相机

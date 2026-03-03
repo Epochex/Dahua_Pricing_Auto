@@ -298,6 +298,49 @@ _EAS_ALIASES: Tuple[str, ...] = (
     "电子防盗系统",
 )
 
+_STRICT_PRICE_GROUP_POLICY: Dict[str, Dict[str, Any]] = {
+    "ACCESS CONTROL": {"default": "ACCESS CONTROL", "allowed": {"ACCESS CONTROL"}},
+    "ALARM": {"default": "Alarm", "allowed": {"Alarm"}},
+    "WIFI相机": {"default": "WIFI相机", "allowed": {"WIFI相机"}},
+    "DOORBELL": {"default": "Doorbell", "allowed": {"Doorbell"}},
+}
+
+
+def _norm_upper_text(v: Optional[str]) -> str:
+    return str(v or "").strip().upper()
+
+
+def strict_price_group_default(category: Optional[str]) -> Optional[str]:
+    pol = _STRICT_PRICE_GROUP_POLICY.get(_norm_upper_text(category))
+    if not pol:
+        return None
+    return str(pol.get("default") or "").strip() or None
+
+
+def is_strict_price_group_compatible(category: Optional[str], price_group: Optional[str]) -> bool:
+    pol = _STRICT_PRICE_GROUP_POLICY.get(_norm_upper_text(category))
+    if not pol:
+        return True
+    allowed = {str(x).strip().upper() for x in (pol.get("allowed") or set())}
+    return _norm_upper_text(price_group) in allowed
+
+
+def _sanitize_price_group_for_category(
+    category: Optional[str],
+    price_group: Optional[str],
+) -> Tuple[Optional[str], bool]:
+    """
+    对部分强约束产品线执行一致性修正，避免出现 category 与 price_group 跨线错配。
+    返回 (sanitized_price_group, changed)
+    """
+    pg = str(price_group).strip() if price_group is not None else None
+    if is_strict_price_group_compatible(category, pg):
+        return pg, False
+    default_pg = strict_price_group_default(category)
+    if default_pg:
+        return default_pg, True
+    return pg, False
+
 
 def _series_implies_eas(series_key: str, series_display: str) -> bool:
     sk = _norm_key(series_key)
@@ -470,6 +513,10 @@ def compute_prices_for_part(
     sys_row: Optional[pd.Series],
     france_map: pd.DataFrame,
     sys_map: pd.DataFrame,
+    force_category: Optional[str] = None,
+    force_price_group: Optional[str] = None,
+    force_series_key: Optional[str] = None,
+    force_full_recalc: bool = False,
 ) -> Dict:
     """
     输出 result dict：
@@ -489,11 +536,22 @@ def compute_prices_for_part(
         if fb_cat != "UNKNOWN":
             category, price_group = fb_cat, (fb_pg or fb_cat)
 
+    if force_category:
+        category = str(force_category).strip()
+    if force_price_group:
+        price_group = str(force_price_group).strip()
+
     if not price_group:
         price_group = category
 
+    # 自动分类时，强约束类目禁止跨线 price_group（例如 ACCESS CONTROL 被误配到 WIFI相机）
+    if not force_price_group:
+        price_group, _ = _sanitize_price_group_for_category(category, price_group)
+
     # 2) Series（展示 + 给 PRICE_RULES 选子规则用）
     series_display, series_key = detect_series(france_row, sys_row, price_group)
+    if force_series_key:
+        series_key = str(force_series_key).strip()
 
     # 3) 原始值（France 优先，France 不存在则从 Sys 补基础字段）
     final_values = build_original_values(france_row, sys_row)
@@ -531,7 +589,7 @@ def compute_prices_for_part(
         }
 
     # 4) 如果 France 所有价格都齐全 → 全部 Original（不计算）
-    if _all_prices_present(france_row):
+    if _all_prices_present(france_row) and not force_full_recalc:
         return {
             "final_values": final_values,
             "calculated_fields": calculated_fields,
@@ -572,7 +630,12 @@ def compute_prices_for_part(
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
-    if ddp_existing is not None and ddp_existing > 0:
+    if force_full_recalc:
+        ddp_a = compute_ddp_a_from_fob(fob, category)
+        if ddp_a is not None:
+            final_values["DDP A(EUR)"] = ddp_a
+            calculated_fields.add("DDP A(EUR)")
+    elif ddp_existing is not None and ddp_existing > 0:
         ddp_a = ddp_existing
     else:
         ddp_a = compute_ddp_a_from_fob(fob, category)
@@ -587,7 +650,14 @@ def compute_prices_for_part(
             for col in PRICE_COLS:
                 if col == "FOB C(EUR)":
                     continue
-                if _to_float(final_values.get(col)) is None and col in channel_prices:
+                if col not in channel_prices:
+                    continue
+                if force_full_recalc:
+                    if channel_prices[col] is not None:
+                        final_values[col] = channel_prices[col]
+                        calculated_fields.add(col)
+                    continue
+                if _to_float(final_values.get(col)) is None:
                     final_values[col] = channel_prices[col]
                     calculated_fields.add(col)
 
@@ -720,7 +790,14 @@ def _fill_missing_prices_from_base(
 # ======================================================================
 # Public server API functions
 # ======================================================================
-def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
+def compute_one(
+    data: DataBundle,
+    pn: str,
+    force_category: Optional[str] = None,
+    force_price_group: Optional[str] = None,
+    force_series_key: Optional[str] = None,
+    force_full_recalc: bool = False,
+) -> Dict[str, Any]:
     """
     server API：单个 PN 查询
     """
@@ -766,7 +843,21 @@ def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
             "warnings": warnings,
         }
 
-    result = compute_prices_for_part(pn, fr_row, sys_row, data.map_fr, data.map_sys)
+    force_category_norm = str(force_category).strip() if force_category else None
+    force_price_group_norm = str(force_price_group).strip() if force_price_group else None
+    force_series_key_norm = str(force_series_key).strip() if force_series_key else None
+
+    result = compute_prices_for_part(
+        pn,
+        fr_row,
+        sys_row,
+        data.map_fr,
+        data.map_sys,
+        force_category=force_category_norm,
+        force_price_group=force_price_group_norm,
+        force_series_key=force_series_key_norm,
+        force_full_recalc=bool(force_full_recalc),
+    )
     result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
 
     # Black 型号提醒（不影响计算，只做可追溯 warning）
@@ -800,6 +891,11 @@ def compute_one(data: DataBundle, pn: str) -> Dict[str, Any]:
             "fallback_base_pn": fb_from,
             "used_fr_fallback": bool(used_fr_fb),
             "used_sys_fallback": bool(used_sys_fb),
+            "manual_override": bool(force_category_norm or force_price_group_norm),
+            "forced_category": force_category_norm,
+            "forced_price_group": force_price_group_norm,
+            "forced_series_key": force_series_key_norm,
+            "force_full_recalc": bool(force_full_recalc),
         },
         "warnings": warnings,
     }

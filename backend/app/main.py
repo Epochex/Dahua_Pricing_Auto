@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from collections import Counter, defaultdict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
 from backend.engine.core import pricing_rules as pricing_rules_mod
+from backend.engine.core.formatter import build_export_frames, write_export_xlsx
 
 
 APP_ROOT = Path(__file__).resolve().parents[2]  # .../backend
@@ -202,6 +204,109 @@ class QueryReq(BaseModel):
     pn: str = Field(..., description="Part No.")
 
 
+class QueryRecomputeReq(BaseModel):
+    pn: str = Field(..., description="Part No.")
+    force_category: Optional[str] = Field(default=None, description="override DDP category")
+    force_price_group: Optional[str] = Field(default=None, description="override PRICE_RULES group")
+    force_series_key: Optional[str] = Field(default=None, description="override PRICE_RULES subgroup key")
+
+
+class QueryExportReq(BaseModel):
+    pn: str = Field(..., description="Part No.")
+    force_category: Optional[str] = Field(default=None, description="override DDP category")
+    force_price_group: Optional[str] = Field(default=None, description="override PRICE_RULES group")
+    force_series_key: Optional[str] = Field(default=None, description="override PRICE_RULES subgroup key")
+    force_full_recalc: bool = Field(default=False, description="force full price recalculation")
+
+
+def _norm_optional_text(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _validate_query_overrides(
+    force_category: Optional[str],
+    force_price_group: Optional[str],
+    force_series_key: Optional[str],
+    *,
+    require_any: bool = False,
+) -> None:
+    if require_any and not force_category and not force_price_group:
+        raise HTTPException(status_code=400, detail="force_category or force_price_group is required")
+
+    if force_category and force_category not in pricing_rules_mod.DDP_RULES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"force_category not found in DDP_RULES: {force_category!r}",
+        )
+
+    if force_price_group and force_price_group not in pricing_rules_mod.PRICE_RULES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"force_price_group not found in PRICE_RULES: {force_price_group!r}",
+        )
+
+    if force_series_key and force_price_group:
+        group_rules = pricing_rules_mod.PRICE_RULES.get(force_price_group) or {}
+        if force_series_key not in group_rules:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"force_series_key not found in PRICE_RULES[{force_price_group!r}]: "
+                    f"{force_series_key!r}"
+                ),
+            )
+
+    if force_category and force_price_group:
+        if not pricing_engine_mod.is_strict_price_group_compatible(force_category, force_price_group):
+            default_pg = pricing_engine_mod.strict_price_group_default(force_category)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"incompatible force_category/force_price_group: "
+                    f"{force_category!r} vs {force_price_group!r}; "
+                    f"expected price_group={default_pg!r}"
+                ),
+            )
+
+
+def _build_category_price_groups() -> Dict[str, list[str]]:
+    out: Dict[str, list[str]] = {}
+    if _engine is None or _engine.data is None:
+        return out
+
+    cnt: Dict[str, Counter[str]] = defaultdict(Counter)
+    for df in (_engine.data.map_fr, _engine.data.map_sys):
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            cat = _norm_optional_text(row.get("category"))
+            pg = _norm_optional_text(row.get("price_group_hint"))
+            if not cat or not pg:
+                continue
+            if pg not in pricing_rules_mod.PRICE_RULES:
+                continue
+            cnt[cat][pg] += 1
+
+    for cat in sorted(cnt.keys()):
+        ranked = [k for k, _ in cnt[cat].most_common() if k in pricing_rules_mod.PRICE_RULES]
+        if cat in pricing_rules_mod.PRICE_RULES and cat in ranked:
+            ranked = [cat] + [x for x in ranked if x != cat]
+        elif cat in pricing_rules_mod.PRICE_RULES:
+            ranked = [cat] + ranked
+        out[cat] = ranked
+
+    for cat in sorted(pricing_rules_mod.DDP_RULES.keys()):
+        if cat in out:
+            continue
+        if cat in pricing_rules_mod.PRICE_RULES:
+            out[cat] = [cat]
+
+    return out
+
+
 app = FastAPI(title="Dahua Pricing Auto (Deploy Server)", version="0.2.0")
 
 _engine: Optional[PricingEngine] = None
@@ -230,6 +335,91 @@ def query_one(req: QueryReq) -> Dict[str, Any]:
     if not pn:
         raise HTTPException(status_code=400, detail="pn is empty")
     return _engine.query_one(pn)
+
+
+@app.get("/api/query/options")
+def query_options() -> Dict[str, Any]:
+    category_price_groups = _build_category_price_groups()
+    group_rule_keys = {
+        str(g): sorted([str(k) for k in (v.keys() if isinstance(v, dict) else [])])
+        for g, v in pricing_rules_mod.PRICE_RULES.items()
+    }
+    return {
+        "categories": sorted([str(k) for k in pricing_rules_mod.DDP_RULES.keys()]),
+        "price_groups": sorted([str(k) for k in pricing_rules_mod.PRICE_RULES.keys()]),
+        "category_price_groups": category_price_groups,
+        "group_rule_keys": group_rule_keys,
+    }
+
+
+@app.post("/api/query/recompute")
+def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
+    assert _engine is not None
+    pn = (req.pn or "").strip()
+    if not pn:
+        raise HTTPException(status_code=400, detail="pn is empty")
+
+    force_category = _norm_optional_text(req.force_category)
+    force_price_group = _norm_optional_text(req.force_price_group)
+    force_series_key = _norm_optional_text(req.force_series_key)
+    _validate_query_overrides(
+        force_category,
+        force_price_group,
+        force_series_key,
+        require_any=True,
+    )
+
+    return _engine.query_one(
+        pn,
+        force_category=force_category,
+        force_price_group=force_price_group,
+        force_series_key=force_series_key,
+        force_full_recalc=True,
+    )
+
+
+@app.post("/api/query/export")
+def query_export(req: QueryExportReq) -> FileResponse:
+    assert _engine is not None
+    pn = (req.pn or "").strip()
+    if not pn:
+        raise HTTPException(status_code=400, detail="pn is empty")
+
+    force_category = _norm_optional_text(req.force_category)
+    force_price_group = _norm_optional_text(req.force_price_group)
+    force_series_key = _norm_optional_text(req.force_series_key)
+    _validate_query_overrides(
+        force_category,
+        force_price_group,
+        force_series_key,
+        require_any=False,
+    )
+
+    result = _engine.query_one(
+        pn,
+        force_category=force_category,
+        force_price_group=force_price_group,
+        force_series_key=force_series_key,
+        force_full_recalc=bool(req.force_full_recalc),
+    )
+    if str(result.get("status", "")).lower() != "ok":
+        raise HTTPException(status_code=404, detail=f"pn not found: {pn}")
+
+    export_dir = OUTPUTS_DIR / f"single_export_{uuid.uuid4().hex[:16]}"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    frames = build_export_frames([result])
+    out_path = write_export_xlsx(frames, out_dir=export_dir, level="country")
+
+    safe_pn = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in pn).strip("_")
+    if not safe_pn:
+        safe_pn = "part"
+    download_name = f"{safe_pn}_Country_import_upload_Model.xlsx"
+
+    return FileResponse(
+        path=str(out_path),
+        filename=download_name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.post("/api/batch")
