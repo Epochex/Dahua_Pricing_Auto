@@ -123,6 +123,76 @@ def _build_big_text(france_row: Optional[pd.Series], sys_row: Optional[pd.Series
     return " ".join(parts)
 
 
+_TURNSTILE_TOKENS = (
+    "PEDESTRIAN TURNSTILE",
+    "TURNSTILE",
+    "人行道闸",
+    "翼闸",
+    "摆闸",
+    "三辊闸",
+    "速通门",
+    "闸机",
+)
+
+
+def _is_turnstile_text(v) -> bool:
+    s = safe_upper(v)
+    if not s:
+        return False
+    return any(tok in s for tok in _TURNSTILE_TOKENS)
+
+
+def _forced_category_override(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> Optional[Tuple[str, str]]:
+    """
+    高优先级业务修正：
+    - 人行道闸（Pedestrian Turnstile）统一按 ACCESS CONTROL 处理
+    """
+    if sys_row is not None:
+        first_line = safe_upper(sys_row.get("First Product Line"))
+        second_line = safe_upper(sys_row.get("Second Product Line"))
+        if first_line == "INTELLIGENT BUILDING" and second_line == "PEDESTRIAN TURNSTILE":
+            return ("ACCESS CONTROL", "ACCESS CONTROL")
+
+    fields = []
+    if france_row is not None:
+        for col in (
+            "Product Line",
+            "Product Line(CN)",
+            "First Level Product Category",
+            "Second Level Product Category",
+            "Series",
+            "Description",
+            "Product Name",
+            "Product Name(CN)",
+            "External Model",
+            "Internal Model",
+        ):
+            if col in france_row and pd.notna(france_row[col]):
+                fields.append(france_row[col])
+
+    if sys_row is not None:
+        for col in (
+            "First Product Line",
+            "Second Product Line",
+            "Catelog Name",
+            "Series",
+            "Product Name",
+            "Product Name(CN)",
+            "External Model",
+            "Internal Model",
+        ):
+            if col in sys_row and pd.notna(sys_row[col]):
+                fields.append(sys_row[col])
+
+    if any(_is_turnstile_text(v) for v in fields):
+        return ("ACCESS CONTROL", "ACCESS CONTROL")
+
+    return None
+
+
 def _detect_ipc_series_key(big: str) -> str:
     # IPC 代际：优先看 IPCx 字样，再兜底看 HFW/HDW 的首位数字
     if "IPC8" in big:
@@ -310,6 +380,10 @@ def classify_category_and_price_group(
     优先使用 France 映射，失败再用 Sys。
     两边都失败时：对录像机大类（NVR/IVSS/EVS/XVR）做强兜底识别，避免 UNKNOWN 直接中断自动定价。
     """
+    forced = _forced_category_override(france_row, sys_row)
+    if forced is not None:
+        return forced
+
     # 1) France 优先
     if france_row is not None:
         cat, pg = apply_mapping(france_row, france_map)

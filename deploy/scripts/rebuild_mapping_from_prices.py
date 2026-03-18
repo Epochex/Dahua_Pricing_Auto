@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from backend.engine.core.classifier import apply_mapping  # noqa: E402
 
 
-RUNTIME_DIR = Path("/data/runtime")
+RUNTIME_DIR = Path("/data/dahua_pricing_runtime")
 MAPPING_DIR = REPO_ROOT / "mapping"
 
 COLS = [
@@ -198,6 +198,18 @@ def build_mapping(
             "车载",
             "auto-learn seed: Dahua Auto / Auto Terminal",
         )
+        add_rule(
+            rows,
+            first_col,
+            "equals",
+            "Intelligent Building",
+            second_col,
+            "equals",
+            "Pedestrian Turnstile",
+            "ACCESS CONTROL",
+            "ACCESS CONTROL",
+            "manual override: Pedestrian Turnstile -> ACCESS CONTROL",
+        )
 
     # 2) Learn exact first+second rules from dominant labels.
     combo_counter: Dict[Tuple[str, str], Counter[Tuple[str, str]]] = defaultdict(Counter)
@@ -362,7 +374,7 @@ def main() -> None:
     write_mapping(sys_new, MAPPING_DIR / "productline_map_sys_full.csv")
     copy_to_runtime()
     print(f"backup created: {backup_dir}")
-    print("mapping files overwritten in repo and /data/runtime/mapping")
+    print("mapping files overwritten in repo and /data/dahua_pricing_runtime/mapping")
 
 
 if __name__ == "__main__":

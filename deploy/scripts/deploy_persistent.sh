@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/data/Dahua_Pricing_Auto}"
-RUNTIME_DIR="${RUNTIME_DIR:-/data/runtime}"
+RUNTIME_DIR="${RUNTIME_DIR:-/data/dahua_pricing_runtime}"
 DOMAIN="${DOMAIN:-www.dahuafrance-auto-pricing.com}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 
@@ -32,6 +32,24 @@ prepare_runtime_dirs() {
     "${RUNTIME_DIR}/outputs" \
     "${RUNTIME_DIR}/logs" \
     "${RUNTIME_DIR}/admin"
+}
+
+migrate_legacy_runtime_if_needed() {
+  local old_runtime="/data/runtime"
+  local has_new_data=0
+  if [[ "${RUNTIME_DIR}" == "${old_runtime}" ]]; then
+    return
+  fi
+  if [[ ! -d "${old_runtime}" ]]; then
+    return
+  fi
+  if [[ -f "${RUNTIME_DIR}/data/FrancePrice.xlsx" || -f "${RUNTIME_DIR}/data/FrancePrice.xls" ]]; then
+    has_new_data=1
+  fi
+  if [[ "${has_new_data}" -ne 1 ]]; then
+    log "Migrating legacy runtime data from ${old_runtime} -> ${RUNTIME_DIR}"
+    cp -a "${old_runtime}/." "${RUNTIME_DIR}/"
+  fi
 }
 
 sync_mapping_files() {
@@ -79,6 +97,7 @@ build_frontend() {
 install_systemd_service() {
   log "Installing systemd service"
   cp -f "${REPO_DIR}/deploy/systemd/dahua-pricing-backend.service" /etc/systemd/system/dahua-pricing-backend.service
+  sed -i -E "s|^Environment=DAHUA_PRICING_RUNTIME_DIR=.*$|Environment=DAHUA_PRICING_RUNTIME_DIR=${RUNTIME_DIR}|g" /etc/systemd/system/dahua-pricing-backend.service
   sed -i "s|--port 8000|--port ${BACKEND_PORT}|g" /etc/systemd/system/dahua-pricing-backend.service
   systemctl daemon-reload
   systemctl enable --now dahua-pricing-backend
@@ -117,6 +136,7 @@ main() {
   require_root
   install_prerequisites
   prepare_runtime_dirs
+  migrate_legacy_runtime_if_needed
   sync_mapping_files
   validate_data_files
   build_backend

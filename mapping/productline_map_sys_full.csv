@@ -35,7 +35,7 @@
 38,First Product Line,equals,Commercial Display,Second Product Line,equals,LCD Video Wall,商显/TV-WALL,商显/TV-WALL,"auto-learn dominant first+second (246, purity=1.000)"
 39,First Product Line,equals,PTZ,Second Product Line,equals,Specialized PTZ Camera,PTZ,PTZ,"auto-learn dominant first+second (234, purity=1.000)"
 40,First Product Line,equals,Central Control,Second Product Line,equals,Display Control,键盘/解码器,键盘/解码器,"auto-learn dominant first+second (224, purity=1.000)"
-41,First Product Line,equals,Intelligent Building,Second Product Line,equals,Pedestrian Turnstile,电子防盗门,电子防盗门,"auto-learn dominant first+second (213, purity=1.000)"
+41,First Product Line,equals,Intelligent Building,Second Product Line,equals,Pedestrian Turnstile,ACCESS CONTROL,ACCESS CONTROL,"manual override: Pedestrian Turnstile -> ACCESS CONTROL"
 42,First Product Line,equals,PTZ,Second Product Line,equals,HDCVI PTZ Camera,PTZ,PTZ,"auto-learn dominant first+second (205, purity=1.000)"
 43,First Product Line,equals,Basic Network,Second Product Line,equals,Enterprise Wi-Fi,IT交换机路由器,TRANSMISSION,"auto-learn dominant first+second (205, purity=1.000)"
 44,First Product Line,equals,Dahua,Second Product Line,equals,HDD,硬盘/存储介质,硬盘/存储介质,"auto-learn dominant first+second (176, purity=1.000)"

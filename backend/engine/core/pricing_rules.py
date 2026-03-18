@@ -25,6 +25,7 @@ DDP_RULES = {
     "VDP": (0.10, 0.0, 0.02, 0.000198),
 
     "ALARM": (0.05, 0.0, 0.02, 0.000198),
+    "Alarm": (0.05, 0.0, 0.02, 0.000198),
 
     "ACCESS CONTROL": (0.10, 0.021, 0.02, 0.000198),
 
@@ -46,6 +47,7 @@ DDP_RULES = {
     "视频会议": (0.10, 0.034, 0.02, 0.000198),
 
     "电子防盗门": (0.10, 0.0, 0.02, 0.000198),
+    "电子防盗门 EAS": (0.10, 0.0, 0.02, 0.000198),
     "安检机": (0.15, 0.0, 0.02, 0.000198),
     "电子白板": (0.15, 0.034, 0.02, 0.000198),
     "烟感": (0.10, 0.02, 0.02, 0.000198),
@@ -63,8 +65,11 @@ PRICE_RULES = {
         "PSDW":        dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
         "针孔":         dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
         "IPC5":        dict(reseller=0.12, gold=0.27, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC5/7/8/MULTI-SENSOR / SPECIAL":
+                       dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
         "IPC5/7/MULTI-SENSOR / SPECIAL":
                        dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
+        "IPC3":        dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
         "IPC3-S2":     dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
         "IPC2-PRO":    dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
         "IPC2":        dict(reseller=0.12, gold=0.20, silver=0.30, ivory=0.35, msrp_on_installer=0.60),
@@ -102,7 +107,7 @@ PRICE_RULES = {
         "_default_":   dict(reseller=0.12, gold=0.22, silver=0.30, ivory=0.35, msrp_on_installer=0.50),
     },
     "EVS": {
-        "_default_":   dict(reseller=0.00, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
+        "_default_":   dict(reseller=0.12, gold=0.25, silver=0.30, ivory=0.35, msrp_on_installer=0.40),
     },
     "XVR": {
         "_default_":   dict(reseller=0.12, gold=0.17, silver=0.20, ivory=0.25, msrp_on_installer=0.60),

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { apiGetJson, apiPostForm, apiPostJson, apiPutJson } from "./api.js";
 import { formatPricePiecewise, safeStr } from "./format.js";
 
@@ -205,7 +205,9 @@ function QueryDiagnosticBlock({ resp }) {
 
   const calcLevelText = `${safeStr(meta.sys_sales_type)}（Sys 基准字段：${safeStr(
     meta.sys_basis_field
-  )} | 定价公式：${safeStr(meta.pricing_rule_name)}）`;
+  )} | Sys adjust key：${safeStr(meta.sys_uplift_key)} | 关键词叠加：${safeStr(
+    meta.sys_keyword_uplift_hits
+  )} (+${safeStr(meta.sys_keyword_uplift_pct)}) | 定价公式：${safeStr(meta.pricing_rule_name)}）`;
 
   return (
     <div className="diagBlock">
@@ -271,14 +273,95 @@ function QueryDiagnosticBlock({ resp }) {
   );
 }
 
+function ExternalModelClusterBlock({ cluster, loading, onExportAll, exporting }) {
+  if (!loading && !cluster) return null;
+  const rows = Array.isArray(cluster?.rows) ? cluster.rows : [];
+  return (
+    <div className="diagBlock">
+      <div className="diagHeader">
+        <div className="diagTitle">EXTERNAL MODEL INDEX</div>
+        <span className="small monoInline">
+          {loading
+            ? "loading..."
+            : `external_model=${safeStr(cluster?.external_model)} · rows=${safeStr(cluster?.count)} · anchor=${
+                cluster?.anchor_applied ? `yes(${safeStr(cluster?.anchor_pn)})` : "no"
+              } · changed=${safeStr(cluster?.anchor_changed_count)}`}
+        </span>
+      </div>
+
+      <div className="row" style={{ marginBottom: 10 }}>
+        <button className="btn" onClick={onExportAll} disabled={loading || exporting || rows.length === 0}>
+          {exporting ? "EXPORTING..." : "EXPORT EXT ALL"}
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="small">Loading same external model cluster...</div>
+      ) : (
+        <div className="tableWrap">
+          <table className="table dense">
+            <thead>
+              <tr>
+                <th style={{ minWidth: 220 }}>PN</th>
+                <th style={{ minWidth: 260 }}>Internal Model</th>
+                <th style={{ minWidth: 160 }}>Release Status</th>
+                <th style={{ minWidth: 105 }}>FOB</th>
+                <th style={{ minWidth: 105 }}>DDP</th>
+                <th style={{ minWidth: 105 }}>Reseller</th>
+                <th style={{ minWidth: 105 }}>Gold</th>
+                <th style={{ minWidth: 105 }}>Silver</th>
+                <th style={{ minWidth: 105 }}>Ivory</th>
+                <th style={{ minWidth: 105 }}>MSRP</th>
+                <th style={{ minWidth: 180 }}>Price Source</th>
+                <th style={{ minWidth: 90 }}>Changed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const fv = r?.final_values || {};
+                const m = r?.meta || {};
+                return (
+                  <tr key={safeStr(r?.pn)}>
+                    <td className="mono">{safeStr(r?.pn)}</td>
+                    <td className="mono">{safeStr(fv["Internal Model"])}</td>
+                    <td className="mono">{safeStr(fv["Sales Status"])}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["FOB C(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["DDP A(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["Suggested Reseller(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["Gold(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["Silver(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["Ivory(EUR)"]))}</td>
+                    <td className="mono">{safeStr(formatPricePiecewise(fv["MSRP(EUR)"]))}</td>
+                    <td className="mono">
+                      {m?.external_model_anchor_applied
+                        ? `FR anchor ${safeStr(m?.external_model_anchor_pn)}`
+                        : "normal"}
+                    </td>
+                    <td className="mono">{m?.external_model_anchor_changed ? "yes" : "no"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SingleQuery() {
   const [pn, setPn] = useState("");
   const [loading, setLoading] = useState(false);
   const [recalcLoading, setRecalcLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [extMode, setExtMode] = useState(false);
+  const [extLoading, setExtLoading] = useState(false);
+  const [extExporting, setExtExporting] = useState(false);
+  const [extResp, setExtResp] = useState(null);
   const [resp, setResp] = useState(null);
   const [err, setErr] = useState("");
   const [optionsErr, setOptionsErr] = useState("");
+  const [optionsLoading, setOptionsLoading] = useState(false);
   const [queryOptions, setQueryOptions] = useState({
     categories: [],
     price_groups: [],
@@ -289,8 +372,11 @@ function SingleQuery() {
   const [manualPriceGroup, setManualPriceGroup] = useState("");
   const [manualSeriesKey, setManualSeriesKey] = useState("_default_");
 
-  useEffect(() => {
-    (async () => {
+  async function loadQueryOptions({ silent = false } = {}) {
+    if (!silent) setOptionsErr("");
+    setOptionsLoading(true);
+    let lastErr = "";
+    for (let i = 0; i < 3; i += 1) {
       try {
         const r = await apiGetJson("/api/query/options");
         setQueryOptions({
@@ -303,10 +389,21 @@ function SingleQuery() {
           group_rule_keys:
             r?.group_rule_keys && typeof r.group_rule_keys === "object" ? r.group_rule_keys : {},
         });
+        setOptionsErr("");
+        setOptionsLoading(false);
+        return true;
       } catch (e) {
-        setOptionsErr(String(e.message || e));
+        lastErr = String(e.message || e);
+        await new Promise((resolve) => setTimeout(resolve, 250 * (i + 1)));
       }
-    })();
+    }
+    if (!silent) setOptionsErr(lastErr);
+    setOptionsLoading(false);
+    return false;
+  }
+
+  useEffect(() => {
+    void loadQueryOptions({ silent: false });
   }, []);
 
   const categoryOptions = useMemo(() => {
@@ -358,6 +455,7 @@ function SingleQuery() {
   async function run() {
     setErr("");
     setResp(null);
+    setExtResp(null);
 
     const s = pn.trim();
     if (!s) return;
@@ -372,10 +470,58 @@ function SingleQuery() {
       setManualCategory(nextCategory);
       setManualPriceGroup(nextPriceGroup);
       setManualSeriesKey(nextSeriesKey);
+      void loadQueryOptions({ silent: true });
+      if (extMode) {
+        setExtLoading(true);
+        try {
+          const ext = await apiPostJson("/api/query/external-model-index", {
+            pn: s,
+            apply_france_anchor: true,
+          });
+          setExtResp(ext);
+        } finally {
+          setExtLoading(false);
+        }
+      }
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function exportExternalModelAll() {
+    const s = pn.trim();
+    if (!s) return;
+    setErr("");
+    setExtExporting(true);
+    try {
+      const r = await fetch("/api/query/external-model-export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pn: s, apply_france_anchor: true }),
+      });
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        throw new Error(`POST /api/query/external-model-export -> ${r.status} ${txt}`);
+      }
+      const blob = await r.blob();
+      const cd = r.headers.get("Content-Disposition") || r.headers.get("content-disposition");
+      const fromServer = parseFilenameFromContentDisposition(cd);
+      const fallback = `${s.replace(/[^a-zA-Z0-9._-]+/g, "_")}_external_model_all.xlsx`;
+      const filename = fromServer || fallback;
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setExtExporting(false);
     }
   }
 
@@ -488,6 +634,18 @@ function SingleQuery() {
         <button className="btn" onClick={exportOne} disabled={!resp || exporting || loading}>
           {exporting ? "EXPORTING..." : "EXPORT"}
         </button>
+        <label className="small" style={{ marginLeft: 8, display: "flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={extMode}
+            onChange={(e) => {
+              const checked = Boolean(e.target.checked);
+              setExtMode(checked);
+              if (!checked) setExtResp(null);
+            }}
+          />
+          扩展索引模式（External Model）
+        </label>
       </div>
 
       {err ? (
@@ -511,12 +669,30 @@ function SingleQuery() {
           <div className="sectionTitle">PRICE FIELDS</div>
           <QueryPriceTable resp={resp} />
 
+          {extMode ? (
+            <>
+              <Hr />
+              <div className="sectionTitle">EXTERNAL MODEL CLUSTER</div>
+              <ExternalModelClusterBlock
+                cluster={extResp}
+                loading={extLoading}
+                onExportAll={exportExternalModelAll}
+                exporting={extExporting}
+              />
+            </>
+          ) : null}
+
           <Hr />
           <div className="sectionTitle">MANUAL RECALCULATE</div>
           <div className="diagBlock">
             <div className="diagHeader">
               <div className="diagTitle">RE-CALCULATE WITH MANUAL PRODUCT LINE</div>
-              <span className="small monoInline">POST /api/query/recompute</span>
+              <div className="row">
+                <span className="small monoInline">POST /api/query/recompute</span>
+                <button className="btn" onClick={() => void loadQueryOptions({ silent: false })} disabled={optionsLoading}>
+                  {optionsLoading ? "LOADING OPTIONS..." : "RELOAD OPTIONS"}
+                </button>
+              </div>
             </div>
 
             <div className="diagTextRow">
@@ -617,6 +793,10 @@ function BatchJobBlock({ job }) {
   const status = safeStr(job.status);
   const report = job.report || {};
   const outputFiles = Array.isArray(job.output_files) ? job.output_files : [];
+  const total = Number(job.progress_total ?? report.count_total ?? 0) || 0;
+  const done = Number(job.progress_done ?? 0) || 0;
+  const pctRaw = Number(job.progress_percent ?? (total > 0 ? (done * 100) / total : 0));
+  const pct = Number.isFinite(pctRaw) ? Math.max(0, Math.min(100, pctRaw)) : 0;
 
   return (
     <div className="diagBlock">
@@ -657,7 +837,22 @@ function BatchJobBlock({ job }) {
         <div className="diagTextValue">
           <span className="bigPill monoInline">total: {safeStr(report.count_total)}</span>
           <span className="bigPill monoInline">not_found: {safeStr(report.count_not_found)}</span>
+          <span className="bigPill monoInline">anchor_applied: {safeStr(report.count_anchor_applied)}</span>
+          <span className="bigPill monoInline">anchor_changed: {safeStr(report.count_anchor_changed)}</span>
           <span className="bigPill monoInline">outputs: {outputFiles.length}</span>
+        </div>
+      </div>
+
+      <div className="diagTextRow">
+        <div className="diagTextLabel">实时进度</div>
+        <div className="diagTextValue">
+          <div className="progressTrack">
+            <div className="progressFill" style={{ width: `${pct}%` }} />
+          </div>
+          <div className="small monoInline" style={{ marginTop: 6 }}>
+            {safeStr(done)} / {safeStr(total)} ({pct.toFixed(1)}%) · current_pn=
+            {safeStr(job.progress_current_pn || "-")}
+          </div>
         </div>
       </div>
 
@@ -667,6 +862,78 @@ function BatchJobBlock({ job }) {
           <div className="diagTextValue mono err">{safeStr(job.error)}</div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function BatchReviewTable({ job }) {
+  const items = Array.isArray(job?.report?.items) ? job.report.items : [];
+  if (items.length === 0) return null;
+
+  return (
+    <div className="diagBlock">
+      <div className="diagHeader">
+        <div className="diagTitle">BATCH REVIEW ROWS</div>
+        <span className="small monoInline">rows={items.length}</span>
+      </div>
+      <div className="tableWrap">
+        <table className="table dense">
+          <thead>
+            <tr>
+              <th style={{ minWidth: 56 }}>#</th>
+              <th style={{ minWidth: 220 }}>PN</th>
+              <th style={{ minWidth: 90 }}>status</th>
+              <th style={{ minWidth: 160 }}>category</th>
+              <th style={{ minWidth: 260 }}>Internal Model Info</th>
+              <th style={{ minWidth: 220 }}>series/rule</th>
+              <th style={{ minWidth: 180 }}>match</th>
+              <th style={{ minWidth: 180 }}>Price Source</th>
+              <th style={{ minWidth: 100 }}>FOB</th>
+              <th style={{ minWidth: 100 }}>DDP</th>
+              <th style={{ minWidth: 100 }}>Reseller</th>
+              <th style={{ minWidth: 100 }}>Gold</th>
+              <th style={{ minWidth: 100 }}>Silver</th>
+              <th style={{ minWidth: 100 }}>Ivory</th>
+              <th style={{ minWidth: 100 }}>MSRP</th>
+              <th style={{ minWidth: 260 }}>warnings</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r) => (
+              <tr key={`${safeStr(r.idx)}_${safeStr(r.pn)}`}>
+                <td className="mono">{safeStr(r.idx)}</td>
+                <td className="mono">{safeStr(r.pn)}</td>
+                <td className="mono">{safeStr(r.status)}</td>
+                <td className="mono">{safeStr(r.category)}</td>
+                <td className="mono">
+                  {safeStr(r.internal_model)}
+                  <br />
+                  <span className="small">external: {safeStr(r.external_model)}</span>
+                </td>
+                <td className="mono">
+                  {safeStr(r.series_display)}
+                  <br />
+                  <span className="small">{safeStr(r.pricing_rule_name)}</span>
+                </td>
+                <td className="mono">
+                  FR {safeStr(r.fr_match_mode)} ({safeStr(r.fr_matched_pn)})
+                  <br />
+                  SYS {safeStr(r.sys_match_mode)} ({safeStr(r.sys_matched_pn)})
+                </td>
+                <td className="mono">{safeStr(r.price_source)}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.fob))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.ddp))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.reseller))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.gold))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.silver))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.ivory))}</td>
+                <td className="mono">{safeStr(formatPricePiecewise(r.msrp))}</td>
+                <td className="mono">{safeStr((r.warnings || []).join(" | "))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -694,7 +961,11 @@ function BatchExport() {
 
       const r = await apiPostForm("/api/batch", fd);
       setJob(r);
-      if (r?.job_id) setJobId(String(r.job_id));
+      if (r?.job_id) {
+        const id = String(r.job_id);
+        setJobId(id);
+        await refresh(id);
+      }
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
@@ -714,6 +985,16 @@ function BatchExport() {
       setErr(String(e.message || e));
     }
   }
+
+  useEffect(() => {
+    const st = String(job?.status || "").toLowerCase();
+    const shouldPoll = Boolean(jobId) && (!job || st === "queued" || st === "running");
+    if (!shouldPoll) return undefined;
+    const tid = setInterval(() => {
+      refresh(jobId);
+    }, 1200);
+    return () => clearInterval(tid);
+  }, [jobId, job]);
 
   const downloadUrl = jobId ? `/api/jobs/${encodeURIComponent(jobId)}/download` : "#";
   const canDownload =
@@ -788,6 +1069,9 @@ function BatchExport() {
           <BatchJobBlock job={job} />
 
           <Hr />
+          <BatchReviewTable job={job} />
+
+          <Hr />
           <details>
             <summary className="small monoInline">Raw Job JSON</summary>
             <div style={{ marginTop: 10 }} />
@@ -804,7 +1088,7 @@ function BatchExport() {
 }
 
 /* =========================
- * ADMIN (单页矩阵：price rules + uplift)
+ * ADMIN (DDP + price rules + Sys FOB adjust)
  * ========================= */
 
 const PRICE_RULE_FIELDS = [
@@ -815,9 +1099,45 @@ const PRICE_RULE_FIELDS = [
   { key: "msrp_on_installer", label: "MSRP" },
 ];
 
+const DDP_RULE_FIELDS = [
+  { key: "p1", label: "M1" },
+  { key: "p2", label: "M2" },
+  { key: "p3", label: "M3" },
+  { key: "p4", label: "M4" },
+];
+
 function normNum(v, fallback = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function flattenDdpRules(ddpRules) {
+  const rows = [];
+  const keys = Object.keys(ddpRules || {}).sort();
+  for (const k of keys) {
+    const v = Array.isArray(ddpRules[k]) ? ddpRules[k] : [];
+    rows.push({
+      category: k,
+      p1: safeStr(v[0]),
+      p2: safeStr(v[1]),
+      p3: safeStr(v[2]),
+      p4: safeStr(v[3]),
+    });
+  }
+  return rows;
+}
+
+function rebuildDdpRules(rows) {
+  const out = {};
+  for (const r of rows) {
+    out[r.category] = [
+      normNum(r.p1, 0),
+      normNum(r.p2, 0),
+      normNum(r.p3, 0),
+      normNum(r.p4, 0),
+    ];
+  }
+  return out;
 }
 
 function flattenPricingRules(pricingRules) {
@@ -923,35 +1243,123 @@ function buildUpliftPayloadLikeInput(originalRaw, upliftFlat) {
   return out;
 }
 
+function flattenKeywordUpliftRows(rawRows) {
+  const src = Array.isArray(rawRows) ? rawRows : [];
+  return src.map((r, idx) => ({
+    id: `kw_${idx}_${Date.now()}`,
+    price_group: safeStr(r?.price_group),
+    keyword: safeStr(r?.keyword),
+    pct: safeStr(r?.pct),
+    enabled: r?.enabled !== false,
+  }));
+}
+
+function rebuildKeywordUpliftRows(rows) {
+  const out = [];
+  for (const r of rows || []) {
+    const pg = safeStr(r?.price_group).trim();
+    const kw = safeStr(r?.keyword).trim();
+    if (!pg || !kw) continue;
+    out.push({
+      price_group: pg,
+      keyword: kw,
+      pct: normNum(r?.pct, 0),
+      enabled: r?.enabled !== false,
+    });
+  }
+  return out;
+}
+
 function AdminUnifiedRules() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [autoSaving, setAutoSaving] = useState(false);
   const [err, setErr] = useState("");
   const [info, setInfo] = useState("");
 
   const [upliftRaw, setUpliftRaw] = useState(null);
+  const [ddpRows, setDdpRows] = useState([]);
   const [rows, setRows] = useState([]);
   const [upliftFlat, setUpliftFlat] = useState({});
+  const [keywordRows, setKeywordRows] = useState([]);
+  const [keywordPreviewById, setKeywordPreviewById] = useState({});
+  const [keywordPreviewLoadingId, setKeywordPreviewLoadingId] = useState("");
   const [filter, setFilter] = useState("");
+  const skipAutoSaveRef = useRef(true);
+  const dirtyRef = useRef(false);
+  const rowsRef = useRef(rows);
+  const ddpRowsRef = useRef(ddpRows);
+  const upliftRawRef = useRef(upliftRaw);
+  const upliftFlatRef = useRef(upliftFlat);
+  const keywordRowsRef = useRef(keywordRows);
+
+  useEffect(() => {
+    rowsRef.current = rows;
+    ddpRowsRef.current = ddpRows;
+    upliftRawRef.current = upliftRaw;
+    upliftFlatRef.current = upliftFlat;
+    keywordRowsRef.current = keywordRows;
+  }, [rows, ddpRows, upliftRaw, upliftFlat, keywordRows]);
 
   async function loadAll() {
     setErr("");
     setInfo("");
     setLoading(true);
+    skipAutoSaveRef.current = true;
     try {
-      const [pr, uf] = await Promise.all([
+      const [pr, uf, dr, kw] = await Promise.all([
         apiGetJson("/api/admin/pricing-rules"),
         apiGetJson("/api/admin/uplift"),
+        apiGetJson("/api/admin/ddp-rules"),
+        apiGetJson("/api/admin/keyword-uplift"),
       ]);
 
       setUpliftRaw(uf || {});
+      setDdpRows(flattenDdpRules(dr || {}));
       setRows(flattenPricingRules(pr || {}));
       setUpliftFlat(parseUpliftAnyShape(uf || {}));
+      setKeywordRows(flattenKeywordUpliftRows(kw || []));
+      setKeywordPreviewById({});
       setInfo("Loaded");
+      dirtyRef.current = false;
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
       setLoading(false);
+      setTimeout(() => {
+        skipAutoSaveRef.current = false;
+      }, 0);
+    }
+  }
+
+  async function persistAll({ reload = false, silent = false, forceReloadRules = false, snapshot = null } = {}) {
+    const src = snapshot || {
+      rows: rowsRef.current,
+      ddpRows: ddpRowsRef.current,
+      upliftRaw: upliftRawRef.current,
+      upliftFlat: upliftFlatRef.current,
+      keywordRows: keywordRowsRef.current,
+    };
+    const pricingPayload = rebuildPricingRules(src.rows || []);
+    const ddpPayload = rebuildDdpRules(src.ddpRows || []);
+    const upliftPayload = buildUpliftPayloadLikeInput(src.upliftRaw, src.upliftFlat || {});
+    const keywordPayload = rebuildKeywordUpliftRows(src.keywordRows || []);
+
+    await apiPutJson("/api/admin/pricing-rules", pricingPayload);
+    await apiPutJson("/api/admin/ddp-rules", ddpPayload);
+    await apiPutJson("/api/admin/uplift", upliftPayload);
+    await apiPutJson("/api/admin/keyword-uplift", keywordPayload);
+    if (forceReloadRules) {
+      await apiPostJson("/api/admin/reload-rules", {});
+    }
+
+    if (!silent) {
+      setInfo("Saved pricing-rules + ddp-rules + sys-fob-adjust + keyword-adjust");
+    }
+    if (reload) {
+      await loadAll();
+    } else {
+      dirtyRef.current = false;
     }
   }
 
@@ -960,14 +1368,7 @@ function AdminUnifiedRules() {
     setInfo("");
     setSaving(true);
     try {
-      const pricingPayload = rebuildPricingRules(rows);
-      const upliftPayload = buildUpliftPayloadLikeInput(upliftRaw, upliftFlat);
-
-      await apiPutJson("/api/admin/pricing-rules", pricingPayload);
-      await apiPutJson("/api/admin/uplift", upliftPayload);
-
-      setInfo("Saved pricing-rules + uplift");
-      await loadAll();
+      await persistAll({ reload: true, silent: false, forceReloadRules: true });
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
@@ -980,6 +1381,7 @@ function AdminUnifiedRules() {
   }, []);
 
   function setRuleValue(rowIdx, field, value) {
+    dirtyRef.current = true;
     setRows((prev) => {
       const next = prev.slice();
       next[rowIdx] = { ...next[rowIdx], [field]: value };
@@ -987,9 +1389,99 @@ function AdminUnifiedRules() {
     });
   }
 
+  function setDdpValue(rowIdx, field, value) {
+    dirtyRef.current = true;
+    setDdpRows((prev) => {
+      const next = prev.slice();
+      next[rowIdx] = { ...next[rowIdx], [field]: value };
+      return next;
+    });
+  }
+
   function setUpliftValue(key, value) {
+    dirtyRef.current = true;
     setUpliftFlat((prev) => ({ ...prev, [key]: value }));
   }
+
+  function setKeywordValue(rowIdx, field, value) {
+    dirtyRef.current = true;
+    setKeywordRows((prev) => {
+      const next = prev.slice();
+      next[rowIdx] = { ...next[rowIdx], [field]: value };
+      return next;
+    });
+  }
+
+  function addKeywordRow() {
+    dirtyRef.current = true;
+    setKeywordRows((prev) => [
+      ...prev,
+      { id: `kw_new_${Date.now()}`, price_group: "", keyword: "", pct: "0", enabled: true },
+    ]);
+  }
+
+  function removeKeywordRow(rowIdx) {
+    dirtyRef.current = true;
+    setKeywordRows((prev) => prev.filter((_, i) => i !== rowIdx));
+  }
+
+  async function previewKeywordRow(row) {
+    const keyword = safeStr(row?.keyword).trim();
+    const priceGroup = safeStr(row?.price_group).trim();
+    if (!keyword) return;
+    const id = safeStr(row?.id);
+    setKeywordPreviewLoadingId(id);
+    try {
+      const resp = await apiPostJson("/api/admin/keyword-uplift/preview", {
+        price_group: priceGroup || null,
+        keyword,
+        limit: 30,
+      });
+      setKeywordPreviewById((prev) => ({ ...prev, [id]: resp }));
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setKeywordPreviewLoadingId("");
+    }
+  }
+
+  function resolveAutoUpliftKeyForRow(row) {
+    const rn = String(row?.ruleName || "").trim();
+    if (rn && rn !== "_default_") return rn;
+    return String(row?.group || "").trim();
+  }
+
+  useEffect(() => {
+    if (skipAutoSaveRef.current) return;
+    if (loading || saving || autoSaving) return;
+    const t = setTimeout(async () => {
+      setErr("");
+      setAutoSaving(true);
+      try {
+        await persistAll({ reload: false, silent: true });
+        setInfo("Auto-saved");
+      } catch (e) {
+        setErr(String(e.message || e));
+      } finally {
+        setAutoSaving(false);
+      }
+    }, 700);
+    return () => clearTimeout(t);
+  }, [rows, ddpRows, upliftFlat, keywordRows, loading, saving]);
+
+  useEffect(() => {
+    return () => {
+      if (!dirtyRef.current) return;
+      const snapshot = {
+        rows: rowsRef.current,
+        ddpRows: ddpRowsRef.current,
+        upliftRaw: upliftRawRef.current,
+        upliftFlat: upliftFlatRef.current,
+        keywordRows: keywordRowsRef.current,
+      };
+      void persistAll({ reload: false, silent: true, forceReloadRules: true, snapshot }).catch(() => {});
+    };
+  }, []);
 
   const visibleRows = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -1002,33 +1494,27 @@ function AdminUnifiedRules() {
     });
   }, [rows, filter]);
 
-  function resolveUpliftKeyForRow(row) {
-    const candidates = [
-      row.ruleName,
-      row.group,
-      `${row.group}#Tier1`,
-      `${row.group}#Tier2`,
-      `${row.group}#Tier3`,
-      `${row.group}#Tier4`,
-    ];
-    for (const c of candidates) {
-      if (Object.prototype.hasOwnProperty.call(upliftFlat, c)) return c;
-    }
-    return "";
-  }
+  const productGroups = useMemo(() => {
+    return Array.from(new Set(rows.map((r) => safeStr(r.group).trim()).filter(Boolean))).sort();
+  }, [rows]);
 
   return (
     <Card
-      title="ADMIN · PRICE RULES + UPLIFT (UNIFIED)"
-      right={<span className="small monoInline">/api/admin/pricing-rules + /api/admin/uplift</span>}
+      title="ADMIN · DDP RULES + PRICE RULES + SYS FOB ADJUST + KEYWORD ADJUST"
+      right={
+        <span className="small monoInline">
+          /api/admin/ddp-rules + /api/admin/pricing-rules + /api/admin/uplift + /api/admin/keyword-uplift
+        </span>
+      }
     >
       <div className="row wrap">
         <button className="btn" onClick={loadAll} disabled={loading}>
           {loading ? "LOADING..." : "RELOAD"}
         </button>
-        <button className="btn primary" onClick={saveAll} disabled={saving}>
-          {saving ? "SAVING..." : "SAVE ALL"}
+        <button className="btn primary" onClick={saveAll} disabled={saving || autoSaving}>
+          {saving ? "SAVING..." : "SAVE+RELOAD"}
         </button>
+        <span className="small monoInline">{autoSaving ? "AUTO-SAVING..." : "AUTO-SAVE ON"}</span>
 
         <input
           className="input"
@@ -1038,9 +1524,6 @@ function AdminUnifiedRules() {
           placeholder="filter by product group / rule name"
         />
 
-        <span className="small">
-          右侧 <span className="pill">Uplift Key</span> / <span className="pill">Adjust</span> 直接写入 uplift 配置
-        </span>
       </div>
 
       {err ? (
@@ -1059,6 +1542,48 @@ function AdminUnifiedRules() {
 
       <Hr />
 
+      <div className="small monoInline">DDP Rules (FOB * (1+M1) * (1+M2) * (1+M3) * (1+M4))</div>
+      <div className="tableWrap">
+        <table className="table dense">
+          <thead>
+            <tr>
+              <th style={{ minWidth: 180 }}>Category</th>
+              {DDP_RULE_FIELDS.map((f) => (
+                <th key={f.key} style={{ minWidth: 110 }}>
+                  {f.label}
+                </th>
+              ))}
+              <th style={{ minWidth: 380 }}>Formula Preview</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ddpRows.map((r) => {
+              const actualIdx = ddpRows.indexOf(r);
+              return (
+                <tr key={r.category}>
+                  <td className="mono">{r.category}</td>
+                  {DDP_RULE_FIELDS.map((f) => (
+                    <td key={f.key}>
+                      <input
+                        className="input mono cellInput"
+                        value={safeStr(r[f.key])}
+                        onChange={(e) => setDdpValue(actualIdx, f.key, e.target.value)}
+                      />
+                    </td>
+                  ))}
+                  <td className="mono small">
+                    {`FOB*(1+${safeStr(r.p1 || 0)})*(1+${safeStr(r.p2 || 0)})*(1+${safeStr(r.p3 || 0)})*(1+${safeStr(r.p4 || 0)})`}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <Hr />
+
+      <div className="small monoInline">Price Rules + Sys FOB Adjust (France FOB missing + Sys fallback only)</div>
       <div className="tableWrap">
         <table className="table dense">
           <thead>
@@ -1070,14 +1595,13 @@ function AdminUnifiedRules() {
                   {f.label}
                 </th>
               ))}
-              <th style={{ minWidth: 220 }}>Uplift Key</th>
-              <th style={{ minWidth: 130 }}>Adjust</th>
+              <th style={{ minWidth: 180 }}>Adjust</th>
             </tr>
           </thead>
           <tbody>
             {visibleRows.map((r) => {
               const actualIdx = rows.indexOf(r);
-              const resolvedUpliftKey = resolveUpliftKeyForRow(r);
+              const autoUpliftKey = resolveAutoUpliftKeyForRow(r);
               return (
                 <tr key={`${r.group}__${r.ruleName}`}>
                   <td className="mono">{r.group}</td>
@@ -1092,39 +1616,13 @@ function AdminUnifiedRules() {
                       />
                     </td>
                   ))}
-
                   <td>
                     <input
                       className="input mono cellInput"
-                      value={resolvedUpliftKey}
-                      onChange={(e) => {
-                        const nextKey = e.target.value;
-                        setUpliftFlat((prev) => {
-                          const next = { ...prev };
-                          const curVal = resolvedUpliftKey ? next[resolvedUpliftKey] : "";
-                          if (resolvedUpliftKey && resolvedUpliftKey !== nextKey) {
-                            delete next[resolvedUpliftKey];
-                          }
-                          if (nextKey) {
-                            next[nextKey] = curVal ?? next[nextKey] ?? "";
-                          }
-                          return next;
-                        });
-                      }}
-                      placeholder="e.g. IPC / IPC#Tier1 / CCTV监视器"
-                    />
-                  </td>
-
-                  <td>
-                    <input
-                      className="input mono cellInput"
-                      value={resolvedUpliftKey ? safeStr(upliftFlat[resolvedUpliftKey]) : ""}
-                      onChange={(e) => {
-                        const k = resolvedUpliftKey;
-                        if (!k) return;
-                        setUpliftValue(k, e.target.value);
-                      }}
-                      placeholder="0/0.05/0.15"
+                      title={`uplift_key = ${autoUpliftKey}`}
+                      value={safeStr(upliftFlat[autoUpliftKey])}
+                      onChange={(e) => setUpliftValue(autoUpliftKey, e.target.value)}
+                      placeholder="0 / 0.05 / 0.15"
                     />
                   </td>
                 </tr>
@@ -1133,7 +1631,7 @@ function AdminUnifiedRules() {
 
             {visibleRows.length === 0 ? (
               <tr>
-                <td colSpan={2 + PRICE_RULE_FIELDS.length + 2}>
+                <td colSpan={2 + PRICE_RULE_FIELDS.length + 1}>
                   <div className="small">No rows matched filter.</div>
                 </td>
               </tr>
@@ -1144,8 +1642,139 @@ function AdminUnifiedRules() {
 
       <Hr />
 
+      <div className="row wrap" style={{ marginBottom: 8 }}>
+        <div className="small monoInline">
+          Keyword Sys FOB Adjust (stack with Adjust; only when France FOB missing + Sys fallback)
+        </div>
+        <button className="btn" onClick={addKeywordRow}>
+          ADD KEYWORD RULE
+        </button>
+      </div>
+      <datalist id="keyword-price-group-options">
+        {productGroups.map((g) => (
+          <option key={g} value={g} />
+        ))}
+      </datalist>
+      <div className="tableWrap">
+        <table className="table dense">
+          <thead>
+            <tr>
+              <th style={{ minWidth: 160 }}>Product Group</th>
+              <th style={{ minWidth: 180 }}>Keyword</th>
+              <th style={{ minWidth: 120 }}>Increase %</th>
+              <th style={{ minWidth: 110 }}>Enabled</th>
+              <th style={{ minWidth: 160 }}>Match Count</th>
+              <th style={{ minWidth: 260 }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keywordRows.map((r, idx) => {
+              const preview = keywordPreviewById[safeStr(r.id)];
+              return (
+                <tr key={safeStr(r.id)}>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      list="keyword-price-group-options"
+                      value={safeStr(r.price_group)}
+                      onChange={(e) => setKeywordValue(idx, "price_group", e.target.value)}
+                      placeholder="ACCESS CONTROL / VDP"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.keyword)}
+                      onChange={(e) => setKeywordValue(idx, "keyword", e.target.value)}
+                      placeholder="ASC / ASI / VTO / KIT"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.pct)}
+                      onChange={(e) => setKeywordValue(idx, "pct", e.target.value)}
+                      placeholder="0.15"
+                    />
+                  </td>
+                  <td>
+                    <select
+                      className="input mono cellInput"
+                      value={r.enabled !== false ? "1" : "0"}
+                      onChange={(e) => setKeywordValue(idx, "enabled", e.target.value === "1")}
+                    >
+                      <option value="1">yes</option>
+                      <option value="0">no</option>
+                    </select>
+                  </td>
+                  <td className="mono">{preview ? `${safeStr(preview.shown)} / ${safeStr(preview.total)}` : "-"}</td>
+                  <td className="row wrap">
+                    <button
+                      className="btn"
+                      onClick={() => previewKeywordRow(r)}
+                      disabled={keywordPreviewLoadingId === safeStr(r.id) || !safeStr(r.keyword).trim()}
+                    >
+                      {keywordPreviewLoadingId === safeStr(r.id) ? "PREVIEWING..." : "PREVIEW"}
+                    </button>
+                    <button className="btn" onClick={() => removeKeywordRow(idx)}>
+                      DELETE
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {keywordRows.length === 0 ? (
+              <tr>
+                <td colSpan={6}>
+                  <div className="small">No keyword rules. Click ADD KEYWORD RULE.</div>
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+
+      {keywordRows
+        .filter((r) => keywordPreviewById[safeStr(r.id)])
+        .map((r) => {
+          const pv = keywordPreviewById[safeStr(r.id)];
+          const list = Array.isArray(pv?.rows) ? pv.rows : [];
+          return (
+            <details key={`preview_${safeStr(r.id)}`} style={{ marginTop: 8 }}>
+              <summary className="small monoInline">
+                Preview {safeStr(r.price_group)}#{safeStr(r.keyword)} · shown={safeStr(pv?.shown)} / total={safeStr(pv?.total)}
+              </summary>
+              <div style={{ marginTop: 8 }} />
+              <div className="tableWrap">
+                <table className="table dense">
+                  <thead>
+                    <tr>
+                      <th style={{ minWidth: 220 }}>PN</th>
+                      <th style={{ minWidth: 220 }}>Internal Model</th>
+                      <th style={{ minWidth: 220 }}>External Model</th>
+                      <th style={{ minWidth: 180 }}>Second Line</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {list.map((x, i) => (
+                      <tr key={`${safeStr(r.id)}_${i}`}>
+                        <td className="mono">{safeStr(x.pn)}</td>
+                        <td className="mono">{safeStr(x.internal_model)}</td>
+                        <td className="mono">{safeStr(x.external_model)}</td>
+                        <td className="mono">{safeStr(x.second_line)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          );
+        })}
+
+      <Hr />
+
       <details>
-        <summary className="small monoInline">Manual Uplift Keys (unmapped / direct edit)</summary>
+        <summary className="small monoInline">All Sys FOB Adjust Keys (advanced / direct edit)</summary>
         <div style={{ marginTop: 10 }} />
         <div className="tableWrap">
           <table className="table dense">

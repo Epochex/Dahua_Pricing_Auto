@@ -18,7 +18,7 @@ from backend.engine.core.pricing_engine import is_strict_price_group_compatible
 from backend.engine.core.pricing_rules import DDP_RULES, PRICE_RULES
 
 
-RUNTIME_DIR = Path("/data/runtime")
+RUNTIME_DIR = Path("/data/dahua_pricing_runtime")
 OUT_DIR = RUNTIME_DIR / "logs" / "mapping_audit"
 
 

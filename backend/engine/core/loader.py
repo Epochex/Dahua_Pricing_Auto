@@ -176,7 +176,7 @@ def load_all_data(data_dir: Path) -> DataBundle:
     """
     data_dir = Path(data_dir)
     runtime_dir = data_dir.parent
-    mapping_dir = runtime_dir / "mapping"   # 你现在的结构：/data/runtime/mapping
+    mapping_dir = runtime_dir / "mapping"
 
     france_path = _pick_existing(
         data_dir / "FrancePrice.xlsx",
