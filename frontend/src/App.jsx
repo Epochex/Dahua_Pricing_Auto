@@ -120,9 +120,47 @@ function parseFilenameFromContentDisposition(value) {
   return basic && basic[1] ? basic[1] : "";
 }
 
+function formatMetaTime(iso, epoch) {
+  let d = null;
+  if (iso) {
+    const t = new Date(iso);
+    if (!Number.isNaN(t.getTime())) d = t;
+  }
+  if (!d && epoch !== null && epoch !== undefined) {
+    const n = Number(epoch);
+    if (Number.isFinite(n)) {
+      const t = new Date(n * 1000);
+      if (!Number.isNaN(t.getTime())) d = t;
+    }
+  }
+  if (!d) return "-";
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}.${p2(d.getMonth() + 1)}.${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
 function QueryPriceTable({ resp }) {
   const fv = resp?.final_values || {};
   const calculated = new Set(resp?.calculated_fields || []);
+  const meta = resp?.meta || {};
+  const sysSalesType = safeStr(meta?.sys_sales_type) || "-";
+  const sysBasisField = safeStr(meta?.sys_basis_field) || "-";
+  const usedBasisRaw = meta?.sys_basis_price_used;
+  const selectedBasisRaw = meta?.sys_basis_price;
+  const hasUsedBasis = usedBasisRaw !== null && usedBasisRaw !== undefined && String(usedBasisRaw) !== "";
+  const hasSelectedBasis =
+    selectedBasisRaw !== null && selectedBasisRaw !== undefined && String(selectedBasisRaw) !== "";
+  const calcLayerValue =
+    sysBasisField && sysBasisField !== "-" ? `${sysSalesType} (${sysBasisField})` : sysSalesType;
+  const basisValue = hasUsedBasis
+    ? formatPricePiecewise(usedBasisRaw)
+    : hasSelectedBasis
+      ? `${formatPricePiecewise(selectedBasisRaw)} (not used)`
+      : "-";
+  const basisRaw = hasUsedBasis
+    ? safeStr(usedBasisRaw)
+    : hasSelectedBasis
+      ? `${safeStr(selectedBasisRaw)} [${sysBasisField}]`
+      : "-";
 
   return (
     <table className="table">
@@ -153,6 +191,23 @@ function QueryPriceTable({ resp }) {
             </tr>
           );
         })}
+        <tr key="__calc_layer__">
+          <td className="mono">Calc Layer (Sys)</td>
+          <td className="priceCell">
+            <span className="priceVal">{calcLayerValue}</span>
+          </td>
+          <td className="mono">{`${sysSalesType} / ${sysBasisField}`}</td>
+        </tr>
+        <tr key="__sys_basis_price_used__">
+          <td className="mono">Sys Basis Price Used</td>
+          <td className="priceCell">
+            <span className="priceVal">{basisValue}</span>
+            <span className={`inlineTag ${hasUsedBasis ? "calc" : "orig"}`}>
+              {hasUsedBasis ? "Used" : "Not Used"}
+            </span>
+          </td>
+          <td className="mono">{basisRaw}</td>
+        </tr>
       </tbody>
     </table>
   );
@@ -1247,7 +1302,6 @@ function flattenKeywordUpliftRows(rawRows) {
   const src = Array.isArray(rawRows) ? rawRows : [];
   return src.map((r, idx) => ({
     id: `kw_${idx}_${Date.now()}`,
-    price_group: safeStr(r?.price_group),
     keyword: safeStr(r?.keyword),
     pct: safeStr(r?.pct),
     enabled: r?.enabled !== false,
@@ -1257,11 +1311,9 @@ function flattenKeywordUpliftRows(rawRows) {
 function rebuildKeywordUpliftRows(rows) {
   const out = [];
   for (const r of rows || []) {
-    const pg = safeStr(r?.price_group).trim();
     const kw = safeStr(r?.keyword).trim();
-    if (!pg || !kw) continue;
+    if (!kw) continue;
     out.push({
-      price_group: pg,
       keyword: kw,
       pct: normNum(r?.pct, 0),
       enabled: r?.enabled !== false,
@@ -1281,9 +1333,6 @@ function AdminUnifiedRules() {
   const [ddpRows, setDdpRows] = useState([]);
   const [rows, setRows] = useState([]);
   const [upliftFlat, setUpliftFlat] = useState({});
-  const [keywordRows, setKeywordRows] = useState([]);
-  const [keywordPreviewById, setKeywordPreviewById] = useState({});
-  const [keywordPreviewLoadingId, setKeywordPreviewLoadingId] = useState("");
   const [filter, setFilter] = useState("");
   const skipAutoSaveRef = useRef(true);
   const dirtyRef = useRef(false);
@@ -1291,15 +1340,13 @@ function AdminUnifiedRules() {
   const ddpRowsRef = useRef(ddpRows);
   const upliftRawRef = useRef(upliftRaw);
   const upliftFlatRef = useRef(upliftFlat);
-  const keywordRowsRef = useRef(keywordRows);
 
   useEffect(() => {
     rowsRef.current = rows;
     ddpRowsRef.current = ddpRows;
     upliftRawRef.current = upliftRaw;
     upliftFlatRef.current = upliftFlat;
-    keywordRowsRef.current = keywordRows;
-  }, [rows, ddpRows, upliftRaw, upliftFlat, keywordRows]);
+  }, [rows, ddpRows, upliftRaw, upliftFlat]);
 
   async function loadAll() {
     setErr("");
@@ -1307,19 +1354,16 @@ function AdminUnifiedRules() {
     setLoading(true);
     skipAutoSaveRef.current = true;
     try {
-      const [pr, uf, dr, kw] = await Promise.all([
+      const [pr, uf, dr] = await Promise.all([
         apiGetJson("/api/admin/pricing-rules"),
         apiGetJson("/api/admin/uplift"),
         apiGetJson("/api/admin/ddp-rules"),
-        apiGetJson("/api/admin/keyword-uplift"),
       ]);
 
       setUpliftRaw(uf || {});
       setDdpRows(flattenDdpRules(dr || {}));
       setRows(flattenPricingRules(pr || {}));
       setUpliftFlat(parseUpliftAnyShape(uf || {}));
-      setKeywordRows(flattenKeywordUpliftRows(kw || []));
-      setKeywordPreviewById({});
       setInfo("Loaded");
       dirtyRef.current = false;
     } catch (e) {
@@ -1338,23 +1382,20 @@ function AdminUnifiedRules() {
       ddpRows: ddpRowsRef.current,
       upliftRaw: upliftRawRef.current,
       upliftFlat: upliftFlatRef.current,
-      keywordRows: keywordRowsRef.current,
     };
     const pricingPayload = rebuildPricingRules(src.rows || []);
     const ddpPayload = rebuildDdpRules(src.ddpRows || []);
     const upliftPayload = buildUpliftPayloadLikeInput(src.upliftRaw, src.upliftFlat || {});
-    const keywordPayload = rebuildKeywordUpliftRows(src.keywordRows || []);
 
     await apiPutJson("/api/admin/pricing-rules", pricingPayload);
     await apiPutJson("/api/admin/ddp-rules", ddpPayload);
     await apiPutJson("/api/admin/uplift", upliftPayload);
-    await apiPutJson("/api/admin/keyword-uplift", keywordPayload);
     if (forceReloadRules) {
       await apiPostJson("/api/admin/reload-rules", {});
     }
 
     if (!silent) {
-      setInfo("Saved pricing-rules + ddp-rules + sys-fob-adjust + keyword-adjust");
+      setInfo("Saved pricing-rules + ddp-rules + sys-fob-adjust");
     }
     if (reload) {
       await loadAll();
@@ -1403,52 +1444,18 @@ function AdminUnifiedRules() {
     setUpliftFlat((prev) => ({ ...prev, [key]: value }));
   }
 
-  function setKeywordValue(rowIdx, field, value) {
-    dirtyRef.current = true;
-    setKeywordRows((prev) => {
-      const next = prev.slice();
-      next[rowIdx] = { ...next[rowIdx], [field]: value };
-      return next;
-    });
-  }
-
-  function addKeywordRow() {
-    dirtyRef.current = true;
-    setKeywordRows((prev) => [
-      ...prev,
-      { id: `kw_new_${Date.now()}`, price_group: "", keyword: "", pct: "0", enabled: true },
-    ]);
-  }
-
-  function removeKeywordRow(rowIdx) {
-    dirtyRef.current = true;
-    setKeywordRows((prev) => prev.filter((_, i) => i !== rowIdx));
-  }
-
-  async function previewKeywordRow(row) {
-    const keyword = safeStr(row?.keyword).trim();
-    const priceGroup = safeStr(row?.price_group).trim();
-    if (!keyword) return;
-    const id = safeStr(row?.id);
-    setKeywordPreviewLoadingId(id);
-    try {
-      const resp = await apiPostJson("/api/admin/keyword-uplift/preview", {
-        price_group: priceGroup || null,
-        keyword,
-        limit: 30,
-      });
-      setKeywordPreviewById((prev) => ({ ...prev, [id]: resp }));
-    } catch (e) {
-      setErr(String(e.message || e));
-    } finally {
-      setKeywordPreviewLoadingId("");
-    }
-  }
-
   function resolveAutoUpliftKeyForRow(row) {
     const rn = String(row?.ruleName || "").trim();
     if (rn && rn !== "_default_") return rn;
     return String(row?.group || "").trim();
+  }
+
+  function jumpToTop() {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function jumpToBottom() {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
   }
 
   useEffect(() => {
@@ -1467,7 +1474,7 @@ function AdminUnifiedRules() {
       }
     }, 700);
     return () => clearTimeout(t);
-  }, [rows, ddpRows, upliftFlat, keywordRows, loading, saving]);
+  }, [rows, ddpRows, upliftFlat, loading, saving]);
 
   useEffect(() => {
     return () => {
@@ -1477,7 +1484,6 @@ function AdminUnifiedRules() {
         ddpRows: ddpRowsRef.current,
         upliftRaw: upliftRawRef.current,
         upliftFlat: upliftFlatRef.current,
-        keywordRows: keywordRowsRef.current,
       };
       void persistAll({ reload: false, silent: true, forceReloadRules: true, snapshot }).catch(() => {});
     };
@@ -1494,16 +1500,12 @@ function AdminUnifiedRules() {
     });
   }, [rows, filter]);
 
-  const productGroups = useMemo(() => {
-    return Array.from(new Set(rows.map((r) => safeStr(r.group).trim()).filter(Boolean))).sort();
-  }, [rows]);
-
   return (
     <Card
-      title="ADMIN · DDP RULES + PRICE RULES + SYS FOB ADJUST + KEYWORD ADJUST"
+      title="RULES · DDP + PRICE + SYS FOB ADJUST"
       right={
         <span className="small monoInline">
-          /api/admin/ddp-rules + /api/admin/pricing-rules + /api/admin/uplift + /api/admin/keyword-uplift
+          /api/admin/ddp-rules + /api/admin/pricing-rules + /api/admin/uplift
         </span>
       }
     >
@@ -1523,6 +1525,12 @@ function AdminUnifiedRules() {
           onChange={(e) => setFilter(e.target.value)}
           placeholder="filter by product group / rule name"
         />
+        <button className="btn" onClick={jumpToTop}>
+          TOP
+        </button>
+        <button className="btn" onClick={jumpToBottom}>
+          BOTTOM
+        </button>
 
       </div>
 
@@ -1642,137 +1650,6 @@ function AdminUnifiedRules() {
 
       <Hr />
 
-      <div className="row wrap" style={{ marginBottom: 8 }}>
-        <div className="small monoInline">
-          Keyword Sys FOB Adjust (stack with Adjust; only when France FOB missing + Sys fallback)
-        </div>
-        <button className="btn" onClick={addKeywordRow}>
-          ADD KEYWORD RULE
-        </button>
-      </div>
-      <datalist id="keyword-price-group-options">
-        {productGroups.map((g) => (
-          <option key={g} value={g} />
-        ))}
-      </datalist>
-      <div className="tableWrap">
-        <table className="table dense">
-          <thead>
-            <tr>
-              <th style={{ minWidth: 160 }}>Product Group</th>
-              <th style={{ minWidth: 180 }}>Keyword</th>
-              <th style={{ minWidth: 120 }}>Increase %</th>
-              <th style={{ minWidth: 110 }}>Enabled</th>
-              <th style={{ minWidth: 160 }}>Match Count</th>
-              <th style={{ minWidth: 260 }}>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {keywordRows.map((r, idx) => {
-              const preview = keywordPreviewById[safeStr(r.id)];
-              return (
-                <tr key={safeStr(r.id)}>
-                  <td>
-                    <input
-                      className="input mono cellInput"
-                      list="keyword-price-group-options"
-                      value={safeStr(r.price_group)}
-                      onChange={(e) => setKeywordValue(idx, "price_group", e.target.value)}
-                      placeholder="ACCESS CONTROL / VDP"
-                    />
-                  </td>
-                  <td>
-                    <input
-                      className="input mono cellInput"
-                      value={safeStr(r.keyword)}
-                      onChange={(e) => setKeywordValue(idx, "keyword", e.target.value)}
-                      placeholder="ASC / ASI / VTO / KIT"
-                    />
-                  </td>
-                  <td>
-                    <input
-                      className="input mono cellInput"
-                      value={safeStr(r.pct)}
-                      onChange={(e) => setKeywordValue(idx, "pct", e.target.value)}
-                      placeholder="0.15"
-                    />
-                  </td>
-                  <td>
-                    <select
-                      className="input mono cellInput"
-                      value={r.enabled !== false ? "1" : "0"}
-                      onChange={(e) => setKeywordValue(idx, "enabled", e.target.value === "1")}
-                    >
-                      <option value="1">yes</option>
-                      <option value="0">no</option>
-                    </select>
-                  </td>
-                  <td className="mono">{preview ? `${safeStr(preview.shown)} / ${safeStr(preview.total)}` : "-"}</td>
-                  <td className="row wrap">
-                    <button
-                      className="btn"
-                      onClick={() => previewKeywordRow(r)}
-                      disabled={keywordPreviewLoadingId === safeStr(r.id) || !safeStr(r.keyword).trim()}
-                    >
-                      {keywordPreviewLoadingId === safeStr(r.id) ? "PREVIEWING..." : "PREVIEW"}
-                    </button>
-                    <button className="btn" onClick={() => removeKeywordRow(idx)}>
-                      DELETE
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-            {keywordRows.length === 0 ? (
-              <tr>
-                <td colSpan={6}>
-                  <div className="small">No keyword rules. Click ADD KEYWORD RULE.</div>
-                </td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
-
-      {keywordRows
-        .filter((r) => keywordPreviewById[safeStr(r.id)])
-        .map((r) => {
-          const pv = keywordPreviewById[safeStr(r.id)];
-          const list = Array.isArray(pv?.rows) ? pv.rows : [];
-          return (
-            <details key={`preview_${safeStr(r.id)}`} style={{ marginTop: 8 }}>
-              <summary className="small monoInline">
-                Preview {safeStr(r.price_group)}#{safeStr(r.keyword)} · shown={safeStr(pv?.shown)} / total={safeStr(pv?.total)}
-              </summary>
-              <div style={{ marginTop: 8 }} />
-              <div className="tableWrap">
-                <table className="table dense">
-                  <thead>
-                    <tr>
-                      <th style={{ minWidth: 220 }}>PN</th>
-                      <th style={{ minWidth: 220 }}>Internal Model</th>
-                      <th style={{ minWidth: 220 }}>External Model</th>
-                      <th style={{ minWidth: 180 }}>Second Line</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {list.map((x, i) => (
-                      <tr key={`${safeStr(r.id)}_${i}`}>
-                        <td className="mono">{safeStr(x.pn)}</td>
-                        <td className="mono">{safeStr(x.internal_model)}</td>
-                        <td className="mono">{safeStr(x.external_model)}</td>
-                        <td className="mono">{safeStr(x.second_line)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          );
-        })}
-
-      <Hr />
-
       <details>
         <summary className="small monoInline">All Sys FOB Adjust Keys (advanced / direct edit)</summary>
         <div style={{ marginTop: 10 }} />
@@ -1803,6 +1680,283 @@ function AdminUnifiedRules() {
           </table>
         </div>
       </details>
+
+      <div className="row wrap" style={{ marginTop: 10 }}>
+        <button className="btn" onClick={jumpToTop}>
+          TOP
+        </button>
+        <button className="btn" onClick={jumpToBottom}>
+          BOTTOM
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function KeywordAdjustConsole() {
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+  const [keywordRows, setKeywordRows] = useState([]);
+  const [keywordPreviewById, setKeywordPreviewById] = useState({});
+  const [keywordPreviewLoadingId, setKeywordPreviewLoadingId] = useState("");
+
+  async function loadAll() {
+    setErr("");
+    setInfo("");
+    setLoading(true);
+    try {
+      const kw = await apiGetJson("/api/admin/keyword-uplift");
+      setKeywordRows(flattenKeywordUpliftRows(kw || []));
+      setKeywordPreviewById({});
+      setInfo("Loaded");
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveAll() {
+    setErr("");
+    setInfo("");
+    setSaving(true);
+    try {
+      const payload = rebuildKeywordUpliftRows(keywordRows || []);
+      await apiPutJson("/api/admin/keyword-uplift", payload);
+      await apiPostJson("/api/admin/reload-rules", {});
+      setInfo("Saved keyword adjust rules + reloaded");
+      await loadAll();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  useEffect(() => {
+    loadAll();
+  }, []);
+
+  function setKeywordValue(rowIdx, field, value) {
+    setKeywordRows((prev) => {
+      const next = prev.slice();
+      next[rowIdx] = { ...next[rowIdx], [field]: value };
+      return next;
+    });
+  }
+
+  function addKeywordRow() {
+    setKeywordRows((prev) => [
+      ...prev,
+      { id: `kw_new_${Date.now()}`, keyword: "", pct: "0", enabled: true },
+    ]);
+  }
+
+  function removeKeywordRow(rowIdx) {
+    setKeywordRows((prev) => prev.filter((_, i) => i !== rowIdx));
+  }
+
+  async function previewKeywordRow(row) {
+    const keyword = safeStr(row?.keyword).trim();
+    if (!keyword) return;
+    const id = safeStr(row?.id);
+    setKeywordPreviewLoadingId(id);
+    try {
+      const resp = await apiPostJson("/api/admin/keyword-uplift/preview", {
+        keyword,
+        pct: normNum(row?.pct, 0),
+        enabled: row?.enabled !== false,
+      });
+      setKeywordPreviewById((prev) => ({ ...prev, [id]: resp }));
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setKeywordPreviewLoadingId("");
+    }
+  }
+
+  function jumpToTop() {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function jumpToBottom() {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  }
+
+  return (
+    <Card
+      title="KEYWORD ADJUST · GLOBAL MATCH + IMPACT PREVIEW"
+      right={<span className="small monoInline">/api/admin/keyword-uplift + /api/admin/keyword-uplift/preview</span>}
+    >
+      <div className="row wrap">
+        <button className="btn" onClick={loadAll} disabled={loading}>
+          {loading ? "LOADING..." : "RELOAD"}
+        </button>
+        <button className="btn primary" onClick={saveAll} disabled={saving}>
+          {saving ? "SAVING..." : "SAVE+RELOAD"}
+        </button>
+        <button className="btn" onClick={jumpToTop}>
+          TOP
+        </button>
+        <button className="btn" onClick={jumpToBottom}>
+          BOTTOM
+        </button>
+      </div>
+
+      {err ? (
+        <>
+          <Hr />
+          <div className="small err">{err}</div>
+        </>
+      ) : null}
+      {info ? (
+        <>
+          <Hr />
+          <div className="small okc">{info}</div>
+        </>
+      ) : null}
+
+      <Hr />
+        <div className="row wrap" style={{ marginBottom: 8 }}>
+          <div className="small monoInline">
+            关键词命中范围：France + Sys 的 Internal Model / External Model；Preview 会重算并仅展示价格实际变化的 PN。
+          </div>
+          <button className="btn" onClick={addKeywordRow}>
+            ADD KEYWORD RULE
+        </button>
+      </div>
+
+      <div className="tableWrap">
+        <table className="table dense">
+          <thead>
+            <tr>
+              <th style={{ minWidth: 200 }}>Keyword</th>
+              <th style={{ minWidth: 120 }}>Increase %</th>
+              <th style={{ minWidth: 110 }}>Enabled</th>
+              <th style={{ minWidth: 260 }}>Impact Summary</th>
+              <th style={{ minWidth: 260 }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keywordRows.map((r, idx) => {
+              const pv = keywordPreviewById[safeStr(r.id)];
+              const affected = pv?.affected_count ?? pv?.total ?? "-";
+              const candidates = pv?.candidate_count ?? pv?.total_candidates ?? "-";
+              const displayed = pv?.displayed_count ?? pv?.shown ?? "-";
+              return (
+                <tr key={safeStr(r.id)}>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.keyword)}
+                      onChange={(e) => setKeywordValue(idx, "keyword", e.target.value)}
+                      placeholder="ASC / ASI / VTO / KIT"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.pct)}
+                      onChange={(e) => setKeywordValue(idx, "pct", e.target.value)}
+                      placeholder="0.15"
+                    />
+                  </td>
+                  <td>
+                    <select
+                      className="input mono cellInput"
+                      value={r.enabled !== false ? "1" : "0"}
+                      onChange={(e) => setKeywordValue(idx, "enabled", e.target.value === "1")}
+                    >
+                      <option value="1">yes</option>
+                      <option value="0">no</option>
+                    </select>
+                  </td>
+                  <td className="mono">
+                    {pv ? `受影响=${safeStr(affected)} · 候选=${safeStr(candidates)} · 展示=${safeStr(displayed)}` : "-"}
+                  </td>
+                  <td className="row wrap">
+                    <button
+                      className="btn"
+                      onClick={() => previewKeywordRow(r)}
+                      disabled={keywordPreviewLoadingId === safeStr(r.id) || !safeStr(r.keyword).trim()}
+                    >
+                      {keywordPreviewLoadingId === safeStr(r.id) ? "PREVIEWING..." : "PREVIEW"}
+                    </button>
+                    <button className="btn" onClick={() => removeKeywordRow(idx)}>
+                      DELETE
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {keywordRows.length === 0 ? (
+              <tr>
+                <td colSpan={5}>
+                  <div className="small">No keyword rules. Click ADD KEYWORD RULE.</div>
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+
+      {keywordRows
+        .filter((r) => keywordPreviewById[safeStr(r.id)])
+        .map((r) => {
+          const pv = keywordPreviewById[safeStr(r.id)];
+          const list = Array.isArray(pv?.rows) ? pv.rows : [];
+          const affected = pv?.affected_count ?? pv?.total ?? 0;
+          const candidates = pv?.candidate_count ?? pv?.total_candidates ?? 0;
+          const displayed = pv?.displayed_count ?? pv?.shown ?? 0;
+          return (
+            <details key={`preview_${safeStr(r.id)}`} style={{ marginTop: 8 }} open>
+              <summary className="small monoInline">
+                Preview {safeStr(r.keyword)}：候选 {safeStr(candidates)}，受影响 {safeStr(affected)}，展示 {safeStr(displayed)}（已展示全部受影响项）
+              </summary>
+              <div style={{ marginTop: 8 }} />
+              <div className="tableWrap">
+                <table className="table dense">
+                  <thead>
+                    <tr>
+                      <th style={{ minWidth: 220 }}>PN</th>
+                      <th style={{ minWidth: 220 }}>Internal Model</th>
+                      <th style={{ minWidth: 220 }}>External Model</th>
+                      <th style={{ minWidth: 120 }}>FOB Before</th>
+                      <th style={{ minWidth: 120 }}>FOB After</th>
+                      <th style={{ minWidth: 120 }}>DDP After</th>
+                      <th style={{ minWidth: 120 }}>Reseller</th>
+                      <th style={{ minWidth: 120 }}>Gold</th>
+                      <th style={{ minWidth: 120 }}>Silver</th>
+                      <th style={{ minWidth: 120 }}>Ivory</th>
+                      <th style={{ minWidth: 120 }}>MSRP</th>
+                      <th style={{ minWidth: 120 }}>Delta %</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {list.map((x, i) => (
+                      <tr key={`${safeStr(r.id)}_${i}`}>
+                        <td className="mono">{safeStr(x.pn)}</td>
+                        <td className="mono">{safeStr(x.internal_model)}</td>
+                        <td className="mono">{safeStr(x.external_model)}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.fob_before))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.fob_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.ddp_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.reseller_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.gold_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.silver_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.ivory_after))}</td>
+                        <td className="mono">{safeStr(formatPricePiecewise(x.msrp_after))}</td>
+                        <td className="mono">{safeStr(x.delta_pct)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          );
+        })}
     </Card>
   );
 }
@@ -1861,7 +2015,14 @@ export default function App() {
             大华法国驻地专用产品定价自动化平台
           </h1>
           <div className="sub">
-            <span className="pill">数据源更新时间:2026.2.23</span>
+            <span className="pill">
+              国家侧数据更新时间:
+              {formatMetaTime(meta?.country_data_updated_at_iso, meta?.country_data_updated_at_epoch)}
+            </span>
+            <span className="pill">
+              系统侧数据更新时间:
+              {formatMetaTime(meta?.sys_data_updated_at_iso, meta?.sys_data_updated_at_epoch)}
+            </span>
             <span className="pill">遇到问题请联系 开发人员:林建克 Jianke LIN | Wechat: Epochex404 </span>
           </div>
         </div>
@@ -1880,10 +2041,16 @@ export default function App() {
             BATCH
           </button>
           <button
-            className={`tab ${tab === "admin" ? "active" : ""}`}
-            onClick={() => setTab("admin")}
+            className={`tab ${tab === "rules" ? "active" : ""}`}
+            onClick={() => setTab("rules")}
           >
-            ADMIN
+            RULES
+          </button>
+          <button
+            className={`tab ${tab === "keyword" ? "active" : ""}`}
+            onClick={() => setTab("keyword")}
+          >
+            KEYWORD
           </button>
           <button
             className={`tab ${tab === "meta" ? "active" : ""}`}
@@ -1897,7 +2064,8 @@ export default function App() {
       <div className="grid">
         {tab === "query" ? <SingleQuery /> : null}
         {tab === "batch" ? <BatchExport /> : null}
-        {tab === "admin" ? <AdminConsole /> : null}
+        {tab === "rules" ? <AdminConsole /> : null}
+        {tab === "keyword" ? <KeywordAdjustConsole /> : null}
         {tab === "meta" ? <MetaPanel meta={meta} metaErr={metaErr} /> : null}
       </div>
     </div>

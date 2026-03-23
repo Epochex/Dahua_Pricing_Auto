@@ -29,20 +29,8 @@ PRICE_COLS = [
 # 默认值可为空；通过 /api/admin/uplift（前端 Adjust 列）可热更新。
 UPLIFT_PCT_BY_LINE: Dict[str, float] = {}
 # 关键词涨价规则（叠加在 Sys FOB Adjust 之后）：
-# [{"price_group":"ACCESS CONTROL","keyword":"ASG","pct":0.15,"enabled":True}, ...]
+# [{"keyword":"ASC","pct":0.15,"enabled":True}, ...]
 KEYWORD_UPLIFT_RULES: List[Dict[str, Any]] = []
-_GROUP_KEY_ALIASES: Dict[str, str] = {
-    "AC": "ACCESS CONTROL",
-    "ACCESSCONTROL": "ACCESS CONTROL",
-}
-
-
-def _normalize_group_key(v: Optional[str]) -> str:
-    s = str(v or "").strip().upper()
-    if not s:
-        return ""
-    compact = s.replace(" ", "")
-    return _GROUP_KEY_ALIASES.get(compact, s)
 
 
 def _detect_uplift_line_key(
@@ -182,45 +170,41 @@ def _pick_sys_uplift(
     return "", 0.0
 
 
-def _build_keyword_match_text(
-    series_display: str,
+def _keyword_matches_model_text(keyword: str, model_text: str) -> bool:
+    kw = str(keyword or "").strip().upper()
+    if not kw:
+        return False
+    text = str(model_text or "").strip().upper()
+    if not text:
+        return False
+
+    # 型号关键词只在型号段前缀上匹配，避免 BASIC -> ASI 这类误命中。
+    for segment in re.split(r"[^A-Z0-9]+", text):
+        if not segment:
+            continue
+        if segment.startswith(kw):
+            return True
+        if segment.startswith(f"DHI{kw}") or segment.startswith(f"DH{kw}"):
+            return True
+    return False
+
+
+def _collect_keyword_model_values(
     france_row: Optional[pd.Series],
     sys_row: Optional[pd.Series],
-) -> str:
+) -> List[str]:
     parts: List[str] = []
-    if series_display:
-        parts.append(series_display)
-
     if france_row is not None:
-        for col in (
-            "Series",
-            "系列",
-            "External Model",
-            "Internal Model",
-            "Description",
-            "Product Name",
-            "Product Name(CN)",
-            "Second Level Product Category",
-            "Product Line",
-            "Product Line(CN)",
-        ):
+        for col in ("External Model", "Internal Model"):
             if col in france_row and pd.notna(france_row[col]):
                 parts.append(str(france_row[col]))
 
     if sys_row is not None:
-        for col in (
-            "Second Product Line",
-            "Catelog Name",
-            "External Model",
-            "Internal Model",
-            "First Product Line",
-            "Product Name",
-            "Product Name(CN)",
-        ):
+        for col in ("External Model", "Internal Model"):
             if col in sys_row and pd.notna(sys_row[col]):
                 parts.append(str(sys_row[col]))
 
-    return " ".join(parts).upper()
+    return parts
 
 
 def _pick_sys_keyword_uplift(
@@ -235,26 +219,16 @@ def _pick_sys_keyword_uplift(
 ) -> Tuple[List[str], float]:
     """
     关键词涨价（仅 Sys 反算 FOB 场景）：
-    - 先按 price_group 过滤（可匹配 category/price_group/effective_price_group/price_rule_key）
-    - 再在 Internal/External/Series/Catelog 等文本中做 contains
+    - 仅在 Internal Model / External Model 中做型号关键词匹配
     - 命中的 pct 做叠加（相加）
     """
     if not KEYWORD_UPLIFT_RULES:
         return [], 0.0
 
-    group_candidates = {
-        _normalize_group_key(category),
-        _normalize_group_key(price_group),
-        _normalize_group_key(effective_price_group),
-    }
-    if price_rule_key:
-        group_candidates.add(_normalize_group_key(price_rule_key))
-    group_candidates.discard("")
-
-    haystack = _build_keyword_match_text(series_display, france_row, sys_row)
+    model_values = _collect_keyword_model_values(france_row, sys_row)
     hits: List[str] = []
     total_pct = 0.0
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[str] = set()
 
     for rule in KEYWORD_UPLIFT_RULES:
         if not isinstance(rule, dict):
@@ -262,25 +236,20 @@ def _pick_sys_keyword_uplift(
         if rule.get("enabled", True) is False:
             continue
 
-        pg = str(rule.get("price_group") or "").strip()
         kw = str(rule.get("keyword") or "").strip()
         pct = _to_float(rule.get("pct"))
         if not kw or pct is None or pct <= 0:
             continue
 
-        pg_up = _normalize_group_key(pg)
-        if pg_up and pg_up not in group_candidates:
-            continue
         kw_up = kw.upper()
-        if kw_up not in haystack:
+        if not any(_keyword_matches_model_text(kw_up, model_text) for model_text in model_values):
             continue
 
-        dedup_key = (pg_up, kw_up)
-        if dedup_key in seen:
+        if kw_up in seen:
             continue
-        seen.add(dedup_key)
+        seen.add(kw_up)
         total_pct += pct
-        hits.append(f"{pg or '*'}#{kw}")
+        hits.append(kw)
 
     return hits, total_pct
 
@@ -670,6 +639,8 @@ def compute_prices_for_part(
       - final_values / calculated_fields / category / price_group / series_display / series_key / pricing_rule_name
       - sys_sales_type: 本 PN 在 Sys 中的 Sales Type（规范化后的）
       - sys_basis_field: 本次 Sys FOB 计算若发生，用的是哪列（Min Price / Area Price）
+      - sys_basis_price: 该层级在 Sys 表对应底价
+      - sys_basis_price_used: 本次是否实际用于反算 FOB（仅 France FOB 缺失时）
       - sys_uplift_key: 本次 Sys FOB uplift 命中的 key（若未命中则 None）
       - sys_keyword_uplift_pct / sys_keyword_uplift_hits: 关键词叠加涨价命中信息
     """
@@ -709,8 +680,9 @@ def compute_prices_for_part(
     # ===== Sys 侧：提前解析 Sales Type（仅用于打印/记录，不改变 France 优先级）=====
     sys_sales_type = "UNKNOWN"
     sys_basis_field: Optional[str] = None
+    sys_basis_price: Optional[float] = None
     if sys_row is not None:
-        _, sys_sales_type, sys_basis_field = _choose_sys_base_price_from_sys(sys_row)
+        sys_basis_price, sys_sales_type, sys_basis_field = _choose_sys_base_price_from_sys(sys_row)
 
     # ===== 预计算：本次会使用的 PRICE_RULES 规则名字（即使最终不需要补全渠道价，也可输出供核对）=====
     effective_price_group = resolve_price_group_for_rules(price_group, series_key, series_display)
@@ -735,6 +707,8 @@ def compute_prices_for_part(
             "used_sys": False,
             "sys_sales_type": sys_sales_type,
             "sys_basis_field": None,
+            "sys_basis_price": sys_basis_price,
+            "sys_basis_price_used": None,
             "sys_uplift_key": None,
             "sys_keyword_uplift_pct": 0.0,
             "sys_keyword_uplift_hits": [],
@@ -754,6 +728,8 @@ def compute_prices_for_part(
             "used_sys": False,
             "sys_sales_type": sys_sales_type,
             "sys_basis_field": None,
+            "sys_basis_price": sys_basis_price,
+            "sys_basis_price_used": None,
             "sys_uplift_key": None,
             "sys_keyword_uplift_pct": 0.0,
             "sys_keyword_uplift_hits": [],
@@ -764,6 +740,7 @@ def compute_prices_for_part(
 
     used_sys = False
     used_sys_basis_field: Optional[str] = None
+    used_sys_basis_price: Optional[float] = None
     used_sys_uplift_key: Optional[str] = None
     used_sys_keyword_uplift_pct: float = 0.0
     used_sys_keyword_uplift_hits: List[str] = []
@@ -772,6 +749,7 @@ def compute_prices_for_part(
     if (fob is None or fob <= 0) and sys_row is not None:
         base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(sys_row)
         sys_sales_type = sales_norm
+        sys_basis_price = base_price
         if base_price is not None and base_price > 0:
             fob = base_price * 0.9
 
@@ -807,6 +785,7 @@ def compute_prices_for_part(
             calculated_fields.add("FOB C(EUR)")
             used_sys = True
             used_sys_basis_field = basis_field  # Min Price / Area Price
+            used_sys_basis_price = base_price
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
@@ -853,6 +832,8 @@ def compute_prices_for_part(
         "used_sys": used_sys,
         "sys_sales_type": sys_sales_type,
         "sys_basis_field": used_sys_basis_field,
+        "sys_basis_price": sys_basis_price,
+        "sys_basis_price_used": used_sys_basis_price,
         "sys_uplift_key": used_sys_uplift_key,
         "sys_keyword_uplift_pct": used_sys_keyword_uplift_pct,
         "sys_keyword_uplift_hits": used_sys_keyword_uplift_hits,
@@ -1064,6 +1045,8 @@ def compute_one(
             "used_sys": result.get("used_sys"),
             "sys_sales_type": result.get("sys_sales_type"),
             "sys_basis_field": result.get("sys_basis_field"),
+            "sys_basis_price": result.get("sys_basis_price"),
+            "sys_basis_price_used": result.get("sys_basis_price_used"),
             "sys_uplift_key": result.get("sys_uplift_key"),
             "sys_keyword_uplift_pct": result.get("sys_keyword_uplift_pct"),
             "sys_keyword_uplift_hits": result.get("sys_keyword_uplift_hits"),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,12 +66,35 @@ class PricingEngine:
     def meta(self) -> Dict[str, Any]:
         if self.data is None:
             return {"loaded": False}
+
+        def _mtime_epoch(path: Optional[Path]) -> Optional[float]:
+            if path is None:
+                return None
+            try:
+                return float(path.stat().st_mtime)
+            except Exception:
+                return None
+
+        def _epoch_to_iso(epoch: Optional[float]) -> Optional[str]:
+            if epoch is None:
+                return None
+            try:
+                return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+            except Exception:
+                return None
+
+        country_epoch = _mtime_epoch(self.data.france_price_path)
+        sys_epoch = _mtime_epoch(self.data.sys_price_path)
         return {
             "loaded": True,
             "loaded_at_epoch": self._loaded_at,
             "data_dir": str(self.cfg.data_dir),
             "france_price_file": str(self.data.france_price_path) if self.data.france_price_path else None,
             "sys_price_file": str(self.data.sys_price_path) if self.data.sys_price_path else None,
+            "country_data_updated_at_epoch": country_epoch,
+            "country_data_updated_at_iso": _epoch_to_iso(country_epoch),
+            "sys_data_updated_at_epoch": sys_epoch,
+            "sys_data_updated_at_iso": _epoch_to_iso(sys_epoch),
             "map_fr_file": str(self.data.map_fr_path) if self.data.map_fr_path else None,
             "map_sys_file": str(self.data.map_sys_path) if self.data.map_sys_path else None,
             "rows_france": int(self.data.france_df.shape[0]),

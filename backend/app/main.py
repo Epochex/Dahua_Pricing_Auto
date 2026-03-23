@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 import threading
 import uuid
@@ -18,7 +19,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from backend.engine.engine import EngineConfig, PricingEngine
-from backend.engine.core.classifier import apply_mapping
 from backend.engine.core import pricing_engine as pricing_engine_mod
 from backend.engine.core import pricing_rules as pricing_rules_mod
 from backend.engine.core.formatter import build_export_frames, write_export_xlsx
@@ -43,10 +43,6 @@ UPLIFT_CFG = ADMIN_DIR / "uplift.json"
 KEYWORD_UPLIFT_CFG = ADMIN_DIR / "keyword_uplift.json"
 DDP_RULES_CFG = ADMIN_DIR / "ddp_rules.json"
 PRICE_RULES_CFG = ADMIN_DIR / "price_rules.json"
-_GROUP_KEY_ALIASES: Dict[str, str] = {
-    "AC": "ACCESS CONTROL",
-    "ACCESSCONTROL": "ACCESS CONTROL",
-}
 
 
 def _utc_now_iso() -> str:
@@ -136,34 +132,32 @@ def _normalize_keyword_uplift_payload(payload: Any) -> list[Dict[str, Any]]:
     if not isinstance(payload, list):
         raise HTTPException(
             status_code=400,
-            detail="payload must be array: [{price_group, keyword, pct, enabled}]",
+            detail="payload must be array: [{keyword, pct, enabled}]",
         )
 
     rows: list[Dict[str, Any]] = []
     for i, it in enumerate(payload):
         if not isinstance(it, dict):
             raise HTTPException(status_code=400, detail=f"keyword_uplift[{i}] must be object")
-        pg = _normalize_group_key(it.get("price_group"))
         kw = str(it.get("keyword") or "").strip()
-        if not pg or not kw:
+        if not kw:
             continue
         pct = _normalize_number(it.get("pct"), f"keyword_uplift[{i}].pct")
         enabled = bool(it.get("enabled", True))
         rows.append(
             {
-                "price_group": pg,
                 "keyword": kw,
                 "pct": pct,
                 "enabled": enabled,
             }
         )
 
-    dedup: Dict[tuple[str, str], Dict[str, Any]] = {}
+    dedup: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        k = (_normalize_group_key(r.get("price_group")), str(r.get("keyword") or "").upper())
+        k = str(r.get("keyword") or "").upper()
         dedup[k] = r
     out = list(dedup.values())
-    out.sort(key=lambda r: (str(r.get("price_group") or ""), str(r.get("keyword") or "")))
+    out.sort(key=lambda r: str(r.get("keyword") or ""))
     return out
 
 
@@ -224,7 +218,6 @@ def _sorted_uplift_dict() -> Dict[str, float]:
 def _sorted_keyword_uplift_rows() -> list[Dict[str, Any]]:
     rows = [
         {
-            "price_group": str(r.get("price_group") or "").strip(),
             "keyword": str(r.get("keyword") or "").strip(),
             "pct": float(r.get("pct") or 0.0),
             "enabled": bool(r.get("enabled", True)),
@@ -232,8 +225,8 @@ def _sorted_keyword_uplift_rows() -> list[Dict[str, Any]]:
         for r in (pricing_engine_mod.KEYWORD_UPLIFT_RULES or [])
         if isinstance(r, dict)
     ]
-    rows = [r for r in rows if r["price_group"] and r["keyword"]]
-    rows.sort(key=lambda r: (r["price_group"], r["keyword"]))
+    rows = [r for r in rows if r["keyword"]]
+    rows.sort(key=lambda r: r["keyword"])
     return rows
 
 
@@ -298,9 +291,9 @@ class ExternalModelReq(BaseModel):
 
 
 class KeywordUpliftPreviewReq(BaseModel):
-    price_group: Optional[str] = Field(default=None, description="optional filter by price_group/category hint")
-    keyword: str = Field(..., description="contains keyword in model/series/product name")
-    limit: int = Field(default=30, ge=1, le=300)
+    keyword: str = Field(..., description="match keyword in Internal Model / External Model")
+    pct: float = Field(..., description="preview uplift pct for the keyword")
+    enabled: bool = Field(default=True, description="if false, preview returns empty impact")
 
 
 def _norm_optional_text(v: Any) -> Optional[str]:
@@ -308,14 +301,6 @@ def _norm_optional_text(v: Any) -> Optional[str]:
         return None
     s = str(v).strip()
     return s or None
-
-
-def _normalize_group_key(v: Optional[str]) -> str:
-    s = str(v or "").strip().upper()
-    if not s:
-        return ""
-    compact = s.replace(" ", "")
-    return _GROUP_KEY_ALIASES.get(compact, s)
 
 
 def _validate_query_overrides(
@@ -617,66 +602,164 @@ def _pick_col(df, candidates: list[str]) -> str:
     return cols[0]
 
 
-def _sys_keyword_preview(price_group: Optional[str], keyword: str, limit: int) -> Dict[str, Any]:
-    assert _engine is not None and _engine.data is not None
-    data = _engine.data
-    df = data.sys_df
-    map_df = data.map_sys
-
-    pg_filter = _normalize_group_key(price_group)
+def _keyword_matches_model_text(keyword: str, model_text: Any) -> bool:
     kw = str(keyword or "").strip().upper()
     if not kw:
-        raise HTTPException(status_code=400, detail="keyword is empty")
+        return False
+    text = str(model_text or "").strip().upper()
+    if not text:
+        return False
 
-    pn_col = _pick_col(df, ["Part Num", "Part No.", "Part No", "PN", "P/N", "Part Number"])
-    fields = [
-        "Internal Model",
-        "External Model",
-        "Second Product Line",
-        "Catelog Name",
-        "Product Name",
-        "Product Name(CN)",
-    ]
-
-    total = 0
-    rows = []
-    for _, r in df.iterrows():
-        cat, pg = apply_mapping(r, map_df)
-        if pg_filter:
-            cands = {_normalize_group_key(cat), _normalize_group_key(pg)}
-            if pg_filter not in cands:
-                continue
-
-        txt_parts = []
-        for f in fields:
-            if f in r and str(r.get(f) or "").strip():
-                txt_parts.append(str(r.get(f)))
-        txt = " ".join(txt_parts).upper()
-        if kw not in txt:
+    for segment in re.split(r"[^A-Z0-9]+", text):
+        if not segment:
             continue
+        if segment.startswith(kw):
+            return True
+        if segment.startswith(f"DHI{kw}") or segment.startswith(f"DH{kw}"):
+            return True
+    return False
 
-        total += 1
-        if len(rows) < limit:
-            rows.append(
-                {
-                    "pn": str(r.get(pn_col) or "").strip(),
-                    "internal_model": str(r.get("Internal Model") or "").strip(),
-                    "external_model": str(r.get("External Model") or "").strip(),
-                    "first_line": str(r.get("First Product Line") or "").strip(),
-                    "second_line": str(r.get("Second Product Line") or "").strip(),
-                    "catelog_name": str(r.get("Catelog Name") or "").strip(),
-                    "category": str(cat or "").strip(),
-                    "price_group_hint": str(pg or "").strip(),
-                }
-            )
 
+def _row_matches_keyword_models(row: Any, keyword: str, fields: list[str]) -> bool:
+    for f in fields:
+        if f in row and _keyword_matches_model_text(keyword, row.get(f)):
+            return True
+    return False
+
+
+def _collect_keyword_candidate_pns(keyword: str) -> list[str]:
+    assert _engine is not None and _engine.data is not None
+    data = _engine.data
+    kw = str(keyword or "").strip().upper()
+    if not kw:
+        return []
+
+    fr = data.france_df
+    sy = data.sys_df
+    fr_pn_col = _pick_col(fr, ["Part No.", "Part No", "Part Num", "PN", "P/N", "Part Number"])
+    sy_pn_col = _pick_col(sy, ["Part Num", "Part No.", "Part No", "PN", "P/N", "Part Number"])
+
+    fr_fields = ["Internal Model", "External Model"]
+    sy_fields = ["Internal Model", "External Model"]
+
+    pns: set[str] = set()
+    for _, r in fr.iterrows():
+        if _row_matches_keyword_models(r, kw, fr_fields):
+            pn = str(r.get(fr_pn_col) or "").strip()
+            if pn:
+                pns.add(pn)
+    for _, r in sy.iterrows():
+        if _row_matches_keyword_models(r, kw, sy_fields):
+            pn = str(r.get(sy_pn_col) or "").strip()
+            if pn:
+                pns.add(pn)
+    return sorted(pns)
+
+def _keyword_preview_all_sources(keyword: str, pct: float, enabled: bool) -> Dict[str, Any]:
+    assert _engine is not None and _engine.data is not None
+    if not enabled:
+        return {
+            "ok": True,
+            "keyword": keyword,
+            "pct": pct,
+            "enabled": False,
+            "candidate_count": 0,
+            "affected_count": 0,
+            "displayed_count": 0,
+            "total_candidates": 0,
+            "total": 0,
+            "shown": 0,
+            "rows": [],
+        }
+
+    kw = str(keyword or "").strip()
+    if not kw:
+        raise HTTPException(status_code=400, detail="keyword is empty")
+    if not math.isfinite(float(pct)):
+        raise HTTPException(status_code=400, detail="pct must be finite")
+
+    candidate_pns = _collect_keyword_candidate_pns(kw)
+    if not candidate_pns:
+        return {
+            "ok": True,
+            "keyword": kw,
+            "pct": pct,
+            "enabled": True,
+            "candidate_count": 0,
+            "affected_count": 0,
+            "displayed_count": 0,
+            "total_candidates": 0,
+            "total": 0,
+            "shown": 0,
+            "rows": [],
+        }
+
+    origin_rules = copy.deepcopy(pricing_engine_mod.KEYWORD_UPLIFT_RULES)
+    base_rules = [
+        r for r in copy.deepcopy(pricing_engine_mod.KEYWORD_UPLIFT_RULES)
+        if str(r.get("keyword") or "").strip().upper() != kw.upper()
+    ]
+    preview_rules = copy.deepcopy(base_rules)
+    preview_rules.append({"keyword": kw, "pct": float(pct), "enabled": True})
+
+    impacted_rows: list[Dict[str, Any]] = []
+    try:
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.clear()
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.extend(base_rules)
+        base_results = {pn: pricing_engine_mod.compute_one(_engine.data, pn) for pn in candidate_pns}
+
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.clear()
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.extend(preview_rules)
+        new_results = {pn: pricing_engine_mod.compute_one(_engine.data, pn) for pn in candidate_pns}
+    finally:
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.clear()
+        pricing_engine_mod.KEYWORD_UPLIFT_RULES.extend(origin_rules)
+
+    for pn in candidate_pns:
+        b = base_results.get(pn) or {}
+        n = new_results.get(pn) or {}
+        bfv = b.get("final_values") or {}
+        nfv = n.get("final_values") or {}
+        bfob = _to_float_soft(bfv.get("FOB C(EUR)"))
+        nfob = _to_float_soft(nfv.get("FOB C(EUR)"))
+        if bfob is None or nfob is None:
+            continue
+        if abs(nfob - bfob) <= 1e-9:
+            continue
+        delta_pct = (nfob / bfob - 1.0) if bfob else None
+        impacted_rows.append(
+            {
+                "pn": pn,
+                "internal_model": str(nfv.get("Internal Model") or "").strip(),
+                "external_model": str(nfv.get("External Model") or "").strip(),
+                "category": str((n.get("meta") or {}).get("category") or "").strip(),
+                "price_group": str((n.get("meta") or {}).get("price_group") or "").strip(),
+                "fob_before": bfob,
+                "fob_after": nfob,
+                "ddp_after": _to_float_soft(nfv.get("DDP A(EUR)")),
+                "reseller_after": _to_float_soft(nfv.get("Suggested Reseller(EUR)")),
+                "gold_after": _to_float_soft(nfv.get("Gold(EUR)")),
+                "silver_after": _to_float_soft(nfv.get("Silver(EUR)")),
+                "ivory_after": _to_float_soft(nfv.get("Ivory(EUR)")),
+                "msrp_after": _to_float_soft(nfv.get("MSRP(EUR)")),
+                "delta_pct": delta_pct,
+                "applied_hits": (n.get("meta") or {}).get("sys_keyword_uplift_hits") or [],
+            }
+        )
+
+    impacted_rows.sort(key=lambda x: (-(x.get("delta_pct") or 0.0), str(x.get("pn") or "")))
     return {
         "ok": True,
-        "price_group": price_group,
-        "keyword": keyword,
-        "total": total,
-        "shown": len(rows),
-        "rows": rows,
+        "keyword": kw,
+        "pct": float(pct),
+        "enabled": True,
+        "candidate_count": len(candidate_pns),
+        "affected_count": len(impacted_rows),
+        "displayed_count": len(impacted_rows),
+        "total_candidates": len(candidate_pns),
+        "total": len(impacted_rows),
+        "shown": len(impacted_rows),
+        "rows": impacted_rows,
     }
 
 
@@ -1083,9 +1166,9 @@ def admin_put_keyword_uplift(payload: Any = Body(...)) -> Dict[str, Any]:
 
 @app.post("/api/admin/keyword-uplift/preview")
 def admin_preview_keyword_uplift(req: KeywordUpliftPreviewReq) -> Dict[str, Any]:
-    price_group = _norm_optional_text(req.price_group)
     keyword = (req.keyword or "").strip()
-    return _sys_keyword_preview(price_group, keyword, int(req.limit))
+    pct = _normalize_number(req.pct, "pct")
+    return _keyword_preview_all_sources(keyword, pct, bool(req.enabled))
 
 
 @app.put("/api/admin/uplift")
