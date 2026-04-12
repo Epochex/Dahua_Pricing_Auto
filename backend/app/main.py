@@ -11,7 +11,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
@@ -50,7 +50,7 @@ def _utc_now_iso() -> str:
 
 
 def _ensure_dirs() -> None:
-    for d in (UPLOADS_DIR, OUTPUTS_DIR, LOGS_DIR, DATA_DIR, ADMIN_DIR, MAPPING_DIR):
+    for d in (UPLOADS_DIR, OUTPUTS_DIR, DATA_DIR, ADMIN_DIR, MAPPING_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -60,7 +60,6 @@ def _job_dirs(job_id: str) -> Tuple[Path, Path, Path]:
     lg = LOGS_DIR / job_id
     up.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    lg.mkdir(parents=True, exist_ok=True)
     return up, out, lg
 
 
@@ -272,6 +271,11 @@ class QueryRecomputeReq(BaseModel):
     force_category: Optional[str] = Field(default=None, description="override DDP category")
     force_price_group: Optional[str] = Field(default=None, description="override PRICE_RULES group")
     force_series_key: Optional[str] = Field(default=None, description="override PRICE_RULES subgroup key")
+    manual_sys_basis_price_used: Optional[float] = Field(
+        default=None,
+        description="manual override for Sys Basis Price Used",
+    )
+    manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
 
 
 class QueryExportReq(BaseModel):
@@ -280,6 +284,11 @@ class QueryExportReq(BaseModel):
     force_price_group: Optional[str] = Field(default=None, description="override PRICE_RULES group")
     force_series_key: Optional[str] = Field(default=None, description="override PRICE_RULES subgroup key")
     force_full_recalc: bool = Field(default=False, description="force full price recalculation")
+    manual_sys_basis_price_used: Optional[float] = Field(
+        default=None,
+        description="manual override for Sys Basis Price Used",
+    )
+    manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
 
 
 class ExternalModelReq(BaseModel):
@@ -288,6 +297,11 @@ class ExternalModelReq(BaseModel):
         default=True,
         description="if france has complete priced row under same external model, override cluster prices",
     )
+
+
+class ModelSearchReq(BaseModel):
+    query: str = Field(..., description="internal/external model query")
+    limit: int = Field(default=100, ge=1, le=300, description="max matched devices to return")
 
 
 class KeywordUpliftPreviewReq(BaseModel):
@@ -347,6 +361,26 @@ def _validate_query_overrides(
                     f"expected price_group={default_pg!r}"
                 ),
             )
+
+
+def _normalize_manual_price_override(v: Any, field: str) -> Optional[float]:
+    if v is None:
+        return None
+    n = _normalize_number(v, field)
+    if n <= 0:
+        raise HTTPException(status_code=400, detail=f"{field}: must be > 0")
+    return n
+
+
+def _validate_manual_recompute_inputs(
+    manual_sys_basis_price_used: Optional[float],
+    manual_fob: Optional[float],
+) -> None:
+    if manual_sys_basis_price_used is not None and manual_fob is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="manual_sys_basis_price_used and manual_fob cannot be provided together",
+        )
 
 
 def _build_category_price_groups() -> Dict[str, list[str]]:
@@ -451,6 +485,142 @@ def _collect_external_model_cluster_pns(pn: str) -> tuple[str, list[str]]:
     if input_key and input_key not in seen:
         pns.insert(0, pn)
     return ext_model, pns
+
+
+def _normalize_model_match_text(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if not s:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "", s)
+
+
+def _score_model_match(query_norm: str, value: Any) -> tuple[int, str]:
+    target = _normalize_model_match_text(value)
+    if not query_norm or not target:
+        return 0, ""
+    if target == query_norm:
+        return 300, "exact"
+    if target.startswith(query_norm):
+        return 200, "prefix"
+    if query_norm in target:
+        return 100, "contains"
+    return 0, ""
+
+
+def _collect_model_search_candidates(
+    df: Any,
+    *,
+    source: str,
+    query_norm: str,
+    seen: Dict[str, Dict[str, Any]],
+) -> None:
+    if df is None or getattr(df, "empty", True):
+        return
+
+    pn_col = _pick_col(df, ("Part No.", "Part No", "Part Num", "PN", "P/N", "Part Number", "PartNumber"))
+    internal_col = _pick_col(df, ("Internal Model",))
+    external_col = _pick_col(df, ("External Model", "ExternalModel"))
+    if not pn_col or (not internal_col and not external_col):
+        return
+
+    for _, row in df.iterrows():
+        pn = _norm_optional_text(row.get(pn_col))
+        if not pn:
+            continue
+
+        matches: List[tuple[str, int, str, Optional[str]]] = []
+        for field_name, col_name in (("internal_model", internal_col), ("external_model", external_col)):
+            if not col_name:
+                continue
+            raw_val = _norm_optional_text(row.get(col_name))
+            score, match_type = _score_model_match(query_norm, raw_val)
+            if score > 0:
+                matches.append((field_name, score, match_type, raw_val))
+        if not matches:
+            continue
+
+        best_field, best_score, best_type, _raw_val = max(matches, key=lambda x: (x[1], x[0]))
+        _ = best_field
+        item = seen.get(pn)
+        if item is None:
+            item = {
+                "pn": pn,
+                "score": best_score,
+                "match_type": best_type,
+                "matched_fields": set(),
+                "sources": set(),
+                "internal_model_raw": None,
+                "external_model_raw": None,
+            }
+            seen[pn] = item
+        if best_score > int(item.get("score") or 0):
+            item["score"] = best_score
+            item["match_type"] = best_type
+
+        cast_fields: Set[str] = item["matched_fields"]
+        cast_sources: Set[str] = item["sources"]
+        cast_sources.add(source)
+        for field_name, _score, _match_type, raw_val in matches:
+            cast_fields.add(field_name)
+            key = "internal_model_raw" if field_name == "internal_model" else "external_model_raw"
+            if raw_val and not item.get(key):
+                item[key] = raw_val
+
+
+def _search_models(req: ModelSearchReq) -> Dict[str, Any]:
+    assert _engine is not None and _engine.data is not None
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is empty")
+
+    query_norm = _normalize_model_match_text(query)
+    if not query_norm:
+        raise HTTPException(status_code=400, detail="query has no searchable characters")
+
+    seen: Dict[str, Dict[str, Any]] = {}
+    _collect_model_search_candidates(
+        _engine.data.france_df,
+        source="france",
+        query_norm=query_norm,
+        seen=seen,
+    )
+    _collect_model_search_candidates(
+        _engine.data.sys_df,
+        source="sys",
+        query_norm=query_norm,
+        seen=seen,
+    )
+
+    ranked = sorted(
+        seen.values(),
+        key=lambda x: (
+            -int(x.get("score") or 0),
+            str(x.get("pn") or ""),
+            str(x.get("internal_model_raw") or ""),
+            str(x.get("external_model_raw") or ""),
+        ),
+    )
+
+    items: List[Dict[str, Any]] = []
+    for idx, matched in enumerate(ranked[: int(req.limit)], start=1):
+        row = _engine.query_one(str(matched.get("pn") or ""))
+        review = _build_batch_review_item(idx, row)
+        review["match_type"] = matched.get("match_type")
+        review["match_score"] = matched.get("score")
+        review["matched_fields"] = sorted(list(matched.get("matched_fields") or []))
+        review["sources"] = sorted(list(matched.get("sources") or []))
+        review["internal_model_raw"] = matched.get("internal_model_raw")
+        review["external_model_raw"] = matched.get("external_model_raw")
+        items.append(review)
+
+    return {
+        "query": query,
+        "normalized_query": query_norm,
+        "count": len(items),
+        "total_hits": len(ranked),
+        "limit": int(req.limit),
+        "items": items,
+    }
 
 
 def _pick_france_anchor_prices(external_model: str) -> tuple[Optional[str], Optional[Dict[str, float]]]:
@@ -824,6 +994,12 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
         force_series_key,
         require_any=True,
     )
+    manual_sys_basis_price_used = _normalize_manual_price_override(
+        req.manual_sys_basis_price_used,
+        "manual_sys_basis_price_used",
+    )
+    manual_fob = _normalize_manual_price_override(req.manual_fob, "manual_fob")
+    _validate_manual_recompute_inputs(manual_sys_basis_price_used, manual_fob)
 
     return _engine.query_one(
         pn,
@@ -831,6 +1007,8 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
         force_price_group=force_price_group,
         force_series_key=force_series_key,
         force_full_recalc=True,
+        manual_sys_basis_price_used=manual_sys_basis_price_used,
+        manual_fob=manual_fob,
     )
 
 
@@ -850,6 +1028,12 @@ def query_export(req: QueryExportReq) -> FileResponse:
         force_series_key,
         require_any=False,
     )
+    manual_sys_basis_price_used = _normalize_manual_price_override(
+        req.manual_sys_basis_price_used,
+        "manual_sys_basis_price_used",
+    )
+    manual_fob = _normalize_manual_price_override(req.manual_fob, "manual_fob")
+    _validate_manual_recompute_inputs(manual_sys_basis_price_used, manual_fob)
 
     result = _engine.query_one(
         pn,
@@ -857,6 +1041,8 @@ def query_export(req: QueryExportReq) -> FileResponse:
         force_price_group=force_price_group,
         force_series_key=force_series_key,
         force_full_recalc=bool(req.force_full_recalc),
+        manual_sys_basis_price_used=manual_sys_basis_price_used,
+        manual_fob=manual_fob,
     )
     if str(result.get("status", "")).lower() != "ok":
         raise HTTPException(status_code=404, detail=f"pn not found: {pn}")
@@ -885,6 +1071,11 @@ def query_external_model_index(req: ExternalModelReq) -> Dict[str, Any]:
     if not pn:
         raise HTTPException(status_code=400, detail="pn is empty")
     return _query_cluster_by_external_model(pn, apply_france_anchor=bool(req.apply_france_anchor))
+
+
+@app.post("/api/models/search")
+def model_search(req: ModelSearchReq) -> Dict[str, Any]:
+    return _search_models(req)
 
 
 @app.post("/api/query/external-model-export")

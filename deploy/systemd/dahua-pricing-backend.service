@@ -8,7 +8,9 @@ User=root
 WorkingDirectory=/data/Dahua_Pricing_Auto
 Environment=PYTHONUNBUFFERED=1
 Environment=DAHUA_PRICING_RUNTIME_DIR=/data/dahua_pricing_runtime
-ExecStart=/data/Dahua_Pricing_Auto/.venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+ExecStart=/data/Dahua_Pricing_Auto/.venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+StandardOutput=null
+StandardError=null
 Restart=always
 RestartSec=3
 

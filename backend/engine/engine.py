@@ -108,6 +108,8 @@ class PricingEngine:
         force_price_group: Optional[str] = None,
         force_series_key: Optional[str] = None,
         force_full_recalc: bool = False,
+        manual_sys_basis_price_used: Optional[float] = None,
+        manual_fob: Optional[float] = None,
     ) -> Dict[str, Any]:
         if self.data is None:
             raise RuntimeError("engine not loaded")
@@ -118,6 +120,8 @@ class PricingEngine:
             force_price_group=force_price_group,
             force_series_key=force_series_key,
             force_full_recalc=force_full_recalc,
+            manual_sys_basis_price_used=manual_sys_basis_price_used,
+            manual_fob=manual_fob,
         )
 
     def run_batch(self, input_path: Path, level: str, out_dir: Path) -> Dict[str, Any]:

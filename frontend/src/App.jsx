@@ -93,6 +93,16 @@ function renderFieldValue(v) {
   return String(v);
 }
 
+function normalizeManualPriceInput(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("手动输入价格必须是大于 0 的数字");
+  }
+  return n;
+}
+
 function formatMatchMode(mode, matchedPn) {
   const m = String(mode || "").toLowerCase();
   const hit = safeStr(matchedPn);
@@ -314,11 +324,25 @@ function QueryDiagnosticBlock({ resp }) {
         <div className="diagTextLabel">重算模式</div>
         <div className="diagTextValue">
           {manualOverride ? (
-            <span className="bigPill monoInline">
-              MANUAL OVERRIDE · category={safeStr(meta?.forced_category)} · price_group={safeStr(
-                meta?.forced_price_group
-              )} · series_key={safeStr(meta?.forced_series_key)}
-            </span>
+            <>
+              <span className="bigPill monoInline">
+                MANUAL OVERRIDE · category={safeStr(meta?.forced_category)} · price_group={safeStr(
+                  meta?.forced_price_group
+                )} · series_key={safeStr(meta?.forced_series_key)}
+              </span>
+              {meta?.manual_override_field === "sys_basis_price_used" ? (
+                <span className="bigPill monoInline">
+                  manual Sys Basis Price Used={safeStr(
+                    formatPricePiecewise(meta?.manual_sys_basis_price_input)
+                  )}
+                </span>
+              ) : null}
+              {meta?.manual_override_field === "fob" ? (
+                <span className="bigPill monoInline">
+                  manual FOB C(EUR)={safeStr(formatPricePiecewise(meta?.manual_fob_input))}
+                </span>
+              ) : null}
+            </>
           ) : (
             <span className="bigPill monoInline">AUTO</span>
           )}
@@ -426,6 +450,8 @@ function SingleQuery() {
   const [manualCategory, setManualCategory] = useState("");
   const [manualPriceGroup, setManualPriceGroup] = useState("");
   const [manualSeriesKey, setManualSeriesKey] = useState("_default_");
+  const [manualSysBasisPriceUsed, setManualSysBasisPriceUsed] = useState("");
+  const [manualFob, setManualFob] = useState("");
 
   async function loadQueryOptions({ silent = false } = {}) {
     if (!silent) setOptionsErr("");
@@ -507,6 +533,22 @@ function SingleQuery() {
     }
   }, [seriesKeyOptions, manualSeriesKey]);
 
+  function syncManualInputsFromResponse(r) {
+    const meta = r?.meta || {};
+    if (meta?.manual_override_field === "sys_basis_price_used") {
+      setManualSysBasisPriceUsed(safeStr(meta?.manual_sys_basis_price_input));
+      setManualFob("");
+      return;
+    }
+    if (meta?.manual_override_field === "fob") {
+      setManualFob(safeStr(meta?.manual_fob_input));
+      setManualSysBasisPriceUsed("");
+      return;
+    }
+    setManualSysBasisPriceUsed("");
+    setManualFob("");
+  }
+
   async function run() {
     setErr("");
     setResp(null);
@@ -525,6 +567,7 @@ function SingleQuery() {
       setManualCategory(nextCategory);
       setManualPriceGroup(nextPriceGroup);
       setManualSeriesKey(nextSeriesKey);
+      syncManualInputsFromResponse(r);
       void loadQueryOptions({ silent: true });
       if (extMode) {
         setExtLoading(true);
@@ -590,6 +633,20 @@ function SingleQuery() {
       return;
     }
 
+    let nextManualBasis = null;
+    let nextManualFob = null;
+    try {
+      nextManualBasis = normalizeManualPriceInput(manualSysBasisPriceUsed);
+      nextManualFob = normalizeManualPriceInput(manualFob);
+    } catch (e) {
+      setErr(String(e.message || e));
+      return;
+    }
+    if (nextManualBasis !== null && nextManualFob !== null) {
+      setErr("Sys Basis Price Used 和 FOB C(EUR) 只能同时修改其中一个");
+      return;
+    }
+
     setErr("");
     setRecalcLoading(true);
     try {
@@ -598,8 +655,11 @@ function SingleQuery() {
         force_category: manualCategory || null,
         force_price_group: manualPriceGroup || null,
         force_series_key: manualSeriesKey || null,
+        manual_sys_basis_price_used: nextManualBasis,
+        manual_fob: nextManualFob,
       });
       setResp(r);
+      syncManualInputsFromResponse(r);
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
@@ -628,6 +688,12 @@ function SingleQuery() {
       payload.force_price_group = safeStr(meta?.forced_price_group) || null;
       payload.force_series_key = safeStr(meta?.forced_series_key) || null;
       payload.force_full_recalc = Boolean(meta?.force_full_recalc);
+      if (meta?.manual_override_field === "sys_basis_price_used" && meta?.manual_sys_basis_price_input != null) {
+        payload.manual_sys_basis_price_used = meta.manual_sys_basis_price_input;
+      }
+      if (meta?.manual_override_field === "fob" && meta?.manual_fob_input != null) {
+        payload.manual_fob = meta.manual_fob_input;
+      }
     }
 
     setErr("");
@@ -806,6 +872,36 @@ function SingleQuery() {
                   price_group(auto): {safeStr(manualPriceGroup || "(auto unresolved)")}
                 </div>
 
+                <div className="row wrap" style={{ marginTop: 10 }}>
+                  <input
+                    className="input mono"
+                    style={{ maxWidth: 240 }}
+                    type="number"
+                    step="0.01"
+                    value={manualSysBasisPriceUsed}
+                    onChange={(e) => setManualSysBasisPriceUsed(e.target.value)}
+                    placeholder={`Sys Basis Price Used（当前 ${safeStr(
+                      formatPricePiecewise(resp?.meta?.sys_basis_price_used ?? resp?.meta?.sys_basis_price)
+                    )}）`}
+                  />
+                  <input
+                    className="input mono"
+                    style={{ maxWidth: 220 }}
+                    type="number"
+                    step="0.01"
+                    value={manualFob}
+                    onChange={(e) => setManualFob(e.target.value)}
+                    placeholder={`FOB C(EUR)（当前 ${safeStr(
+                      formatPricePiecewise(resp?.final_values?.["FOB C(EUR)"])
+                    )}）`}
+                  />
+                </div>
+
+                <div className="small" style={{ marginTop: 6 }}>
+                  价格手动项只允许填写一个。改 `Sys Basis Price Used` 时会按当前产品线公式自动重算 `FOB`；
+                  改 `FOB C(EUR)` 时只重算其余价格层级，不反推 `Sys Basis Price Used`。
+                </div>
+
                 {categoryPriceGroups.length > 1 ? (
                   <div className="row wrap" style={{ marginTop: 8 }}>
                     <span className="small monoInline">高级：切换 price_group</span>
@@ -832,6 +928,132 @@ function SingleQuery() {
           {/* <Hr />
           <div className="sectionTitle">RAW DEBUG</div>
           <KV obj={resp.meta ? { meta: resp.meta, calculated_fields: resp.calculated_fields } : resp} /> */}
+        </>
+      ) : null}
+    </Card>
+  );
+}
+
+function ModelSearchPage() {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [resp, setResp] = useState(null);
+
+  async function runSearch() {
+    const s = query.trim();
+    if (!s) {
+      setErr("请输入内部或外部型号关键字");
+      return;
+    }
+    setErr("");
+    setLoading(true);
+    try {
+      const r = await apiPostJson("/api/models/search", {
+        query: s,
+        limit: 100,
+      });
+      setResp(r);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const items = Array.isArray(resp?.items) ? resp.items : [];
+
+  return (
+    <Card
+      title="MODEL SEARCH"
+      right={<span className="small monoInline">POST /api/models/search</span>}
+    >
+      <div className="row wrap">
+        <input
+          className="input mono"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Internal / External Model (supports exact, prefix, contains)"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void runSearch();
+          }}
+        />
+        <button className="btn primary" onClick={() => void runSearch()} disabled={loading}>
+          {loading ? "SEARCHING..." : "SEARCH"}
+        </button>
+      </div>
+
+      {err ? (
+        <>
+          <Hr />
+          <div className="small err">{err}</div>
+        </>
+      ) : null}
+
+      {resp ? (
+        <>
+          <Hr />
+          <div className="diagBlock">
+            <div className="diagHeader">
+              <div className="diagTitle">MATCH SUMMARY</div>
+              <span className="small monoInline">
+                query={safeStr(resp?.query)} · shown={safeStr(resp?.count)} · total_hits={safeStr(resp?.total_hits)}
+              </span>
+            </div>
+            <div className="small">
+              排序优先级：`exact` → `prefix` → `contains`。价格信息为当前平台自动计算结果。
+            </div>
+          </div>
+
+          <Hr />
+          <div className="tableWrap">
+            <table className="table dense">
+              <thead>
+                <tr>
+                  <th style={{ minWidth: 220 }}>PN</th>
+                  <th style={{ minWidth: 220 }}>Internal Model</th>
+                  <th style={{ minWidth: 220 }}>External Model</th>
+                  <th style={{ minWidth: 110 }}>Match</th>
+                  <th style={{ minWidth: 160 }}>Matched Fields</th>
+                  <th style={{ minWidth: 120 }}>Source</th>
+                  <th style={{ minWidth: 100 }}>FOB</th>
+                  <th style={{ minWidth: 100 }}>DDP</th>
+                  <th style={{ minWidth: 110 }}>Reseller</th>
+                  <th style={{ minWidth: 100 }}>Gold</th>
+                  <th style={{ minWidth: 100 }}>Silver</th>
+                  <th style={{ minWidth: 100 }}>Ivory</th>
+                  <th style={{ minWidth: 100 }}>MSRP</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.length === 0 ? (
+                  <tr>
+                    <td colSpan={13} className="small">
+                      no matched devices
+                    </td>
+                  </tr>
+                ) : (
+                  items.map((item) => (
+                    <tr key={safeStr(item?.pn)}>
+                      <td className="mono">{safeStr(item?.pn)}</td>
+                      <td className="mono">{safeStr(item?.internal_model || item?.internal_model_raw)}</td>
+                      <td className="mono">{safeStr(item?.external_model || item?.external_model_raw)}</td>
+                      <td className="mono">{safeStr(item?.match_type)}</td>
+                      <td className="mono">{safeStr((item?.matched_fields || []).join(", "))}</td>
+                      <td className="mono">{safeStr((item?.sources || []).join(", "))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.fob))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.ddp))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.reseller))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.gold))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.silver))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.ivory))}</td>
+                      <td className="mono">{safeStr(formatPricePiecewise(item?.msrp))}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </>
       ) : null}
     </Card>
@@ -2035,6 +2257,12 @@ export default function App() {
             QUERY
           </button>
           <button
+            className={`tab ${tab === "search" ? "active" : ""}`}
+            onClick={() => setTab("search")}
+          >
+            MODEL SEARCH
+          </button>
+          <button
             className={`tab ${tab === "batch" ? "active" : ""}`}
             onClick={() => setTab("batch")}
           >
@@ -2063,6 +2291,7 @@ export default function App() {
 
       <div className="grid">
         {tab === "query" ? <SingleQuery /> : null}
+        {tab === "search" ? <ModelSearchPage /> : null}
         {tab === "batch" ? <BatchExport /> : null}
         {tab === "rules" ? <AdminConsole /> : null}
         {tab === "keyword" ? <KeywordAdjustConsole /> : null}
