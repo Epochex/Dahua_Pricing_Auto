@@ -142,6 +142,57 @@ def _is_turnstile_text(v) -> bool:
     return any(tok in s for tok in _TURNSTILE_TOKENS)
 
 
+def _is_ptz_project_camera(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> bool:
+    fields = []
+    if france_row is not None:
+        for col in (
+            "Series",
+            "Second Level Product Category",
+            "Description",
+            "External Model",
+            "Internal Model",
+        ):
+            if col in france_row and pd.notna(france_row[col]):
+                fields.append(france_row[col])
+
+    if sys_row is not None:
+        for col in (
+            "First Product Line",
+            "Second Product Line",
+            "Catelog Name",
+            "External Model",
+            "Internal Model",
+        ):
+            if col in sys_row and pd.notna(sys_row[col]):
+                fields.append(sys_row[col])
+
+    big = safe_upper(" ".join(str(x) for x in fields))
+    if "PTZ CAMERAS FOR OVERSEAS PROJECT" not in big and "POSITIONING SYSTEMS" not in big:
+        return False
+
+    return bool(re.search(r"\b(?:DHI|DH)\s*-\s*PTZ", big) or re.search(r"\bPTZ[0-9]", big))
+
+
+def _is_security_inspection_text(v) -> bool:
+    s = safe_upper(v)
+    if not s:
+        return False
+    return any(
+        tok in s
+        for tok in (
+            "DAHUA ISCAN",
+            "SECURITY INSPECTION EQUIPMENT",
+            "BAGGAGE INSPECTION",
+            "LUGGAGE AND PARCEL",
+            "PEOPLE SCREENING",
+            "ANTI-TERRORIST AND EXPLOSION-PROOF",
+        )
+    )
+
+
 def _forced_category_override(
     france_row: Optional[pd.Series],
     sys_row: Optional[pd.Series],
@@ -189,6 +240,12 @@ def _forced_category_override(
 
     if any(_is_turnstile_text(v) for v in fields):
         return ("ACCESS CONTROL", "ACCESS CONTROL")
+
+    if _is_ptz_project_camera(france_row, sys_row):
+        return ("PTZ", "PTZ")
+
+    if any(_is_security_inspection_text(v) for v in fields):
+        return ("安检机", "安检机")
 
     return None
 
