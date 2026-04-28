@@ -296,8 +296,8 @@ function QueryDiagnosticBlock({ resp }) {
         <div className="diagItem diagSpan2">
           <div className="diagLabel">display rule</div>
           <div className="diagValue">
-            <span className="bigPill monoInline">&lt;30 → 2 decimals</span>
-            <span className="bigPill monoInline">≥30 → integer</span>
+            <span className="bigPill monoInline">&lt;10 → 2 decimals</span>
+            <span className="bigPill monoInline">≥10 → integer</span>
           </div>
         </div>
       </div>
@@ -669,6 +669,11 @@ function SingleQuery() {
 
   async function exportOne() {
     if (!resp) return;
+    if (extMode) {
+      await exportExternalModelAll();
+      return;
+    }
+
     const s = (pn || safeStr(resp?.pn)).trim();
     if (!s) return;
 
@@ -752,8 +757,8 @@ function SingleQuery() {
         <button className="btn primary" onClick={run} disabled={loading}>
           {loading ? "RUNNING..." : "RUN"}
         </button>
-        <button className="btn" onClick={exportOne} disabled={!resp || exporting || loading}>
-          {exporting ? "EXPORTING..." : "EXPORT"}
+        <button className="btn" onClick={exportOne} disabled={!resp || exporting || extExporting || loading}>
+          {exporting || extExporting ? "EXPORTING..." : extMode ? "EXPORT EXT ALL" : "EXPORT"}
         </button>
         <label className="small" style={{ marginLeft: 8, display: "flex", alignItems: "center", gap: 6 }}>
           <input

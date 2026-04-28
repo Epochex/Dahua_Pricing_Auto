@@ -52,15 +52,29 @@ def normalize_pn_base(pn: str) -> str:
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
     """
-    按后缀选择引擎：
-    - .xlsx / .xlsm -> openpyxl
-    - .xls          -> xlrd
+    按真实文件格式优先选择引擎，后缀仅作为兜底：
+    - xlsx/xlsm (zip/OOXML) -> openpyxl
+    - xls (OLE/BIFF8)       -> xlrd
     说明：
     - openpyxl 不支持 .xls（BIFF8 老格式）
     - xlrd 2.x 不支持 .xlsx
+    - 数据更新链路里可能出现 xlsx 内容但命名为 .xls 的文件，需要按文件头兼容
     """
     path = Path(path)
     suffix = path.suffix.lower()
+    try:
+        with path.open("rb") as f:
+            head = f.read(8)
+    except OSError:
+        head = b""
+
+    # OOXML files are zip archives and start with PK, even when the suffix is wrong.
+    if head.startswith(b"PK"):
+        return pd.read_excel(path, engine="openpyxl")
+
+    # Legacy .xls files use the OLE Compound File Binary Format.
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return pd.read_excel(path, engine="xlrd")
 
     if suffix == ".xls":
         # 需要 xlrd（仅 .xls）

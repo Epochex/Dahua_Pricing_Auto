@@ -269,8 +269,8 @@ def build_export_df(
     level: "1" -> Country; "2" -> Country&Customer
 
     导出时对“Calculated 的价格列”应用与控制台一致的取整规则：
-      - < 30 → 四舍五入到 1 位小数
-      - ≥ 30 → 四舍五入到整数
+      - < 10 → 保留 2 位小数
+      - ≥ 10 → 四舍五入到整数
     Original 列保持原始数值。
     """
     import pandas as pd  # 这里本身很轻量，只是构造 DataFrame

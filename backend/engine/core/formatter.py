@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+PRICE_DECIMAL_THRESHOLD = 10
+
 
 def _to_float(v) -> Optional[float]:
     if v is None:
@@ -27,13 +29,13 @@ def _to_float(v) -> Optional[float]:
 def _format_price_piecewise(v) -> Optional[float | int]:
     """
     本地规则：
-      - < 30  : 保留 2 位小数
-      - >= 30 : 四舍五入取整
+      - < 10  : 保留 2 位小数
+      - >= 10 : 四舍五入取整
     """
     f = _to_float(v)
     if f is None:
         return None
-    if f < 30:
+    if f < PRICE_DECIMAL_THRESHOLD:
         return round(f, 2)
     return int(round(f))
 
@@ -98,8 +100,8 @@ def write_export_xlsx(frames: Dict[str, pd.DataFrame], out_dir: Path, level: str
       - Country_import_upload_Model.xlsx
 
     导出时应用本地“分段取整”规则：
-      - <30 保留2位小数
-      - >=30 取整
+      - <10 保留2位小数
+      - >=10 取整
     """
     level_norm = (level or "").strip().lower()
     if level_norm not in ("country", "country_customer"):

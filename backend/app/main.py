@@ -313,7 +313,14 @@ class KeywordUpliftPreviewReq(BaseModel):
 def _norm_optional_text(v: Any) -> Optional[str]:
     if v is None:
         return None
+    try:
+        if math.isnan(v):
+            return None
+    except (TypeError, ValueError):
+        pass
     s = str(v).strip()
+    if s.lower() in {"nan", "none", "nat", "<na>"}:
+        return None
     return s or None
 
 

@@ -273,6 +273,8 @@ def _to_float(v) -> Optional[float]:
 def compute_ddp_a_from_fob(fob: Optional[float], category: str) -> Optional[float]:
     if fob is None or fob <= 0:
         return None
+    if _is_software_category(category):
+        return fob
     rule = DDP_RULES.get(category)
     if not rule:
         return None
@@ -424,6 +426,21 @@ _STRICT_PRICE_GROUP_POLICY: Dict[str, Dict[str, Any]] = {
 
 def _norm_upper_text(v: Optional[str]) -> str:
     return str(v or "").strip().upper()
+
+
+def _is_software_category(category: Optional[str]) -> bool:
+    return _norm_upper_text(category) in {"软件", "SOFTWARE"}
+
+
+def _sync_software_ddp_to_fob(final_values: Dict[str, Any], calculated_fields: Set[str]) -> Optional[float]:
+    fob = _to_float(final_values.get("FOB C(EUR)"))
+    if fob is None or fob <= 0:
+        return None
+    current_ddp = _to_float(final_values.get("DDP A(EUR)"))
+    final_values["DDP A(EUR)"] = fob
+    if current_ddp != fob:
+        calculated_fields.add("DDP A(EUR)")
+    return fob
 
 
 def strict_price_group_default(category: Optional[str]) -> Optional[str]:
@@ -771,6 +788,8 @@ def compute_prices_for_part(
         and manual_sys_basis_price_used is None
         and manual_fob is None
     ):
+        if _is_software_category(category):
+            _sync_software_ddp_to_fob(final_values, calculated_fields)
         return {
             "final_values": final_values,
             "calculated_fields": calculated_fields,
@@ -851,7 +870,9 @@ def compute_prices_for_part(
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
-    if force_recalc_all:
+    if _is_software_category(category):
+        ddp_a = _sync_software_ddp_to_fob(final_values, calculated_fields)
+    elif force_recalc_all:
         ddp_a = compute_ddp_a_from_fob(fob, category)
         if ddp_a is not None:
             final_values["DDP A(EUR)"] = ddp_a
