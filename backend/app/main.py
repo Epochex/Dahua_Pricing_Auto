@@ -277,6 +277,14 @@ class QueryRecomputeReq(BaseModel):
         description="manual override for Sys Basis Price Used",
     )
     manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
+    manual_price_field: Optional[str] = Field(
+        default=None,
+        description="manual price tier to use as the reverse-calculation anchor",
+    )
+    manual_price_value: Optional[float] = Field(
+        default=None,
+        description="manual price value for manual_price_field",
+    )
     apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
 
 
@@ -291,6 +299,14 @@ class QueryExportReq(BaseModel):
         description="manual override for Sys Basis Price Used",
     )
     manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
+    manual_price_field: Optional[str] = Field(
+        default=None,
+        description="manual price tier to use as the reverse-calculation anchor",
+    )
+    manual_price_value: Optional[float] = Field(
+        default=None,
+        description="manual price value for manual_price_field",
+    )
     apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
 
 
@@ -382,14 +398,55 @@ def _normalize_manual_price_override(v: Any, field: str) -> Optional[float]:
     return n
 
 
+def _normalize_manual_price_field(v: Any) -> Optional[str]:
+    s = _norm_optional_text(v)
+    if not s:
+        return None
+    aliases = {
+        "sys_basis_price_used": pricing_engine_mod.MANUAL_SYS_BASIS_PRICE_FIELD,
+        "sys basis price used": pricing_engine_mod.MANUAL_SYS_BASIS_PRICE_FIELD,
+        "fob": "FOB C(EUR)",
+        "fob c": "FOB C(EUR)",
+        "ddp": "DDP A(EUR)",
+        "ddp a": "DDP A(EUR)",
+        "reseller": "Suggested Reseller(EUR)",
+        "suggested reseller": "Suggested Reseller(EUR)",
+        "gold": "Gold(EUR)",
+        "silver": "Silver(EUR)",
+        "ivory": "Ivory(EUR)",
+        "msrp": "MSRP(EUR)",
+    }
+    field = aliases.get(s.strip().lower(), s)
+    if field not in pricing_engine_mod.MANUAL_PRICE_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"manual_price_field not supported: {s!r}",
+        )
+    return field
+
+
 def _validate_manual_recompute_inputs(
     manual_sys_basis_price_used: Optional[float],
     manual_fob: Optional[float],
+    manual_price_field: Optional[str],
+    manual_price_value: Optional[float],
 ) -> None:
-    if manual_sys_basis_price_used is not None and manual_fob is not None:
+    has_manual_price_field = bool(manual_price_field) or manual_price_value is not None
+    if bool(manual_price_field) != (manual_price_value is not None):
         raise HTTPException(
             status_code=400,
-            detail="manual_sys_basis_price_used and manual_fob cannot be provided together",
+            detail="manual_price_field and manual_price_value must be provided together",
+        )
+
+    manual_modes = [
+        manual_sys_basis_price_used is not None,
+        manual_fob is not None,
+        has_manual_price_field,
+    ]
+    if sum(1 for x in manual_modes if x) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="manual price override fields cannot be provided together",
         )
 
 
@@ -1009,18 +1066,30 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
         "manual_sys_basis_price_used",
     )
     manual_fob = _normalize_manual_price_override(req.manual_fob, "manual_fob")
-    _validate_manual_recompute_inputs(manual_sys_basis_price_used, manual_fob)
-
-    return _engine.query_one(
-        pn,
-        force_category=force_category,
-        force_price_group=force_price_group,
-        force_series_key=force_series_key,
-        force_full_recalc=True,
-        manual_sys_basis_price_used=manual_sys_basis_price_used,
-        manual_fob=manual_fob,
-        apply_black_markup=bool(req.apply_black_markup),
+    manual_price_field = _normalize_manual_price_field(req.manual_price_field)
+    manual_price_value = _normalize_manual_price_override(req.manual_price_value, "manual_price_value")
+    _validate_manual_recompute_inputs(
+        manual_sys_basis_price_used,
+        manual_fob,
+        manual_price_field,
+        manual_price_value,
     )
+
+    try:
+        return _engine.query_one(
+            pn,
+            force_category=force_category,
+            force_price_group=force_price_group,
+            force_series_key=force_series_key,
+            force_full_recalc=True,
+            manual_sys_basis_price_used=manual_sys_basis_price_used,
+            manual_fob=manual_fob,
+            manual_price_field=manual_price_field,
+            manual_price_value=manual_price_value,
+            apply_black_markup=bool(req.apply_black_markup),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.post("/api/query/export")
@@ -1044,18 +1113,30 @@ def query_export(req: QueryExportReq) -> FileResponse:
         "manual_sys_basis_price_used",
     )
     manual_fob = _normalize_manual_price_override(req.manual_fob, "manual_fob")
-    _validate_manual_recompute_inputs(manual_sys_basis_price_used, manual_fob)
-
-    result = _engine.query_one(
-        pn,
-        force_category=force_category,
-        force_price_group=force_price_group,
-        force_series_key=force_series_key,
-        force_full_recalc=bool(req.force_full_recalc),
-        manual_sys_basis_price_used=manual_sys_basis_price_used,
-        manual_fob=manual_fob,
-        apply_black_markup=bool(req.apply_black_markup),
+    manual_price_field = _normalize_manual_price_field(req.manual_price_field)
+    manual_price_value = _normalize_manual_price_override(req.manual_price_value, "manual_price_value")
+    _validate_manual_recompute_inputs(
+        manual_sys_basis_price_used,
+        manual_fob,
+        manual_price_field,
+        manual_price_value,
     )
+
+    try:
+        result = _engine.query_one(
+            pn,
+            force_category=force_category,
+            force_price_group=force_price_group,
+            force_series_key=force_series_key,
+            force_full_recalc=bool(req.force_full_recalc),
+            manual_sys_basis_price_used=manual_sys_basis_price_used,
+            manual_fob=manual_fob,
+            manual_price_field=manual_price_field,
+            manual_price_value=manual_price_value,
+            apply_black_markup=bool(req.apply_black_markup),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if str(result.get("status", "")).lower() != "ok":
         raise HTTPException(status_code=404, detail=f"pn not found: {pn}")
 

@@ -22,6 +22,9 @@ PRICE_COLS = [
     "MSRP(EUR)",
 ]
 
+MANUAL_SYS_BASIS_PRICE_FIELD = "Sys Basis Price Used"
+MANUAL_PRICE_FIELDS = [MANUAL_SYS_BASIS_PRICE_FIELD, *PRICE_COLS]
+
 BLACK_VARIANT_MARKUP_EUR = 2.0
 
 # =========================
@@ -286,6 +289,27 @@ def compute_ddp_a_from_fob(fob: Optional[float], category: str) -> Optional[floa
     return ddp
 
 
+def _ddp_multiplier_for_category(category: str) -> Optional[float]:
+    if _is_software_category(category):
+        return 1.0
+    rule = DDP_RULES.get(category)
+    if not rule:
+        return None
+    multiplier = 1.0
+    for pct in rule:
+        multiplier *= (1 + pct)
+    return multiplier
+
+
+def _compute_fob_from_ddp_a(ddp_a: Optional[float], category: str) -> Optional[float]:
+    if ddp_a is None or ddp_a <= 0:
+        return None
+    multiplier = _ddp_multiplier_for_category(category)
+    if multiplier is None or multiplier <= 0:
+        return None
+    return ddp_a / multiplier
+
+
 def pick_price_rule_with_key(price_group: str, series_key: str) -> Tuple[Optional[Dict], Optional[str]]:
     """
     根据 price_group (大类) + series_key 在 PRICE_RULES 中选择一条规则，并返回“命中的 key”。
@@ -362,6 +386,91 @@ def compute_channel_prices(ddp_a: float, rule: Dict) -> Dict[str, Optional[float
         "Ivory(EUR)": ivory,
         "MSRP(EUR)": msrp,
     }
+
+
+def _rule_pct(rule: Dict, key: str, field: str) -> Optional[float]:
+    pct = _to_float((rule or {}).get(key))
+    if pct is None:
+        return None
+    if pct >= 1:
+        raise ValueError(f"cannot reverse {field}: invalid PRICE_RULES pct {key}={pct}")
+    return pct
+
+
+def _ddp_from_manual_channel_price(field: str, price: float, rule: Dict) -> Optional[float]:
+    if field == "DDP A(EUR)":
+        return price
+    if field == "Suggested Reseller(EUR)":
+        pct = _rule_pct(rule, "reseller", field)
+        return price if pct is None else price * (1 - pct)
+    if field == "Gold(EUR)":
+        pct = _rule_pct(rule, "gold", field)
+        if pct is None:
+            raise ValueError(f"cannot reverse {field}: PRICE_RULES gold pct is missing")
+        return price * (1 - pct)
+    if field == "Silver(EUR)":
+        pct = _rule_pct(rule, "silver", field)
+        if pct is None:
+            raise ValueError(f"cannot reverse {field}: PRICE_RULES silver pct is missing")
+        return price * (1 - pct)
+    if field == "Ivory(EUR)":
+        pct = _rule_pct(rule, "ivory", field)
+        if pct is None:
+            raise ValueError(f"cannot reverse {field}: PRICE_RULES ivory pct is missing")
+        return price * (1 - pct)
+    if field == "MSRP(EUR)":
+        ivory_pct = _rule_pct(rule, "ivory", field)
+        msrp_pct = _rule_pct(rule, "msrp_on_installer", field)
+        if ivory_pct is None or msrp_pct is None:
+            raise ValueError(f"cannot reverse {field}: PRICE_RULES ivory/msrp pct is missing")
+        return price * (1 - msrp_pct) * (1 - ivory_pct)
+    raise ValueError(f"unsupported manual price field: {field!r}")
+
+
+def compute_fob_from_manual_price_field(
+    manual_price_field: str,
+    manual_price_value: float,
+    *,
+    category: str,
+    price_rule_dict: Optional[Dict],
+    price_group: str,
+    effective_price_group: str,
+    price_rule_key: Optional[str],
+    series_display: str,
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> Tuple[float, Optional[str], float, List[str], bool]:
+    field = str(manual_price_field or "").strip()
+    value = _to_float(manual_price_value)
+    if field not in MANUAL_PRICE_FIELDS:
+        raise ValueError(f"manual_price_field is not supported: {field!r}")
+    if value is None or value <= 0:
+        raise ValueError("manual_price_value must be > 0")
+
+    if field == MANUAL_SYS_BASIS_PRICE_FIELD:
+        fob, uplift_key, kw_pct, kw_hits = _compute_fob_from_basis_price(
+            value,
+            category=category,
+            price_group=price_group,
+            effective_price_group=effective_price_group,
+            price_rule_key=price_rule_key,
+            series_display=series_display,
+            france_row=france_row,
+            sys_row=sys_row,
+        )
+        return fob, uplift_key, kw_pct, kw_hits, True
+
+    if field == "FOB C(EUR)":
+        return value, None, 0.0, [], False
+
+    if price_rule_dict is None:
+        raise ValueError(f"cannot reverse {field}: PRICE_RULES rule is missing")
+
+    ddp_a = _ddp_from_manual_channel_price(field, value, price_rule_dict)
+    fob = _compute_fob_from_ddp_a(ddp_a, category)
+    if fob is None or fob <= 0:
+        raise ValueError(f"cannot reverse {field}: DDP rule is missing for category {category!r}")
+    return fob, None, 0.0, [], False
 
 
 def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
@@ -1279,6 +1388,8 @@ def compute_prices_for_part(
     force_full_recalc: bool = False,
     manual_sys_basis_price_used: Optional[float] = None,
     manual_fob: Optional[float] = None,
+    manual_price_field: Optional[str] = None,
+    manual_price_value: Optional[float] = None,
 ) -> Dict:
     """
     输出 result dict：
@@ -1290,10 +1401,15 @@ def compute_prices_for_part(
       - sys_uplift_key: 本次 Sys FOB uplift 命中的 key（若未命中则 None）
       - sys_keyword_uplift_pct / sys_keyword_uplift_hits: 关键词叠加涨价命中信息
     """
-    if manual_sys_basis_price_used is not None and manual_fob is not None:
-        raise ValueError("manual_sys_basis_price_used and manual_fob are mutually exclusive")
+    has_manual_price_field = bool(manual_price_field) or manual_price_value is not None
+    legacy_manual_count = int(manual_sys_basis_price_used is not None) + int(manual_fob is not None)
+    if legacy_manual_count > 1 or (has_manual_price_field and legacy_manual_count > 0):
+        raise ValueError("manual price override fields are mutually exclusive")
     force_recalc_all = bool(
-        force_full_recalc or manual_sys_basis_price_used is not None or manual_fob is not None
+        force_full_recalc
+        or manual_sys_basis_price_used is not None
+        or manual_fob is not None
+        or manual_price_value is not None
     )
 
     # 1) 产品线 & 价格组
@@ -1372,6 +1488,7 @@ def compute_prices_for_part(
         and not force_recalc_all
         and manual_sys_basis_price_used is None
         and manual_fob is None
+        and manual_price_value is None
     ):
         if _is_software_category(category):
             _sync_software_ddp_to_fob(final_values, calculated_fields)
@@ -1404,8 +1521,34 @@ def compute_prices_for_part(
     used_sys_keyword_uplift_pct: float = 0.0
     used_sys_keyword_uplift_hits: List[str] = []
     manual_override_field: Optional[str] = None
+    manual_price_field_used: Optional[str] = None
+    manual_price_input: Optional[float] = None
 
-    if manual_sys_basis_price_used is not None and manual_sys_basis_price_used > 0:
+    if manual_price_field and manual_price_value is not None:
+        fob, used_sys_uplift_key, used_sys_keyword_uplift_pct, used_sys_keyword_uplift_hits, used_basis = (
+            compute_fob_from_manual_price_field(
+                manual_price_field,
+                manual_price_value,
+                category=category,
+                price_rule_dict=price_rule_dict,
+                price_group=price_group,
+                effective_price_group=effective_price_group,
+                price_rule_key=price_rule_key,
+                series_display=series_display,
+                france_row=france_row,
+                sys_row=sys_row,
+            )
+        )
+        final_values["FOB C(EUR)"] = fob
+        calculated_fields.add("FOB C(EUR)")
+        manual_price_field_used = str(manual_price_field).strip()
+        manual_price_input = manual_price_value
+        manual_override_field = manual_price_field_used
+        if used_basis:
+            used_sys = True
+            used_sys_basis_field = sys_basis_field or "Manual Input"
+            used_sys_basis_price = manual_price_value
+    elif manual_sys_basis_price_used is not None and manual_sys_basis_price_used > 0:
         fob, used_sys_uplift_key, used_sys_keyword_uplift_pct, used_sys_keyword_uplift_hits = (
             _compute_fob_from_basis_price(
                 manual_sys_basis_price_used,
@@ -1424,11 +1567,15 @@ def compute_prices_for_part(
         used_sys_basis_field = sys_basis_field or "Manual Input"
         used_sys_basis_price = manual_sys_basis_price_used
         manual_override_field = "sys_basis_price_used"
+        manual_price_field_used = MANUAL_SYS_BASIS_PRICE_FIELD
+        manual_price_input = manual_sys_basis_price_used
     elif manual_fob is not None and manual_fob > 0:
         fob = manual_fob
         final_values["FOB C(EUR)"] = fob
         calculated_fields.add("FOB C(EUR)")
         manual_override_field = "fob"
+        manual_price_field_used = "FOB C(EUR)"
+        manual_price_input = manual_fob
     # 只在 France 缺失 FOB 时，才允许从 Sys 计算 FOB（不改你原逻辑）
     elif (fob is None or fob <= 0) and sys_row is not None:
         base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(sys_row)
@@ -1508,6 +1655,8 @@ def compute_prices_for_part(
         "manual_override_field": manual_override_field,
         "manual_sys_basis_price_input": manual_sys_basis_price_used,
         "manual_fob_input": manual_fob,
+        "manual_price_field": manual_price_field_used,
+        "manual_price_input": manual_price_input,
     }
 
 
@@ -1634,6 +1783,8 @@ def compute_one(
     force_full_recalc: bool = False,
     manual_sys_basis_price_used: Optional[float] = None,
     manual_fob: Optional[float] = None,
+    manual_price_field: Optional[str] = None,
+    manual_price_value: Optional[float] = None,
     apply_black_markup: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1676,7 +1827,11 @@ def compute_one(
     force_price_group_norm = str(force_price_group).strip() if force_price_group else None
     force_series_key_norm = str(force_series_key).strip() if force_series_key else None
     allow_manual_without_source = bool(
-        (manual_sys_basis_price_used is not None or manual_fob is not None)
+        (
+            manual_sys_basis_price_used is not None
+            or manual_fob is not None
+            or manual_price_value is not None
+        )
         and (force_category_norm or force_price_group_norm)
     )
 
@@ -1703,6 +1858,8 @@ def compute_one(
         force_full_recalc=bool(force_full_recalc),
         manual_sys_basis_price_used=manual_sys_basis_price_used,
         manual_fob=manual_fob,
+        manual_price_field=manual_price_field,
+        manual_price_value=manual_price_value,
     )
     result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
 
@@ -1740,6 +1897,7 @@ def compute_one(
                 or force_price_group_norm
                 or manual_sys_basis_price_used is not None
                 or manual_fob is not None
+                or manual_price_value is not None
             ),
             "forced_category": force_category_norm,
             "forced_price_group": force_price_group_norm,
@@ -1748,10 +1906,13 @@ def compute_one(
                 force_full_recalc
                 or manual_sys_basis_price_used is not None
                 or manual_fob is not None
+                or manual_price_value is not None
             ),
             "manual_override_field": result.get("manual_override_field"),
             "manual_sys_basis_price_input": result.get("manual_sys_basis_price_input"),
             "manual_fob_input": result.get("manual_fob_input"),
+            "manual_price_field": result.get("manual_price_field"),
+            "manual_price_input": result.get("manual_price_input"),
         },
         "warnings": warnings,
     }

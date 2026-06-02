@@ -64,6 +64,9 @@ const PRICE_KEYS = [
   "MSRP(EUR)",
 ];
 
+const MANUAL_SYS_BASIS_PRICE_FIELD = "Sys Basis Price Used";
+const MANUAL_PRICE_FIELDS = [MANUAL_SYS_BASIS_PRICE_FIELD, ...PRICE_KEYS];
+
 function getPriceSourceLabel(field, resp) {
   const meta = resp?.meta || {};
   const blackVariant = meta?.black_variant || {};
@@ -76,6 +79,8 @@ function getPriceSourceLabel(field, resp) {
 
   if (atcVariant?.applied && PRICE_KEYS.includes(field)) return "ATC+Sys";
   if (blackVariant?.applied && PRICE_KEYS.includes(field)) return "Black+2";
+  if (safeStr(meta?.manual_price_field) === field) return "Manual";
+  if (meta?.manual_override_field === "fob" && field === "FOB C(EUR)") return "Manual";
 
   if (calculated.has(field)) {
     if (meta.used_sys) return "Calculated(Sys)";
@@ -106,6 +111,46 @@ function normalizeManualPriceInput(v) {
     throw new Error("手动输入价格必须是大于 0 的数字");
   }
   return n;
+}
+
+function getManualPriceMeta(meta) {
+  const field =
+    safeStr(meta?.manual_price_field) ||
+    (meta?.manual_override_field === "sys_basis_price_used"
+      ? MANUAL_SYS_BASIS_PRICE_FIELD
+      : meta?.manual_override_field === "fob"
+      ? "FOB C(EUR)"
+      : "");
+  const value =
+    meta?.manual_price_input ??
+    (field === MANUAL_SYS_BASIS_PRICE_FIELD
+      ? meta?.manual_sys_basis_price_input
+      : field === "FOB C(EUR)"
+      ? meta?.manual_fob_input
+      : null);
+  return { field, value };
+}
+
+function currentValueForManualPriceField(field, resp) {
+  if (field === MANUAL_SYS_BASIS_PRICE_FIELD) {
+    return resp?.meta?.sys_basis_price_used ?? resp?.meta?.sys_basis_price;
+  }
+  return resp?.final_values?.[field];
+}
+
+function attachManualPriceOverride(payload, meta) {
+  const { field, value } = getManualPriceMeta(meta || {});
+  if (field && value !== null && value !== undefined) {
+    payload.manual_price_field = field;
+    payload.manual_price_value = value;
+    return;
+  }
+  if (meta?.manual_override_field === "sys_basis_price_used" && meta?.manual_sys_basis_price_input != null) {
+    payload.manual_sys_basis_price_used = meta.manual_sys_basis_price_input;
+  }
+  if (meta?.manual_override_field === "fob" && meta?.manual_fob_input != null) {
+    payload.manual_fob = meta.manual_fob_input;
+  }
 }
 
 function formatMatchMode(mode, matchedPn) {
@@ -264,6 +309,7 @@ function QueryDiagnosticBlock({ resp }) {
   const meta = resp?.meta || {};
   const statusOk = String(resp?.status || "").toLowerCase() === "ok";
   const manualOverride = Boolean(meta?.manual_override);
+  const manualPrice = getManualPriceMeta(meta);
   const frMatchText = formatMatchMode(meta.fr_match_mode, meta.fr_matched_pn);
   const sysMatchText = formatMatchMode(meta.sys_match_mode, meta.sys_matched_pn);
 
@@ -335,16 +381,9 @@ function QueryDiagnosticBlock({ resp }) {
                   meta?.forced_price_group
                 )} · series_key={safeStr(meta?.forced_series_key)}
               </span>
-              {meta?.manual_override_field === "sys_basis_price_used" ? (
+              {manualPrice.field ? (
                 <span className="bigPill monoInline">
-                  manual Sys Basis Price Used={safeStr(
-                    formatPricePiecewise(meta?.manual_sys_basis_price_input)
-                  )}
-                </span>
-              ) : null}
-              {meta?.manual_override_field === "fob" ? (
-                <span className="bigPill monoInline">
-                  manual FOB C(EUR)={safeStr(formatPricePiecewise(meta?.manual_fob_input))}
+                  manual {manualPrice.field}={safeStr(formatPricePiecewise(manualPrice.value))}
                 </span>
               ) : null}
             </>
@@ -607,8 +646,8 @@ function SingleQuery() {
   const [manualCategory, setManualCategory] = useState("");
   const [manualPriceGroup, setManualPriceGroup] = useState("");
   const [manualSeriesKey, setManualSeriesKey] = useState("_default_");
-  const [manualSysBasisPriceUsed, setManualSysBasisPriceUsed] = useState("");
-  const [manualFob, setManualFob] = useState("");
+  const [manualPriceField, setManualPriceField] = useState(MANUAL_SYS_BASIS_PRICE_FIELD);
+  const [manualPriceValue, setManualPriceValue] = useState("");
 
   async function loadQueryOptions({ silent = false } = {}) {
     if (!silent) setOptionsErr("");
@@ -690,20 +729,17 @@ function SingleQuery() {
     }
   }, [seriesKeyOptions, manualSeriesKey]);
 
+  const manualPriceCurrent = currentValueForManualPriceField(manualPriceField, resp);
+
   function syncManualInputsFromResponse(r) {
     const meta = r?.meta || {};
-    if (meta?.manual_override_field === "sys_basis_price_used") {
-      setManualSysBasisPriceUsed(safeStr(meta?.manual_sys_basis_price_input));
-      setManualFob("");
+    const { field, value } = getManualPriceMeta(meta);
+    if (field) {
+      setManualPriceField(field);
+      setManualPriceValue(safeStr(value));
       return;
     }
-    if (meta?.manual_override_field === "fob") {
-      setManualFob(safeStr(meta?.manual_fob_input));
-      setManualSysBasisPriceUsed("");
-      return;
-    }
-    setManualSysBasisPriceUsed("");
-    setManualFob("");
+    setManualPriceValue("");
   }
 
   async function run() {
@@ -790,17 +826,15 @@ function SingleQuery() {
       return;
     }
 
-    let nextManualBasis = null;
-    let nextManualFob = null;
+    let nextManualPrice = null;
     try {
-      nextManualBasis = normalizeManualPriceInput(manualSysBasisPriceUsed);
-      nextManualFob = normalizeManualPriceInput(manualFob);
+      nextManualPrice = normalizeManualPriceInput(manualPriceValue);
     } catch (e) {
       setErr(String(e.message || e));
       return;
     }
-    if (nextManualBasis !== null && nextManualFob !== null) {
-      setErr("Sys Basis Price Used 和 FOB C(EUR) 只能同时修改其中一个");
+    if (nextManualPrice !== null && !manualPriceField) {
+      setErr("请选择要作为基准的价格层级");
       return;
     }
 
@@ -812,8 +846,8 @@ function SingleQuery() {
         force_category: manualCategory || null,
         force_price_group: manualPriceGroup || null,
         force_series_key: manualSeriesKey || null,
-        manual_sys_basis_price_used: nextManualBasis,
-        manual_fob: nextManualFob,
+        manual_price_field: nextManualPrice === null ? null : manualPriceField,
+        manual_price_value: nextManualPrice,
         apply_black_markup: Boolean(resp?.meta?.black_variant?.applied || resp?.meta?.atc_variant?.applied),
       });
       setResp(r);
@@ -843,12 +877,7 @@ function SingleQuery() {
         payload.force_category = safeStr(meta?.forced_category || meta?.category) || null;
         payload.force_price_group = safeStr(meta?.forced_price_group || meta?.price_group) || null;
         payload.force_series_key = safeStr(meta?.forced_series_key || meta?.series_key) || null;
-        if (meta?.manual_override_field === "sys_basis_price_used" && meta?.manual_sys_basis_price_input != null) {
-          payload.manual_sys_basis_price_used = meta.manual_sys_basis_price_input;
-        }
-        if (meta?.manual_override_field === "fob" && meta?.manual_fob_input != null) {
-          payload.manual_fob = meta.manual_fob_input;
-        }
+        attachManualPriceOverride(payload, meta);
         const r = await apiPostJson("/api/query/recompute", payload);
         setResp(r);
         syncManualInputsFromResponse(r);
@@ -891,12 +920,7 @@ function SingleQuery() {
       payload.force_price_group = safeStr(meta?.forced_price_group) || null;
       payload.force_series_key = safeStr(meta?.forced_series_key) || null;
       payload.force_full_recalc = Boolean(meta?.force_full_recalc);
-      if (meta?.manual_override_field === "sys_basis_price_used" && meta?.manual_sys_basis_price_input != null) {
-        payload.manual_sys_basis_price_used = meta.manual_sys_basis_price_input;
-      }
-      if (meta?.manual_override_field === "fob" && meta?.manual_fob_input != null) {
-        payload.manual_fob = meta.manual_fob_input;
-      }
+      attachManualPriceOverride(payload, meta);
     }
 
     setErr("");
@@ -1079,33 +1103,32 @@ function SingleQuery() {
                 </div>
 
                 <div className="row wrap" style={{ marginTop: 10 }}>
+                  <select
+                    className="input mono"
+                    style={{ maxWidth: 260 }}
+                    value={manualPriceField}
+                    onChange={(e) => setManualPriceField(e.target.value)}
+                  >
+                    {MANUAL_PRICE_FIELDS.map((f) => (
+                      <option key={f} value={f}>
+                        {f}
+                      </option>
+                    ))}
+                  </select>
                   <input
                     className="input mono"
                     style={{ maxWidth: 240 }}
                     type="number"
                     step="0.01"
-                    value={manualSysBasisPriceUsed}
-                    onChange={(e) => setManualSysBasisPriceUsed(e.target.value)}
-                    placeholder={`Sys Basis Price Used（当前 ${safeStr(
-                      formatPricePiecewise(resp?.meta?.sys_basis_price_used ?? resp?.meta?.sys_basis_price)
-                    )}）`}
-                  />
-                  <input
-                    className="input mono"
-                    style={{ maxWidth: 220 }}
-                    type="number"
-                    step="0.01"
-                    value={manualFob}
-                    onChange={(e) => setManualFob(e.target.value)}
-                    placeholder={`FOB C(EUR)（当前 ${safeStr(
-                      formatPricePiecewise(resp?.final_values?.["FOB C(EUR)"])
-                    )}）`}
+                    value={manualPriceValue}
+                    onChange={(e) => setManualPriceValue(e.target.value)}
+                    placeholder={`当前 ${safeStr(formatPricePiecewise(manualPriceCurrent))}`}
                   />
                 </div>
 
                 <div className="small" style={{ marginTop: 6 }}>
-                  价格手动项只允许填写一个。改 `Sys Basis Price Used` 时会按当前产品线公式自动重算 `FOB`；
-                  改 `FOB C(EUR)` 时只重算其余价格层级，不反推 `Sys Basis Price Used`。
+                  选择一个价格层级并输入基准价；系统会按当前产品线公式反推 `FOB`，再全量重算所有导出价格。
+                  `Sys Basis Price Used` 会沿用 Sys 底价到 FOB 的 uplift 逻辑。
                 </div>
 
                 {categoryPriceGroups.length > 1 ? (

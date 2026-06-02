@@ -110,6 +110,8 @@ class PricingEngine:
         force_full_recalc: bool = False,
         manual_sys_basis_price_used: Optional[float] = None,
         manual_fob: Optional[float] = None,
+        manual_price_field: Optional[str] = None,
+        manual_price_value: Optional[float] = None,
         apply_black_markup: bool = False,
     ) -> Dict[str, Any]:
         if self.data is None:
@@ -123,6 +125,8 @@ class PricingEngine:
             force_full_recalc=force_full_recalc,
             manual_sys_basis_price_used=manual_sys_basis_price_used,
             manual_fob=manual_fob,
+            manual_price_field=manual_price_field,
+            manual_price_value=manual_price_value,
             apply_black_markup=apply_black_markup,
         )
 
