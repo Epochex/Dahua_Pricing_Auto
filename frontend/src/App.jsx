@@ -66,11 +66,16 @@ const PRICE_KEYS = [
 
 function getPriceSourceLabel(field, resp) {
   const meta = resp?.meta || {};
+  const blackVariant = meta?.black_variant || {};
+  const atcVariant = meta?.atc_variant || {};
   const calculated = new Set(resp?.calculated_fields || []);
   const fv = resp?.final_values || {};
   const hasValue = fv[field] !== null && fv[field] !== undefined && String(fv[field]) !== "";
 
   if (!hasValue) return "";
+
+  if (atcVariant?.applied && PRICE_KEYS.includes(field)) return "ATC+Sys";
+  if (blackVariant?.applied && PRICE_KEYS.includes(field)) return "Black+2";
 
   if (calculated.has(field)) {
     if (meta.used_sys) return "Calculated(Sys)";
@@ -296,7 +301,7 @@ function QueryDiagnosticBlock({ resp }) {
         <div className="diagItem diagSpan2">
           <div className="diagLabel">display rule</div>
           <div className="diagValue">
-            <span className="bigPill monoInline">&lt;10 → 2 decimals</span>
+            <span className="bigPill monoInline">&lt;10 → 1 decimal</span>
             <span className="bigPill monoInline">≥10 → integer</span>
           </div>
         </div>
@@ -428,10 +433,162 @@ function ExternalModelClusterBlock({ cluster, loading, onExportAll, exporting })
   );
 }
 
+function BlackVariantBlock({ resp, onApply, applying }) {
+  const bv = resp?.meta?.black_variant || {};
+  if (!bv?.is_black) return null;
+
+  const whitePrices = bv?.white_prices || {};
+  const adjustedPrices = bv?.adjusted_prices || {};
+  const eligible = Boolean(bv?.eligible);
+  const applied = Boolean(bv?.applied);
+
+  return (
+    <div className={`diagBlock blackVariantBlock ${applied ? "applied" : eligible ? "eligible" : "missing"}`}>
+      <div className="diagHeader">
+        <div className="diagTitle">BLACK SKU PRICE CHECK</div>
+        <span className={`inlineTag ${applied ? "orig" : eligible ? "calc" : ""}`}>
+          {applied ? "APPLIED" : eligible ? "WHITE PRICE FOUND" : "WHITE PRICE MISSING"}
+        </span>
+      </div>
+
+      <div className="diagTextRow">
+        <div className="diagTextLabel">白色款</div>
+        <div className="diagTextValue">
+          {eligible ? (
+            <>
+              <span className="bigPill monoInline">PN: {safeStr(bv?.white_pn)}</span>
+              <span className="bigPill monoInline">Internal: {safeStr(bv?.white_internal_model)}</span>
+              <span className="bigPill monoInline">Match: {safeStr(bv?.match_source)}</span>
+            </>
+          ) : (
+            <span className="small err">没有在 France 国家侧找到可用于 +2 的白色款完整价格。</span>
+          )}
+        </div>
+      </div>
+
+      {eligible ? (
+        <div className="tableWrap blackVariantTable">
+          <table className="table dense">
+            <thead>
+              <tr>
+                <th style={{ minWidth: 170 }}>Field</th>
+                <th style={{ minWidth: 110 }}>White FR</th>
+                <th style={{ minWidth: 110 }}>Black +2</th>
+              </tr>
+            </thead>
+            <tbody>
+              {PRICE_KEYS.map((k) => (
+                <tr key={k}>
+                  <td className="mono">{k}</td>
+                  <td className="mono">{safeStr(formatPricePiecewise(whitePrices?.[k]))}</td>
+                  <td className="mono strongPrice">{safeStr(formatPricePiecewise(adjustedPrices?.[k]))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+
+      {eligible ? (
+        <div className="blackVariantActions">
+          <div className="small">
+            确认后，本 black SKU 导出价会使用白色款 France 价格 + {safeStr(bv?.markup_eur)} EUR；Sys Basis Price
+            Used 不会改动。
+          </div>
+          <button className="btn primary" onClick={onApply} disabled={applying || applied}>
+            {applied ? "BLACK +2 ACTIVE" : applying ? "APPLYING..." : "APPLY BLACK +2"}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AtcVariantBlock({ resp, onApply, applying }) {
+  const av = resp?.meta?.atc_variant || {};
+  if (!av?.is_atc) return null;
+
+  const basePrices = av?.base_prices || {};
+  const sourcePrices = av?.source_prices || {};
+  const beforePrices = Object.keys(basePrices).length > 0 ? basePrices : sourcePrices;
+  const adjustedPrices = av?.adjusted_prices || {};
+  const eligible = Boolean(av?.eligible);
+  const applied = Boolean(av?.applied);
+  const markup = Number(av?.markup_eur);
+  const markupText = Number.isFinite(markup) ? `${formatPricePiecewise(markup)} EUR` : "-";
+
+  return (
+    <div className={`diagBlock blackVariantBlock ${applied ? "applied" : eligible ? "eligible" : "missing"}`}>
+      <div className="diagHeader">
+        <div className="diagTitle">ATC SKU PRICE CHECK</div>
+        <span className={`inlineTag ${applied ? "orig" : eligible ? "calc" : ""}`}>
+          {applied ? "APPLIED" : eligible ? "BASE PRICE FOUND" : "BASE PRICE MISSING"}
+        </span>
+      </div>
+
+      <div className="diagTextRow">
+        <div className="diagTextLabel">原版</div>
+        <div className="diagTextValue">
+          {eligible ? (
+            <>
+              <span className="bigPill monoInline">PN: {safeStr(av?.base_pn)}</span>
+              <span className="bigPill monoInline">Internal: {safeStr(av?.base_internal_model)}</span>
+              <span className="bigPill monoInline">Match: {safeStr(av?.match_source)}</span>
+              <span className="bigPill monoInline">
+                Sys delta: {markupText} ({safeStr(av?.sys_base_basis_price)}
+                {" -> "}
+                {safeStr(av?.sys_variant_basis_price)})
+              </span>
+            </>
+          ) : (
+            <span className="small err">没有找到可用于叠加 ATC Sys 差价的原版完整 France 价格。</span>
+          )}
+        </div>
+      </div>
+
+      {eligible ? (
+        <div className="tableWrap blackVariantTable">
+          <table className="table dense">
+            <thead>
+              <tr>
+                <th style={{ minWidth: 170 }}>Field</th>
+                <th style={{ minWidth: 110 }}>{Object.keys(basePrices).length > 0 ? "Base FR" : "Current"}</th>
+                <th style={{ minWidth: 130 }}>ATC + Sys</th>
+              </tr>
+            </thead>
+            <tbody>
+              {PRICE_KEYS.map((k) => (
+                <tr key={k}>
+                  <td className="mono">{k}</td>
+                  <td className="mono">{safeStr(formatPricePiecewise(beforePrices?.[k]))}</td>
+                  <td className="mono strongPrice">{safeStr(formatPricePiecewise(adjustedPrices?.[k]))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+
+      {eligible ? (
+        <div className="blackVariantActions">
+          <div className="small">
+            确认后，本 ATC SKU 导出价会在当前价格上独立叠加 Sys 中 ATC 相对原版的差价；Sys Basis Price
+            Used 不会改动。若同时命中 black 规则，两个差价会叠加。
+          </div>
+          <button className="btn primary" onClick={onApply} disabled={applying || applied}>
+            {applied ? "ATC SYS DELTA ACTIVE" : applying ? "APPLYING..." : "APPLY ATC SYS DELTA"}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SingleQuery() {
   const [pn, setPn] = useState("");
   const [loading, setLoading] = useState(false);
   const [recalcLoading, setRecalcLoading] = useState(false);
+  const [blackApplyLoading, setBlackApplyLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [extMode, setExtMode] = useState(false);
   const [extLoading, setExtLoading] = useState(false);
@@ -559,7 +716,7 @@ function SingleQuery() {
 
     setLoading(true);
     try {
-      const r = await apiPostJson("/api/query", { pn: s });
+      const r = await apiPostJson("/api/query", { pn: s, apply_black_markup: false });
       setResp(r);
       const nextCategory = safeStr(r?.meta?.category);
       const nextPriceGroup = safeStr(r?.meta?.price_group);
@@ -657,6 +814,7 @@ function SingleQuery() {
         force_series_key: manualSeriesKey || null,
         manual_sys_basis_price_used: nextManualBasis,
         manual_fob: nextManualFob,
+        apply_black_markup: Boolean(resp?.meta?.black_variant?.applied || resp?.meta?.atc_variant?.applied),
       });
       setResp(r);
       syncManualInputsFromResponse(r);
@@ -664,6 +822,45 @@ function SingleQuery() {
       setErr(String(e.message || e));
     } finally {
       setRecalcLoading(false);
+    }
+  }
+
+  async function applyBlackMarkup() {
+    if (!resp) return;
+    const s = (pn || safeStr(resp?.pn)).trim();
+    if (!s) return;
+
+    const meta = resp?.meta || {};
+    const manualOverride = Boolean(meta?.manual_override);
+    setErr("");
+    setBlackApplyLoading(true);
+    try {
+      const payload = {
+        pn: s,
+        apply_black_markup: true,
+      };
+      if (manualOverride) {
+        payload.force_category = safeStr(meta?.forced_category || meta?.category) || null;
+        payload.force_price_group = safeStr(meta?.forced_price_group || meta?.price_group) || null;
+        payload.force_series_key = safeStr(meta?.forced_series_key || meta?.series_key) || null;
+        if (meta?.manual_override_field === "sys_basis_price_used" && meta?.manual_sys_basis_price_input != null) {
+          payload.manual_sys_basis_price_used = meta.manual_sys_basis_price_input;
+        }
+        if (meta?.manual_override_field === "fob" && meta?.manual_fob_input != null) {
+          payload.manual_fob = meta.manual_fob_input;
+        }
+        const r = await apiPostJson("/api/query/recompute", payload);
+        setResp(r);
+        syncManualInputsFromResponse(r);
+      } else {
+        const r = await apiPostJson("/api/query", payload);
+        setResp(r);
+        syncManualInputsFromResponse(r);
+      }
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setBlackApplyLoading(false);
     }
   }
 
@@ -686,6 +883,7 @@ function SingleQuery() {
       force_price_group: null,
       force_series_key: null,
       force_full_recalc: false,
+      apply_black_markup: Boolean(meta?.black_variant?.applied || meta?.atc_variant?.applied),
     };
 
     if (manualOverride) {
@@ -786,6 +984,9 @@ function SingleQuery() {
           <Hr />
 
           <QueryDiagnosticBlock resp={resp} />
+
+          <BlackVariantBlock resp={resp} onApply={applyBlackMarkup} applying={blackApplyLoading} />
+          <AtcVariantBlock resp={resp} onApply={applyBlackMarkup} applying={blackApplyLoading} />
 
           <Hr />
           <div className="sectionTitle">BASE FIELDS</div>
@@ -1121,6 +1322,8 @@ function BatchJobBlock({ job }) {
           <span className="bigPill monoInline">not_found: {safeStr(report.count_not_found)}</span>
           <span className="bigPill monoInline">anchor_applied: {safeStr(report.count_anchor_applied)}</span>
           <span className="bigPill monoInline">anchor_changed: {safeStr(report.count_anchor_changed)}</span>
+          <span className="bigPill monoInline">black+2: {safeStr(report.count_black_markup_applied)}</span>
+          <span className="bigPill monoInline">atc+sys: {safeStr(report.count_atc_markup_applied)}</span>
           <span className="bigPill monoInline">outputs: {outputFiles.length}</span>
         </div>
       </div>
@@ -1210,7 +1413,21 @@ function BatchReviewTable({ job }) {
                 <td className="mono">{safeStr(formatPricePiecewise(r.silver))}</td>
                 <td className="mono">{safeStr(formatPricePiecewise(r.ivory))}</td>
                 <td className="mono">{safeStr(formatPricePiecewise(r.msrp))}</td>
-                <td className="mono">{safeStr((r.warnings || []).join(" | "))}</td>
+                <td className="mono">
+                  {r.black_white_pn ? (
+                    <>
+                      <span className="inlineTag calc">white {safeStr(r.black_white_pn)}</span>
+                      <br />
+                    </>
+                  ) : null}
+                  {r.atc_base_pn ? (
+                    <>
+                      <span className="inlineTag calc">base {safeStr(r.atc_base_pn)}</span>
+                      <br />
+                    </>
+                  ) : null}
+                  {safeStr((r.warnings || []).join(" | "))}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -1229,6 +1446,7 @@ function BatchExport() {
 
   // 新增：后端 /api/batch 要求必填 level
   const [level, setLevel] = useState("country");
+  const [applyBlackMarkup, setApplyBlackMarkup] = useState(true);
 
   async function submit() {
     if (!file) return;
@@ -1240,6 +1458,7 @@ function BatchExport() {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("level", level); // 修复 422: missing body.level
+      fd.append("apply_black_markup", applyBlackMarkup ? "true" : "false");
 
       const r = await apiPostForm("/api/batch", fd);
       setJob(r);
@@ -1310,6 +1529,15 @@ function BatchExport() {
         <button className="btn primary" onClick={submit} disabled={!file || submitting}>
           {submitting ? "UPLOADING..." : "SUBMIT"}
         </button>
+
+        <label className="small batchCheck">
+          <input
+            type="checkbox"
+            checked={applyBlackMarkup}
+            onChange={(e) => setApplyBlackMarkup(Boolean(e.target.checked))}
+          />
+          Black +2 / ATC delta
+        </label>
 
         <input
           className="input mono"

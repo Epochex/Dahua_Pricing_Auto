@@ -47,6 +47,8 @@ def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[
         match_type1 = str(rule.get("match_type1") or "").strip().lower()
         pattern1 = safe_upper(rule.get("pattern1"))
         value1 = safe_upper(row.get(field1))
+        if not pattern1:
+            continue
 
         if match_type1 == "equals":
             if value1 != pattern1:
@@ -62,6 +64,8 @@ def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[
             match_type2 = str(rule.get("match_type2") or "").strip().lower()
             pattern2 = safe_upper(rule.get("pattern2"))
             value2 = safe_upper(row.get(field2))
+            if not pattern2:
+                continue
 
             if match_type2 == "equals":
                 if value2 != pattern2:
@@ -193,6 +197,78 @@ def _is_security_inspection_text(v) -> bool:
     )
 
 
+def _collect_model_texts(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> list[str]:
+    vals: list[str] = []
+    for row in (france_row, sys_row):
+        if row is None:
+            continue
+        for col in ("Internal Model", "External Model"):
+            if col in row and pd.notna(row[col]):
+                s = str(row[col]).strip()
+                if s:
+                    vals.append(s)
+    return vals
+
+
+def _model_blob(france_row: Optional[pd.Series], sys_row: Optional[pd.Series]) -> str:
+    vals = _collect_model_texts(france_row, sys_row)
+    if not vals:
+        return ""
+    return safe_upper(" ".join(vals))
+
+
+def _model_evidence_override(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> Optional[Tuple[str, str]]:
+    """
+    Strong model-prefix evidence learned from the current runtime data.
+
+    The mapping CSVs are product-line based and can miss newer lines such as
+    "Cameras for Overseas Distribution Channels". When model text is explicit,
+    prefer it over broad learned fallbacks.
+    """
+    big = _model_blob(france_row, sys_row)
+    if not big:
+        return None
+
+    # Recorders first: avoid treating XVR/NVR strings as generic camera text.
+    if re.search(r"\b(?:DHI|DH)?-?IVSS", big) or re.search(r"\bIVSS[0-9]", big):
+        return ("IVSS", "IVSS")
+    if re.search(r"\b(?:DHI|DH)?-?EVS", big) or re.search(r"\bEVS[0-9]", big):
+        return ("EVS", "EVS")
+    if re.search(r"\b(?:DHI|DH)?-?XVR", big) or re.search(r"\bXVR[0-9]", big):
+        return ("XVR", "XVR")
+    if re.search(r"\b(?:DHI|DH)?-?NVR", big) or re.search(r"\bNVR[0-9]", big):
+        return ("NVR", "NVR")
+
+    if re.search(r"\b(?:DHI|DH)?-?TPC", big) or re.search(r"\bTPC[-0-9A-Z]", big):
+        return ("THERMAL", "THERMAL")
+
+    if (
+        re.search(r"\b(?:DHI|DH)?-?PTZ", big)
+        or re.search(r"\bPTZ[0-9]", big)
+        or re.search(r"\b(?:DHI|DH)?-?SD[0-9]", big)
+        or re.search(r"\bSD[0-9]", big)
+    ):
+        return ("PTZ", "PTZ")
+
+    if re.search(r"\b(?:DHI|DH)-?IPC\b", big) or re.search(r"\bIPC[-A-Z0-9]", big):
+        return ("IPC", "IPC")
+    if re.search(r"\b(?:DHI|DH)-?(?:HFW|HDBW|HDW|HDB)[0-9]", big):
+        return ("IPC", "IPC")
+    if re.search(r"\b(?:HFW|HDBW|HDW|HDB)[0-9]", big):
+        return ("IPC", "IPC")
+
+    if re.search(r"\b(?:DHI|DH)?-?HAC[-A-Z0-9]", big) or re.search(r"\bHAC[-A-Z0-9]", big):
+        return ("HAC", "HAC")
+
+    return None
+
+
 def _forced_category_override(
     france_row: Optional[pd.Series],
     sys_row: Optional[pd.Series],
@@ -247,6 +323,10 @@ def _forced_category_override(
     if any(_is_security_inspection_text(v) for v in fields):
         return ("安检机", "安检机")
 
+    model_override = _model_evidence_override(france_row, sys_row)
+    if model_override is not None:
+        return model_override
+
     return None
 
 
@@ -265,7 +345,7 @@ def _detect_ipc_series_key(big: str) -> str:
     if "IPC1" in big:
         return "IPC1"
 
-    m = re.search(r"H[DF]W([0-9])", big)
+    m = re.search(r"H(?:DBW|DB|DW|FW)([0-9])", big)
     if not m:
         return ""
 

@@ -264,6 +264,7 @@ def _apply_rule_overrides_if_exist() -> None:
 
 class QueryReq(BaseModel):
     pn: str = Field(..., description="Part No.")
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
 
 
 class QueryRecomputeReq(BaseModel):
@@ -276,6 +277,7 @@ class QueryRecomputeReq(BaseModel):
         description="manual override for Sys Basis Price Used",
     )
     manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
 
 
 class QueryExportReq(BaseModel):
@@ -289,6 +291,7 @@ class QueryExportReq(BaseModel):
         description="manual override for Sys Basis Price Used",
     )
     manual_fob: Optional[float] = Field(default=None, description="manual override for FOB C(EUR)")
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
 
 
 class ExternalModelReq(BaseModel):
@@ -967,7 +970,7 @@ def query_one(req: QueryReq) -> Dict[str, Any]:
     pn = (req.pn or "").strip()
     if not pn:
         raise HTTPException(status_code=400, detail="pn is empty")
-    return _engine.query_one(pn)
+    return _engine.query_one(pn, apply_black_markup=bool(req.apply_black_markup))
 
 
 @app.get("/api/query/options")
@@ -1016,6 +1019,7 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
         force_full_recalc=True,
         manual_sys_basis_price_used=manual_sys_basis_price_used,
         manual_fob=manual_fob,
+        apply_black_markup=bool(req.apply_black_markup),
     )
 
 
@@ -1050,6 +1054,7 @@ def query_export(req: QueryExportReq) -> FileResponse:
         force_full_recalc=bool(req.force_full_recalc),
         manual_sys_basis_price_used=manual_sys_basis_price_used,
         manual_fob=manual_fob,
+        apply_black_markup=bool(req.apply_black_markup),
     )
     if str(result.get("status", "")).lower() != "ok":
         raise HTTPException(status_code=404, detail=f"pn not found: {pn}")
@@ -1117,11 +1122,26 @@ def query_external_model_export(req: ExternalModelReq) -> FileResponse:
 def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
     fv = row.get("final_values") or {}
     meta = row.get("meta") or {}
+    black_variant = meta.get("black_variant") or {}
+    atc_variant = meta.get("atc_variant") or {}
     anchor_applied = bool(meta.get("external_model_anchor_applied"))
     anchor_pn = _norm_optional_text(meta.get("external_model_anchor_pn"))
     price_source = "FR_ANCHOR" if anchor_applied else "NORMAL"
     if anchor_applied and anchor_pn:
         price_source = f"FR_ANCHOR({anchor_pn})"
+    if black_variant.get("applied"):
+        white_pn = _norm_optional_text(black_variant.get("white_pn"))
+        price_source = f"BLACK+2({white_pn})" if white_pn else "BLACK+2"
+    elif black_variant.get("eligible"):
+        white_pn = _norm_optional_text(black_variant.get("white_pn"))
+        price_source = f"BLACK WHITE FOUND({white_pn})" if white_pn else "BLACK WHITE FOUND"
+    if atc_variant.get("applied"):
+        base_pn = _norm_optional_text(atc_variant.get("base_pn"))
+        delta = atc_variant.get("markup_eur")
+        price_source = f"ATC+SYS({base_pn}, +{delta:g})" if base_pn and isinstance(delta, (int, float)) else "ATC+SYS"
+    elif atc_variant.get("eligible"):
+        base_pn = _norm_optional_text(atc_variant.get("base_pn"))
+        price_source = f"ATC BASE FOUND({base_pn})" if base_pn else "ATC BASE FOUND"
     return {
         "idx": idx,
         "pn": row.get("pn"),
@@ -1138,6 +1158,14 @@ def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
         "sys_match_mode": meta.get("sys_match_mode"),
         "sys_matched_pn": meta.get("sys_matched_pn"),
         "price_source": price_source,
+        "black_variant": black_variant,
+        "atc_variant": atc_variant,
+        "black_markup_applied": bool(black_variant.get("applied")),
+        "black_white_pn": black_variant.get("white_pn"),
+        "black_white_internal_model": black_variant.get("white_internal_model"),
+        "atc_markup_applied": bool(atc_variant.get("applied")),
+        "atc_base_pn": atc_variant.get("base_pn"),
+        "atc_base_internal_model": atc_variant.get("base_internal_model"),
         "anchor_changed": bool(meta.get("external_model_anchor_changed")),
         "used_sys": bool(meta.get("used_sys")),
         "fob": fv.get("FOB C(EUR)"),
@@ -1156,6 +1184,7 @@ def _run_batch_job(job_id: str) -> None:
     state = _read_state(job_id)
     input_path = Path(state.get("input_path") or "")
     level_norm = str(state.get("level") or "country").strip().lower() or "country"
+    apply_black_markup = bool(state.get("apply_black_markup"))
     out_dir = OUTPUTS_DIR / job_id
 
     try:
@@ -1172,6 +1201,8 @@ def _run_batch_job(job_id: str) -> None:
         state["progress_current_pn"] = None
         state["progress_anchor_applied"] = 0
         state["progress_anchor_changed"] = 0
+        state["progress_black_markup_applied"] = 0
+        state["progress_atc_markup_applied"] = 0
         state["progress_not_found"] = 0
         _write_state(job_id, state)
 
@@ -1181,14 +1212,21 @@ def _run_batch_job(job_id: str) -> None:
         warnings: list[Dict[str, Any]] = []
         anchor_applied_count = 0
         anchor_changed_count = 0
+        black_markup_applied_count = 0
+        atc_markup_applied_count = 0
         anchor_cache: Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]] = {}
 
         for i, pn in enumerate(pns, start=1):
-            row = _engine.query_one(pn)
+            row = _engine.query_one(pn, apply_black_markup=False)
             _apply_external_model_anchor_to_row(
                 row,
                 apply_france_anchor=True,
                 anchor_cache=anchor_cache,
+            )
+            pricing_engine_mod.apply_variant_markups(
+                _engine.data,
+                row,
+                apply=apply_black_markup,
             )
 
             results.append(row)
@@ -1201,6 +1239,12 @@ def _run_batch_job(job_id: str) -> None:
                 anchor_applied_count += 1
             if row_meta.get("external_model_anchor_changed"):
                 anchor_changed_count += 1
+            black_variant = row_meta.get("black_variant") or {}
+            if black_variant.get("applied"):
+                black_markup_applied_count += 1
+            atc_variant = row_meta.get("atc_variant") or {}
+            if atc_variant.get("applied"):
+                atc_markup_applied_count += 1
             for w in (row.get("warnings") or []):
                 warnings.append({"pn": row.get("pn"), "w": w})
 
@@ -1209,6 +1253,8 @@ def _run_batch_job(job_id: str) -> None:
             state["progress_current_pn"] = pn
             state["progress_anchor_applied"] = anchor_applied_count
             state["progress_anchor_changed"] = anchor_changed_count
+            state["progress_black_markup_applied"] = black_markup_applied_count
+            state["progress_atc_markup_applied"] = atc_markup_applied_count
             state["progress_not_found"] = len(not_found)
             _write_state(job_id, state)
 
@@ -1225,6 +1271,8 @@ def _run_batch_job(job_id: str) -> None:
             "warnings": warnings,
             "count_anchor_applied": anchor_applied_count,
             "count_anchor_changed": anchor_changed_count,
+            "count_black_markup_applied": black_markup_applied_count,
+            "count_atc_markup_applied": atc_markup_applied_count,
             "items": items,
         }
 
@@ -1248,6 +1296,7 @@ def _run_batch_job(job_id: str) -> None:
 @app.post("/api/batch")
 def batch(
     level: str = Form(..., description="country | country_customer"),
+    apply_black_markup: bool = Form(False, description="apply detected variant markups (black +2, ATC Sys delta)"),
     file: UploadFile = File(...),
 ) -> Dict[str, Any]:
     """
@@ -1286,6 +1335,7 @@ def batch(
         "level": level_norm,              # 实际执行 level
         "level_input": level_input,       # 保留原始请求
         "export_layout": "country",
+        "apply_black_markup": bool(apply_black_markup),
         "input_name": file.filename,
         "input_path": str(input_path),
         "output_files": [],
@@ -1297,6 +1347,8 @@ def batch(
         "progress_current_pn": None,
         "progress_anchor_applied": 0,
         "progress_anchor_changed": 0,
+        "progress_black_markup_applied": 0,
+        "progress_atc_markup_applied": 0,
         "progress_not_found": 0,
     }
     _write_state(job_id, state)
@@ -1308,7 +1360,12 @@ def batch(
         name=f"batch-job-{job_id}",
     )
     worker.start()
-    return {"job_id": job_id, "status": "queued", "export_layout": "country"}
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "export_layout": "country",
+        "apply_black_markup": bool(apply_black_markup),
+    }
 
 
 @app.get("/api/jobs/{job_id}")

@@ -557,6 +557,49 @@ a:hover {
   background: #edf5ef;
 }
 
+.blackVariantBlock {
+  margin-top: 12px;
+  border-color: #d5c48f;
+}
+
+.blackVariantBlock.applied {
+  border-color: #9dbba7;
+}
+
+.blackVariantBlock.missing {
+  border-color: #d6aaaa;
+}
+
+.blackVariantTable {
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.blackVariantActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.strongPrice {
+  font-weight: 700;
+  color: var(--green);
+}
+
+.batchCheck {
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  background: var(--paper-3);
+}
+
 details {
   border: 1px solid var(--line);
   background: var(--paper-3);
@@ -626,5 +669,10 @@ summary {
   .diagTextLabel {
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .blackVariantActions {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

@@ -22,6 +22,8 @@ PRICE_COLS = [
     "MSRP(EUR)",
 ]
 
+BLACK_VARIANT_MARKUP_EUR = 2.0
+
 # =========================
 # Sys FOB Adjust（涨价系数）
 # =========================
@@ -78,7 +80,7 @@ def _detect_uplift_line_key(
                 return k
 
         # 兜底：根据 HFW/HDW 后第一位数字猜代数（覆盖 8/7/5/3/2/1）
-        m = re.search(r"H[DF]W([0-9])", big)
+        m = re.search(r"H(?:DBW|DB|DW|FW)([0-9])", big)
         if m:
             d = m.group(1)
             if d == "8":
@@ -398,6 +400,580 @@ def _norm_key(s: Optional[str]) -> str:
     return str(s).strip().upper()
 
 
+def _normalize_model_lookup(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^A-Z0-9]+", "", s)
+    for prefix in ("DHI", "DH"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    return s
+
+
+def _strip_black_suffix(model: Any) -> Optional[str]:
+    s = str(model or "").strip()
+    if not s:
+        return None
+    stripped = re.sub(r"(?i)(?:[-_\s]+BLACK|BLACK)$", "", s).strip("-_ ")
+    if stripped == s:
+        return None
+    return stripped or None
+
+
+def _strip_atc_token(model: Any) -> Optional[str]:
+    s = str(model or "").strip()
+    if not s:
+        return None
+    stripped = re.sub(r"(?i)(?:[-_\s]+ATC)(?=$|[-_\s])", "", s, count=1).strip("-_ ")
+    if stripped == s:
+        return None
+    return stripped or None
+
+
+def _atc_optical_fallback_model(model: Optional[str]) -> Optional[str]:
+    if not model:
+        return None
+    converted = re.sub(r"(?i)([-_])0832([-_])", r"\g<1>2712\2", model)
+    converted = re.sub(r"(?i)([-_])Z4([-_])", r"\g<1>Z\2", converted)
+    converted = re.sub(r"(?i)([-_])Z4E([-_])", r"\g<1>ZE\2", converted)
+    if converted == model:
+        return None
+    return converted
+
+
+def _hdbw_to_hfw_white_model(model: Optional[str]) -> Optional[str]:
+    if not model:
+        return None
+
+    def repl(m: re.Match) -> str:
+        # HDBW3449RP -> HFW3449TP, HDBW3449R -> HFW3449T
+        return f"HFW{m.group(1)}T{m.group(2) or ''}"
+
+    converted = re.sub(r"HDBW([0-9]+)R(P?)", repl, model, count=1, flags=re.IGNORECASE)
+    if converted == model:
+        return None
+    return converted
+
+
+def _black_white_candidate_models(internal_model: Any, external_model: Any) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def _push(model: Optional[str], source: str) -> None:
+        if not model:
+            return
+        key = _normalize_model_lookup(model)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        candidates.append({"model": str(model).strip(), "source": source})
+
+    stripped_internal = _strip_black_suffix(internal_model)
+    stripped_external = _strip_black_suffix(external_model)
+
+    # Some black dome SKUs are priced from the matching white HFW family in the
+    # country table, e.g. HDBW3449RP-...-Black -> HFW3449TP-....
+    _push(_hdbw_to_hfw_white_model(stripped_internal), "hdbw_to_hfw_internal")
+    _push(_hdbw_to_hfw_white_model(stripped_external), "hdbw_to_hfw_external")
+    _push(stripped_internal, "strip_black_internal")
+    _push(stripped_external, "strip_black_external")
+
+    return candidates
+
+
+def _atc_base_candidate_models(internal_model: Any, external_model: Any) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def _push(model: Optional[str], source: str) -> None:
+        if not model:
+            return
+        key = _normalize_model_lookup(model)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        candidates.append({"model": str(model).strip(), "source": source})
+
+    stripped_internal = _strip_atc_token(internal_model)
+    stripped_external = _strip_atc_token(external_model)
+
+    _push(stripped_internal, "strip_atc_internal")
+    _push(stripped_external, "strip_atc_external")
+    _push(_atc_optical_fallback_model(stripped_internal), "strip_atc_internal_optical_fallback")
+    _push(_atc_optical_fallback_model(stripped_external), "strip_atc_external_optical_fallback")
+
+    return candidates
+
+
+def _row_complete_prices(row: pd.Series) -> Optional[Dict[str, float]]:
+    prices: Dict[str, float] = {}
+    for col in PRICE_COLS:
+        v = _to_float(row.get(col))
+        if v is None:
+            return None
+        prices[col] = v
+    return prices
+
+
+def _build_model_row_index(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    internal_col = "Internal Model" if "Internal Model" in df.columns else None
+    external_col = "External Model" if "External Model" in df.columns else None
+    index: Dict[str, pd.Series] = {}
+    for _, row in df.iterrows():
+        for col in (internal_col, external_col):
+            if not col:
+                continue
+            key = _normalize_model_lookup(row.get(col))
+            if key and key not in index:
+                index[key] = row
+    return index
+
+
+def _model_counterpart_payload(
+    row: pd.Series,
+    *,
+    pn_col: str,
+    match_model: Optional[str],
+    match_source: Optional[str],
+    prices: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    return {
+        "pn": str(row.get(pn_col) or "").strip() if pn_col in row else None,
+        "internal_model": str(row.get("Internal Model") or "").strip() if "Internal Model" in row else None,
+        "external_model": str(row.get("External Model") or "").strip() if "External Model" in row else None,
+        "match_model": match_model,
+        "match_source": match_source,
+        "prices": prices,
+    }
+
+
+def _find_white_counterpart_in_france(
+    data: DataBundle,
+    *,
+    internal_model: Any,
+    external_model: Any,
+) -> Optional[Dict[str, Any]]:
+    candidates = _black_white_candidate_models(internal_model, external_model)
+    if not candidates:
+        return None
+
+    df = data.france_df
+    if df is None or df.empty:
+        return None
+
+    pn_col = _pick_pn_col(df)
+    internal_col = "Internal Model" if "Internal Model" in df.columns else None
+    external_col = "External Model" if "External Model" in df.columns else None
+    if not internal_col and not external_col:
+        return None
+
+    index = _build_model_row_index(df)
+
+    for cand in candidates:
+        row = index.get(_normalize_model_lookup(cand.get("model")))
+        if row is None:
+            continue
+        prices = _row_complete_prices(row)
+        if not prices:
+            continue
+        return _model_counterpart_payload(
+            row,
+            pn_col=pn_col,
+            match_model=cand.get("model"),
+            match_source=cand.get("source"),
+            prices=prices,
+        )
+
+    return None
+
+
+def _find_atc_base_counterpart_in_france(
+    data: DataBundle,
+    *,
+    internal_model: Any,
+    external_model: Any,
+) -> Optional[Dict[str, Any]]:
+    candidates = _atc_base_candidate_models(internal_model, external_model)
+    if not candidates:
+        return None
+
+    df = data.france_df
+    if df is None or df.empty:
+        return None
+    if "Internal Model" not in df.columns and "External Model" not in df.columns:
+        return None
+
+    pn_col = _pick_pn_col(df)
+    index = _build_model_row_index(df)
+    for cand in candidates:
+        row = index.get(_normalize_model_lookup(cand.get("model")))
+        if row is None:
+            continue
+        prices = _row_complete_prices(row)
+        if not prices:
+            continue
+        return _model_counterpart_payload(
+            row,
+            pn_col=pn_col,
+            match_model=cand.get("model"),
+            match_source=cand.get("source"),
+            prices=prices,
+        )
+
+    return None
+
+
+def _find_sys_counterpart_by_models(
+    data: DataBundle,
+    candidates: List[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    df = data.sys_df
+    if df is None or df.empty:
+        return None
+    if "Internal Model" not in df.columns and "External Model" not in df.columns:
+        return None
+
+    pn_col = _pick_pn_col(df)
+    index = _build_model_row_index(df)
+    for cand in candidates:
+        row = index.get(_normalize_model_lookup(cand.get("model")))
+        if row is None:
+            continue
+        basis_price, sales_type, basis_field = _choose_sys_base_price_from_sys(row)
+        if basis_price is None:
+            continue
+        payload = _model_counterpart_payload(
+            row,
+            pn_col=pn_col,
+            match_model=cand.get("model"),
+            match_source=cand.get("source"),
+            prices=None,
+        )
+        payload.update(
+            {
+                "basis_price": basis_price,
+                "sales_type": sales_type,
+                "basis_field": basis_field,
+            }
+        )
+        return payload
+
+    return None
+
+
+def _find_current_atc_in_sys(
+    data: DataBundle,
+    *,
+    pn: Any,
+    internal_model: Any,
+    external_model: Any,
+) -> Optional[Dict[str, Any]]:
+    df = data.sys_df
+    if df is None or df.empty:
+        return None
+
+    key_raw = normalize_pn_raw(str(pn or ""))
+    if key_raw and key_raw in (data.sys_idx_raw or {}):
+        row = df.iloc[int(data.sys_idx_raw[key_raw])]
+        basis_price, sales_type, basis_field = _choose_sys_base_price_from_sys(row)
+        if basis_price is not None:
+            pn_col = _pick_pn_col(df)
+            payload = _model_counterpart_payload(
+                row,
+                pn_col=pn_col,
+                match_model=str(internal_model or external_model or "").strip(),
+                match_source="current_pn",
+                prices=None,
+            )
+            payload.update(
+                {
+                    "basis_price": basis_price,
+                    "sales_type": sales_type,
+                    "basis_field": basis_field,
+                }
+            )
+            return payload
+
+    candidates: List[Dict[str, str]] = []
+    for model, source in (
+        (internal_model, "current_internal"),
+        (external_model, "current_external"),
+    ):
+        if model:
+            candidates.append({"model": str(model).strip(), "source": source})
+    return _find_sys_counterpart_by_models(data, candidates)
+
+
+def apply_black_variant_markup(
+    data: DataBundle,
+    row: Dict[str, Any],
+    *,
+    apply: bool = False,
+) -> bool:
+    """
+    Detect black SKUs, expose the matching France-side white price, and optionally
+    set every exported price tier to white + 2 EUR. Sys basis metadata is not changed.
+    """
+    if str(row.get("status", "")).lower() != "ok":
+        return False
+
+    fv = row.get("final_values") or {}
+    row["final_values"] = fv
+    meta = row.get("meta") or {}
+    row["meta"] = meta
+
+    internal_model = fv.get("Internal Model")
+    external_model = fv.get("External Model")
+    stripped_internal = _strip_black_suffix(internal_model)
+    stripped_external = _strip_black_suffix(external_model)
+    is_black = bool(stripped_internal or stripped_external)
+
+    black_meta: Dict[str, Any] = {
+        "is_black": is_black,
+        "eligible": False,
+        "applied": False,
+        "markup_eur": BLACK_VARIANT_MARKUP_EUR,
+        "white_pn": None,
+        "white_internal_model": None,
+        "white_external_model": None,
+        "match_model": None,
+        "match_source": None,
+        "white_prices": None,
+        "adjusted_prices": None,
+    }
+    meta["black_variant"] = black_meta
+
+    if not is_black:
+        return False
+
+    ws = [
+        str(w)
+        for w in (row.get("warnings") or [])
+        if not str(w).startswith("black_variant_")
+    ]
+    counterpart = _find_white_counterpart_in_france(
+        data,
+        internal_model=internal_model,
+        external_model=external_model,
+    )
+    if not counterpart:
+        if "black_variant_white_counterpart_not_found" not in ws:
+            ws.append("black_variant_white_counterpart_not_found")
+        row["warnings"] = ws
+        return False
+
+    white_prices = dict(counterpart.get("prices") or {})
+    adjusted_prices = {
+        col: (float(v) + BLACK_VARIANT_MARKUP_EUR)
+        for col, v in white_prices.items()
+        if _to_float(v) is not None
+    }
+    black_meta.update(
+        {
+            "eligible": True,
+            "white_pn": counterpart.get("pn"),
+            "white_internal_model": counterpart.get("internal_model"),
+            "white_external_model": counterpart.get("external_model"),
+            "match_model": counterpart.get("match_model"),
+            "match_source": counterpart.get("match_source"),
+            "white_prices": white_prices,
+            "adjusted_prices": adjusted_prices,
+        }
+    )
+
+    if not apply:
+        if "black_variant_white_counterpart_found_apply_plus_2" not in ws:
+            ws.append("black_variant_white_counterpart_found_apply_plus_2")
+        row["warnings"] = ws
+        return False
+
+    changed = False
+    cf = set(row.get("calculated_fields") or [])
+    for col in PRICE_COLS:
+        if col not in adjusted_prices:
+            continue
+        before = _to_float(fv.get(col))
+        after = _to_float(adjusted_prices.get(col))
+        if after is None:
+            continue
+        fv[col] = after
+        cf.add(col)
+        if before != after:
+            changed = True
+
+    black_meta["applied"] = True
+    row["calculated_fields"] = sorted(list(cf))
+    applied_msg = f"black_variant_plus_2_applied_from_white_pn={counterpart.get('pn') or 'UNKNOWN'}"
+    if applied_msg not in ws:
+        ws.append(applied_msg)
+    row["warnings"] = ws
+    return changed
+
+
+def apply_atc_variant_markup(
+    data: DataBundle,
+    row: Dict[str, Any],
+    *,
+    apply: bool = False,
+) -> bool:
+    """
+    Detect ATC SKUs and expose the Sys ATC uplift.
+    When applied, every exported price tier gets the Sys delta added independently.
+    """
+    if str(row.get("status", "")).lower() != "ok":
+        return False
+
+    fv = row.get("final_values") or {}
+    row["final_values"] = fv
+    meta = row.get("meta") or {}
+    row["meta"] = meta
+
+    internal_model = fv.get("Internal Model")
+    external_model = fv.get("External Model")
+    stripped_internal = _strip_atc_token(internal_model)
+    stripped_external = _strip_atc_token(external_model)
+    is_atc = bool(stripped_internal or stripped_external)
+
+    atc_meta: Dict[str, Any] = {
+        "is_atc": is_atc,
+        "eligible": False,
+        "applied": False,
+        "markup_eur": None,
+        "base_pn": None,
+        "base_internal_model": None,
+        "base_external_model": None,
+        "match_model": None,
+        "match_source": None,
+        "base_prices": None,
+        "source_prices": None,
+        "adjusted_prices": None,
+        "sys_variant_pn": None,
+        "sys_base_pn": None,
+        "sys_variant_basis_price": None,
+        "sys_base_basis_price": None,
+        "sys_basis_field": None,
+        "sys_base_basis_field": None,
+    }
+    meta["atc_variant"] = atc_meta
+
+    if not is_atc:
+        return False
+
+    ws = [
+        str(w)
+        for w in (row.get("warnings") or [])
+        if not str(w).startswith("atc_variant_")
+    ]
+
+    base_fr = _find_atc_base_counterpart_in_france(
+        data,
+        internal_model=internal_model,
+        external_model=external_model,
+    )
+
+    current_sys = _find_current_atc_in_sys(
+        data,
+        pn=row.get("pn"),
+        internal_model=internal_model,
+        external_model=external_model,
+    )
+    base_sys = _find_sys_counterpart_by_models(
+        data,
+        _atc_base_candidate_models(internal_model, external_model),
+    )
+    if not current_sys or not base_sys:
+        if "atc_variant_sys_delta_not_found" not in ws:
+            ws.append("atc_variant_sys_delta_not_found")
+        row["warnings"] = ws
+        return False
+
+    variant_basis = _to_float(current_sys.get("basis_price"))
+    base_basis = _to_float(base_sys.get("basis_price"))
+    if variant_basis is None or base_basis is None:
+        if "atc_variant_sys_delta_not_found" not in ws:
+            ws.append("atc_variant_sys_delta_not_found")
+        row["warnings"] = ws
+        return False
+
+    markup = float(variant_basis) - float(base_basis)
+    base_prices = dict((base_fr or {}).get("prices") or {})
+    source_prices = {
+        col: float(v)
+        for col in PRICE_COLS
+        if (v := _to_float(fv.get(col))) is not None
+    }
+    adjusted_prices = {
+        col: (float(v) + markup)
+        for col, v in source_prices.items()
+        if _to_float(v) is not None
+    }
+    atc_meta.update(
+        {
+            "eligible": True,
+            "markup_eur": markup,
+            "base_pn": (base_fr or {}).get("pn") or base_sys.get("pn"),
+            "base_internal_model": (base_fr or {}).get("internal_model") or base_sys.get("internal_model"),
+            "base_external_model": (base_fr or {}).get("external_model") or base_sys.get("external_model"),
+            "match_model": (base_fr or {}).get("match_model") or base_sys.get("match_model"),
+            "match_source": (base_fr or {}).get("match_source") or base_sys.get("match_source"),
+            "base_prices": base_prices,
+            "source_prices": source_prices,
+            "adjusted_prices": adjusted_prices,
+            "sys_variant_pn": current_sys.get("pn"),
+            "sys_base_pn": base_sys.get("pn"),
+            "sys_variant_basis_price": variant_basis,
+            "sys_base_basis_price": base_basis,
+            "sys_basis_field": current_sys.get("basis_field"),
+            "sys_base_basis_field": base_sys.get("basis_field"),
+        }
+    )
+
+    if not apply:
+        if "atc_variant_base_counterpart_found_apply_sys_delta" not in ws:
+            ws.append("atc_variant_base_counterpart_found_apply_sys_delta")
+        row["warnings"] = ws
+        return False
+
+    changed = False
+    cf = set(row.get("calculated_fields") or [])
+    for col in PRICE_COLS:
+        if col not in adjusted_prices:
+            continue
+        before = _to_float(fv.get(col))
+        after = _to_float(adjusted_prices.get(col))
+        if after is None:
+            continue
+        fv[col] = after
+        cf.add(col)
+        if before != after:
+            changed = True
+
+    atc_meta["applied"] = True
+    row["calculated_fields"] = sorted(list(cf))
+    applied_msg = (
+        "atc_variant_sys_delta_applied_"
+        f"from_base_pn={atc_meta.get('base_pn') or 'UNKNOWN'}_delta={markup:g}"
+    )
+    if applied_msg not in ws:
+        ws.append(applied_msg)
+    row["warnings"] = ws
+    return changed
+
+
+def apply_variant_markups(
+    data: DataBundle,
+    row: Dict[str, Any],
+    *,
+    apply: bool = False,
+) -> bool:
+    black_changed = apply_black_variant_markup(data, row, apply=apply)
+    atc_changed = apply_atc_variant_markup(data, row, apply=apply)
+    return bool(black_changed or atc_changed)
+
+
 # =========================
 # Pricing rule resolution
 # =========================
@@ -479,8 +1055,11 @@ def _series_implies_eas(series_key: str, series_display: str) -> bool:
     sk = _norm_key(series_key)
     sd = _norm_key(series_display)
 
-    # 直接包含 EAS
-    if "EAS" in sk or "EAS" in sd:
+    def _has_eas_token(v: str) -> bool:
+        return bool(re.search(r"(^|[^A-Z0-9])EAS([^A-Z0-9]|$)", v or ""))
+
+    # 直接 EAS token；不能把 OVERSEAS 误判成 EAS。
+    if _has_eas_token(sk) or _has_eas_token(sd):
         return True
 
     # 电子防盗关键词（中文）
@@ -494,7 +1073,13 @@ def _series_implies_eas(series_key: str, series_display: str) -> bool:
     # 兜底：别名表
     for a in _EAS_ALIASES:
         au = _norm_key(a)
-        if au and (au == sk or au == sd or au in sk or au in sd):
+        if not au:
+            continue
+        if au == "EAS":
+            if _has_eas_token(sk) or _has_eas_token(sd):
+                return True
+            continue
+        if au == sk or au == sd or au in sk or au in sd:
             return True
 
     return False
@@ -1049,6 +1634,7 @@ def compute_one(
     force_full_recalc: bool = False,
     manual_sys_basis_price_used: Optional[float] = None,
     manual_fob: Optional[float] = None,
+    apply_black_markup: bool = False,
 ) -> Dict[str, Any]:
     """
     server API：单个 PN 查询
@@ -1120,14 +1706,7 @@ def compute_one(
     )
     result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
 
-    # Black 型号提醒（不影响计算，只做可追溯 warning）
-    internal = result.get("final_values", {}).get("Internal Model")
-    if internal is not None:
-        s = str(internal)
-        if "black" in s.lower():
-            warnings.append("internal_model_contains_black_check_white_variant")
-
-    return {
+    row_out = {
         "pn": pn,
         "status": "ok",
         "final_values": result["final_values"],
@@ -1176,6 +1755,8 @@ def compute_one(
         },
         "warnings": warnings,
     }
+    apply_variant_markups(data, row_out, apply=bool(apply_black_markup))
+    return row_out
 
 
 def compute_many(data: DataBundle, pns: List[str], level: str) -> List[Dict[str, Any]]:

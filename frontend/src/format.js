@@ -5,7 +5,9 @@ export function formatPricePiecewise(v) {
   const f = Number(v);
   if (!Number.isFinite(f)) return String(v);
 
-  if (f < PRICE_DECIMAL_THRESHOLD) return f.toFixed(2);
+  if (f < PRICE_DECIMAL_THRESHOLD) {
+    return (Math.round((f + Number.EPSILON) * 10) / 10).toFixed(1);
+  }
   return String(Math.round(f));
 }
 
