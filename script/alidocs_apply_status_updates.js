@@ -5,7 +5,8 @@
 const PENDING_URL = "https://current-ampland-biography-taxi.trycloudflare.com/api/agent/sheet/status-updates/pending";
 const ACK_URL = "https://current-ampland-biography-taxi.trycloudflare.com/api/agent/sheet/status-updates/ack";
 const AGENT_TOKEN = "PASTE_TOKEN_HERE";
-const LIMIT = 100;
+// Keep the first smoke test narrow. Raise this after the L-column writeback is verified.
+const LIMIT = 1;
 
 function normalizeSheetCollection(collection) {
   if (!collection) return [];
