@@ -14,10 +14,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from backend.app.agent_ops import (
+    AgentAutomation,
+    AgentConfigReq,
+    AgentGspQueueReq,
+    AgentGspStatusResultReq,
+    AgentNotifyTestReq,
+    AgentPricingTaskReq,
+    AgentSheetProbeReq,
+    AgentSheetPushReq,
+)
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
 from backend.engine.core import pricing_rules as pricing_rules_mod
@@ -1003,6 +1013,7 @@ def _keyword_preview_all_sources(keyword: str, pct: float, enabled: bool) -> Dic
 app = FastAPI(title="Dahua Pricing Auto (Deploy Server)", version="0.2.0")
 
 _engine: Optional[PricingEngine] = None
+_agent: Optional[AgentAutomation] = None
 
 
 @app.on_event("startup")
@@ -1013,12 +1024,170 @@ def _startup() -> None:
     cfg = EngineConfig(runtime_dir=RUNTIME_DIR)
     _engine = PricingEngine(cfg)
     _engine.load()
+    global _agent
+    _agent = AgentAutomation(RUNTIME_DIR)
+    _agent.ensure_dirs()
+    _agent.start_poller(_agent_compute_rows)
+
+
+def _require_agent() -> AgentAutomation:
+    assert _agent is not None
+    return _agent
+
+
+def _agent_compute_rows(pns: List[str], apply_black_markup: bool) -> Dict[str, Any]:
+    assert _engine is not None and _engine.data is not None
+    rows: list[Dict[str, Any]] = []
+    items: list[Dict[str, Any]] = []
+    not_found: list[str] = []
+    warnings: list[Dict[str, Any]] = []
+    anchor_applied_count = 0
+    anchor_changed_count = 0
+    black_markup_applied_count = 0
+    atc_markup_applied_count = 0
+    anchor_cache: Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]] = {}
+
+    for i, pn in enumerate(pns, start=1):
+        row = _engine.query_one(pn, apply_black_markup=False)
+        _apply_external_model_anchor_to_row(
+            row,
+            apply_france_anchor=True,
+            anchor_cache=anchor_cache,
+        )
+        pricing_engine_mod.apply_variant_markups(
+            _engine.data,
+            row,
+            apply=apply_black_markup,
+        )
+        rows.append(row)
+        items.append(_build_batch_review_item(i, row))
+
+        if str(row.get("status", "")).lower() == "not_found":
+            not_found.append(str(row.get("pn") or pn))
+        row_meta = row.get("meta") or {}
+        if row_meta.get("external_model_anchor_applied"):
+            anchor_applied_count += 1
+        if row_meta.get("external_model_anchor_changed"):
+            anchor_changed_count += 1
+        black_variant = row_meta.get("black_variant") or {}
+        if black_variant.get("applied"):
+            black_markup_applied_count += 1
+        atc_variant = row_meta.get("atc_variant") or {}
+        if atc_variant.get("applied"):
+            atc_markup_applied_count += 1
+        for w in (row.get("warnings") or []):
+            warnings.append({"pn": row.get("pn"), "w": w})
+
+    return {
+        "rows": rows,
+        "report": {
+            "count_total": len(rows),
+            "count_not_found": len(not_found),
+            "not_found": not_found,
+            "warnings": warnings,
+            "count_anchor_applied": anchor_applied_count,
+            "count_anchor_changed": anchor_changed_count,
+            "count_black_markup_applied": black_markup_applied_count,
+            "count_atc_markup_applied": atc_markup_applied_count,
+            "items": items,
+        },
+    }
 
 
 @app.get("/api/meta")
 def meta() -> Dict[str, Any]:
     assert _engine is not None
     return _engine.meta()
+
+
+@app.get("/api/agent/config")
+def agent_get_config() -> Dict[str, Any]:
+    return _require_agent().read_config(redacted=True)
+
+
+@app.put("/api/agent/config")
+def agent_put_config(req: AgentConfigReq) -> Dict[str, Any]:
+    return _require_agent().save_config(req)
+
+
+@app.get("/api/agent/state")
+def agent_state() -> Dict[str, Any]:
+    return _require_agent().read_state()
+
+
+@app.post("/api/agent/notify/test")
+def agent_notify_test(req: AgentNotifyTestReq) -> Dict[str, Any]:
+    return _require_agent().test_notification(req)
+
+
+@app.post("/api/agent/pricing-task")
+def agent_create_pricing_task(req: AgentPricingTaskReq) -> Dict[str, Any]:
+    _ = req
+    raise HTTPException(status_code=403, detail="agent pricing task is disabled in sheet-probe phase")
+
+
+@app.get("/api/agent/tasks/{task_id}")
+def agent_task_status(task_id: str) -> Dict[str, Any]:
+    return _require_agent().read_task(task_id)
+
+
+@app.get("/api/agent/sheet/parsed/latest")
+def agent_sheet_parsed_latest() -> Dict[str, Any]:
+    return _require_agent().read_parsed_sheet_push("latest")
+
+
+@app.get("/api/agent/sheet/parsed/{push_id}")
+def agent_sheet_parsed(push_id: str) -> Dict[str, Any]:
+    return _require_agent().read_parsed_sheet_push(push_id)
+
+
+@app.post("/api/agent/gsp/status-queue")
+def agent_gsp_status_queue(req: AgentGspQueueReq) -> Dict[str, Any]:
+    return _require_agent().gsp_status_queue(req)
+
+
+@app.post("/api/agent/gsp/status-result")
+def agent_gsp_status_result(req: AgentGspStatusResultReq) -> Dict[str, Any]:
+    return _require_agent().save_gsp_status_result(req)
+
+
+@app.get("/api/agent/tasks/{task_id}/download")
+def agent_task_download(task_id: str) -> FileResponse:
+    _ = task_id
+    raise HTTPException(status_code=403, detail="agent pricing task download is disabled in sheet-probe phase")
+
+
+@app.post("/api/agent/sheet/probe")
+def agent_sheet_probe(req: AgentSheetProbeReq) -> Dict[str, Any]:
+    return _require_agent().probe_sheet_source(req)
+
+
+def _agent_sheet_push_cors(request: Request, response: Response) -> None:
+    origin = request.headers.get("origin") or ""
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    requested_headers = request.headers.get("access-control-request-headers")
+    response.headers["Access-Control-Allow-Headers"] = requested_headers or "content-type, authorization"
+    response.headers["Access-Control-Max-Age"] = "600"
+
+
+@app.options("/api/agent/sheet/push")
+def agent_sheet_push_options(request: Request, response: Response) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return {"ok": True}
+
+
+@app.post("/api/agent/sheet/push")
+def agent_sheet_push(req: AgentSheetPushReq, request: Request, response: Response) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return _require_agent().receive_sheet_push(req)
+
+
+@app.post("/api/agent/poller/run-once")
+def agent_poller_run_once() -> Dict[str, Any]:
+    return _require_agent().run_poll_once()
 
 
 @app.post("/api/query")

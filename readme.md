@@ -225,6 +225,96 @@ https://gsp.dahuasecurity.com/cpqMicro/#/
 
 更新数据表或重启服务后，先看这页确认是否加载到了新的数据。
 
+### 4.7 AGENT
+
+用途：
+
+- 配置定价自动化 Agent 的运行开关、机器人关键词、Webhook 和文件轮询入口
+- 测试 Huachat/钉钉机器人出站通知
+- 测试服务器是否能拉取/读取群在线表格或同步后的本地表格
+- 为后续 Hermes / LangGraph / MCP 接入预留稳定 API 层
+
+当前阶段只测试两件事：
+
+```text
+1. 当前服务器能否读取群里的在线表格 / 导出的表格文件
+2. 当前服务器能否通过机器人 Webhook 往群里发通知
+```
+
+本阶段不会：
+
+- 根据 PN 自动跑定价平台
+- 生成 GSP 上传模板
+- 自动登录或操作 GSP
+- 自动提交任何价格申请
+
+AGENT 页的 Webhook 配置建议：
+
+- `KEYWORD`：填机器人安全关键词，例如 `定价Agent`
+- `NEW WEBHOOK URL`：填自定义机器人 Webhook 地址
+- `NEW WEBHOOK SECRET`：如果开启加签，填机器人加签密钥
+- `SHEET SOURCE PATH`：填服务器可读取的询价文件路径，例如 `/data/dahua_pricing_runtime/agent/inbox/inquiry.xlsx`
+- `PROBE SHEET`：立即测试该表格是否能被当前服务器拉取和预览
+- `FILE POLLER`：确认路径和通知测试无误后再打开；当前 poller 只探测表格变化，不触发定价
+
+当前版本不依赖自定义机器人的 Outgoing 机制。也就是说，机器人先作为“通知出口”使用；如果后续企业机器人 Stream、事件订阅或 Hermes Agent 入站网关打通，再接到同一组 `/api/agent/*` 接口即可。
+
+在线表格主动推送链路：
+
+```text
+钉钉在线表格脚本
+  -> POST /api/agent/sheet/push
+  -> 保存原始 push JSON
+  -> 解析 rows 为结构化任务
+  -> 如果配置了 Webhook，则机器人把处理摘要发回群里
+```
+
+脚本位置：
+
+- `/data/Dahua_Pricing_Auto/script/alidocs_push_all_sheets.js`
+
+服务端落盘位置：
+
+- 原始推送：`/data/dahua_pricing_runtime/agent/sheet_push/latest.json`
+- 结构化结果：`/data/dahua_pricing_runtime/agent/sheet_parsed/latest.json`
+- push token：`/data/dahua_pricing_runtime/agent/sheet_push_token.txt`
+
+结构化结果包含：
+
+- `summary.sheet_count`
+- `summary.task_count`
+- `summary.pending_count`
+- `summary.completed_count`
+- `summary.blocked_count`
+- `tasks[]`，字段包括 `sheet`、`row_index`、`requester`、`description`、`product_line`、`internal_model`、`pn`、`price_level`、`customer_name`、`deadline`、`pla_no`、`owner`、`status`、`stage`、`note`、`normalized_status`
+
+> [!NOTE]
+> 当前仍不会根据 PN 跑定价，不会生成 GSP 模板，也不会自动操作 GSP。
+> bot 回群通知需要先在 AGENT 页配置 Webhook URL 和关键词。
+
+GSP 状态查询链路：
+
+```text
+Linux 后端
+  -> 从最新在线表格 push 里筛选 J/PLA 有值且 L/状态不是已完成的行
+  -> POST /api/agent/gsp/status-queue 暴露给 Windows Desktop Agent
+
+Windows Desktop Agent
+  -> 使用独立 Edge profile 打开 GSP
+  -> 在 PLA NO. 输入框查询
+  -> 读取结果表格 Status
+  -> POST /api/agent/gsp/status-result 回传服务器
+```
+
+Windows Agent 文件：
+
+- `/data/Dahua_Pricing_Auto/desktop_agent/`
+- 结果落盘：`/data/dahua_pricing_runtime/agent/gsp_status/`
+
+> [!IMPORTANT]
+> Windows Agent 默认使用 Playwright + Edge 独立 profile，并默认 `headless=true`，不会抢主屏幕鼠标键盘。
+> 第一次建立 GSP 登录态时需要运行 `login.ps1` 人工登录一次；如果 GSP 不接受 headless，会再迁到独立 Windows 用户会话、小虚拟机或办公室小主机，避免影响日常电脑使用。
+
 ## 5. 仓库结构
 
 ```text
@@ -270,6 +360,10 @@ https://gsp.dahuasecurity.com/cpqMicro/#/
 │   ├── price_rules.json
 │   ├── uplift.json
 │   └── keyword_uplift.json
+├── agent/
+│   ├── config.json                # Agent 自动化配置，含 Webhook/轮询配置
+│   ├── state.json                 # Agent 轮询状态
+│   └── tasks/                     # Agent 自动定价任务与导出结果
 ├── uploads/                       # 批量任务上传源文件
 ├── outputs/                       # 单查导出、批量导出、external model 导出
 └── logs/                          # 任务日志、mapping 审计结果

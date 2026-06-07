@@ -250,6 +250,10 @@ a:hover {
   white-space: pre;
 }
 
+.textarea.short {
+  min-height: 96px;
+}
+
 .btn {
   height: 40px;
   padding: 0 16px;
@@ -600,6 +604,23 @@ a:hover {
   background: var(--paper-3);
 }
 
+.agentGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.agentGrid.two {
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+}
+
+.agentSplit {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
 details {
   border: 1px solid var(--line);
   background: var(--paper-3);
@@ -674,5 +695,11 @@ summary {
   .blackVariantActions {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .agentGrid,
+  .agentGrid.two,
+  .agentSplit {
+    grid-template-columns: 1fr;
   }
 }
