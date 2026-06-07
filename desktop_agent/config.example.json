@@ -2,11 +2,18 @@
   "server_url": "http://100.96.202.40:18081",
   "agent_token": "PASTE_SHEET_PUSH_TOKEN_HERE",
   "gsp_url": "https://gsp.dahuasecurity.com/#/pricing/application/list",
+  "gsp_base_url": "https://gsp.dahuasecurity.com",
+  "gsp_query_mode": "api",
+  "gsp_username": "PASTE_GSP_USERNAME_HERE",
+  "gsp_password": "PASTE_GSP_PASSWORD_HERE",
+  "gsp_country_code": "FR",
+  "gsp_auth_path": "gsp_auth.local.json",
   "edge_channel": "msedge",
   "user_data_dir": "C:/DahuaPricingAgent/edge-profile",
   "headless": true,
   "max_tasks": 5,
   "poll_interval_seconds": 0,
+  "dry_run": false,
   "slow_mo_ms": 0,
   "page_timeout_ms": 45000
 }

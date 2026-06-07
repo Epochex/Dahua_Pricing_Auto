@@ -108,8 +108,10 @@ code_description_server.txt
 .env.*
 !.env.example
 desktop_agent/config.json
+desktop_agent/gsp_auth.local.json
 desktop_agent/edge-profile/
 desktop_agent/screenshots/
+desktop_agent/artifacts/
 desktop_agent/*.trace.zip
 desktop_agent/playwright-report/
 

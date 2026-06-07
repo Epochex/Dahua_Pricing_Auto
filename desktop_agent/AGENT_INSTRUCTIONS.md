@@ -9,10 +9,10 @@ Build and test a Windows-side desktop agent that checks GSP PLA application stat
 The current scope is status checking only:
 
 - Pull pending PLA rows from the Linux backend.
-- Open GSP with a dedicated Edge profile.
-- Search by `PLA NO.`.
-- Read the result table `Status`.
+- Query GSP status through the GSP frontend API by `priceListApplicationId`.
+- Use browser automation only as a fallback/debug path because GSP may block DevTools-controlled browsers.
 - Post the status result back to the backend.
+- If GSP returns `Approved`, the backend queues `L{row_index}=已完成`; `script/alidocs_apply_status_updates.js` must run inside the online spreadsheet to apply and ACK it.
 
 Do not run pricing calculations. Do not submit or edit GSP applications. Do not send Huachat/DingTalk group messages during testing.
 
@@ -25,6 +25,8 @@ The Windows agent should use:
 ```text
 POST /api/agent/gsp/status-queue
 POST /api/agent/gsp/status-result
+POST /api/agent/sheet/status-updates/pending
+POST /api/agent/sheet/status-updates/ack
 ```
 
 For the first Windows test, the configured server URL is:
@@ -33,7 +35,7 @@ For the first Windows test, the configured server URL is:
 http://100.96.202.40:18081
 ```
 
-This is a Tailscale-only nginx entry. It only exposes the two GSP desktop-agent endpoints.
+This is a Tailscale-only nginx entry. It should expose the GSP desktop-agent endpoints and the sheet status update endpoints above.
 
 Both requests require the shared `agent_token`. On the Linux server this token is stored at:
 
@@ -73,6 +75,7 @@ desktop_agent/
   login.ps1
   run_once.ps1
   README.md
+  GSP_API_PLAYBOOK.md
 ```
 
 Install:
@@ -89,11 +92,18 @@ Create/edit `config.json`:
   "server_url": "http://100.96.202.40:18081",
   "agent_token": "PASTE_REAL_TOKEN_HERE",
   "gsp_url": "https://gsp.dahuasecurity.com/#/pricing/application/list",
+  "gsp_base_url": "https://gsp.dahuasecurity.com",
+  "gsp_query_mode": "api",
+  "gsp_username": "PASTE_GSP_USERNAME_HERE",
+  "gsp_password": "PASTE_GSP_PASSWORD_HERE",
+  "gsp_country_code": "FR",
+  "gsp_auth_path": "gsp_auth.local.json",
   "edge_channel": "msedge",
   "user_data_dir": "C:/DahuaPricingAgent/edge-profile",
   "headless": true,
   "max_tasks": 5,
-  "poll_interval_seconds": 0
+  "poll_interval_seconds": 0,
+  "dry_run": false
 }
 ```
 
@@ -103,10 +113,25 @@ First login:
 .\login.ps1
 ```
 
+In API mode, this logs in through `/dahua-b-usercenter/oauth/token` and stores `gsp_auth.local.json`. Browser/Edge login is only a fallback.
+
 Run one status-check pass:
 
 ```powershell
 .\run_once.ps1
+```
+
+Safer staged tests:
+
+```powershell
+# Backend queue/token only. Does not open GSP.
+.\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --queue-only
+
+# Query GSP but do not write the result back to the backend.
+.\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --once --no-push
+
+# Query one PLA directly and print status/current step/taskers.
+.\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --pla PLA20260602141029254
 ```
 
 ## Non-Interference Requirement
@@ -155,9 +180,12 @@ First target row:
 Work steps:
 1. Install dependencies with `install.ps1`.
 2. Put the real token into local `config.json`.
-3. Run `login.ps1` once to persist GSP login in `C:/DahuaPricingAgent/edge-profile`.
-4. Run `run_once.ps1`.
-5. If status extraction fails, inspect the GSP DOM and update selectors in `gsp_status_agent.py`.
-6. Save status via `/api/agent/gsp/status-result`.
-7. Report stdout and the backend saved result path.
+3. Run `--queue-only` first and confirm the target PLA row appears.
+4. Run `login.ps1` once to persist the API OAuth token in `gsp_auth.local.json`.
+5. Run `--once --no-push` and confirm status extraction in stdout.
+6. If API status extraction fails, inspect the GSP frontend API payloads before using browser fallback.
+7. Run `run_once.ps1` only after the no-push query looks correct.
+8. Report stdout and the backend saved result path.
+
+Read `desktop_agent/GSP_API_PLAYBOOK.md` before changing GSP selectors or API payloads.
 ```

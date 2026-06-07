@@ -7,10 +7,21 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
+
+
+def playwright_timeout_error() -> type[Exception]:
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        return PlaywrightTimeoutError
+    except Exception:
+        return TimeoutError
 
 
 def utc_now_iso() -> str:
@@ -18,10 +29,25 @@ def utc_now_iso() -> str:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    base_dir = path.resolve().parent
     data["server_url"] = str(data.get("server_url") or "").rstrip("/")
     data["agent_token"] = str(data.get("agent_token") or "")
     data["gsp_url"] = str(data.get("gsp_url") or "https://gsp.dahuasecurity.com/#/pricing/application/list")
+    data["gsp_base_url"] = str(data.get("gsp_base_url") or "https://gsp.dahuasecurity.com").rstrip("/")
+    data["gsp_query_mode"] = str(data.get("gsp_query_mode") or "api").strip().lower()
+    data["gsp_username"] = str(data.get("gsp_username") or "")
+    data["gsp_password"] = str(data.get("gsp_password") or "")
+    data["gsp_country_code"] = str(data.get("gsp_country_code") or "FR").strip() or "FR"
+    country_codes = data.get("gsp_country_codes") or data["gsp_country_code"]
+    if isinstance(country_codes, str):
+        data["gsp_country_codes"] = [x.strip() for x in country_codes.split(",") if x.strip()]
+    else:
+        data["gsp_country_codes"] = [str(x).strip() for x in country_codes if str(x).strip()]
+    if not data["gsp_country_codes"]:
+        data["gsp_country_codes"] = ["FR"]
+    auth_path = str(data.get("gsp_auth_path") or "gsp_auth.local.json")
+    data["gsp_auth_path"] = str((base_dir / auth_path).resolve() if not Path(auth_path).is_absolute() else Path(auth_path))
     data["edge_channel"] = str(data.get("edge_channel") or "msedge")
     data["user_data_dir"] = str(data.get("user_data_dir") or "C:/DahuaPricingAgent/edge-profile")
     data["headless"] = bool(data.get("headless", True))
@@ -29,6 +55,7 @@ def load_config(path: Path) -> dict[str, Any]:
     data["poll_interval_seconds"] = max(0, int(data.get("poll_interval_seconds") or 0))
     data["slow_mo_ms"] = max(0, int(data.get("slow_mo_ms") or 0))
     data["page_timeout_ms"] = max(10000, int(data.get("page_timeout_ms") or 45000))
+    data["dry_run"] = bool(data.get("dry_run", False))
     if not data["server_url"]:
         raise ValueError("server_url is empty")
     if not data["agent_token"] or "PASTE_" in data["agent_token"]:
@@ -48,11 +75,11 @@ def api_post(cfg: dict[str, Any], path: str, payload: dict[str, Any]) -> dict[st
     return body
 
 
-def fetch_queue(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+def fetch_queue(cfg: dict[str, Any], *, limit: int | None = None) -> list[dict[str, Any]]:
     body = api_post(
         cfg,
         "/api/agent/gsp/status-queue",
-        {"token": cfg["agent_token"], "limit": cfg["max_tasks"]},
+        {"token": cfg["agent_token"], "limit": limit or cfg["max_tasks"]},
     )
     return list(body.get("tasks") or [])
 
@@ -67,6 +94,9 @@ def push_result(cfg: dict[str, Any], task: dict[str, Any], result: dict[str, Any
         "row_index": task.get("row_index"),
         "pn": task.get("pn"),
         "requester": task.get("requester"),
+        "sheet_status": task.get("sheet_status"),
+        "approval_current_step": result.get("approval_current_step"),
+        "approval_taskers": result.get("approval_taskers"),
         "checked_at": result.get("checked_at") or utc_now_iso(),
         "source": "windows-desktop-agent",
         "detail": result.get("detail"),
@@ -85,6 +115,8 @@ class GspStatusChecker:
         self.page: Page | None = None
 
     def __enter__(self) -> "GspStatusChecker":
+        from playwright.sync_api import sync_playwright
+
         self.playwright = sync_playwright().start()
         user_data_dir = Path(self.cfg["user_data_dir"])
         user_data_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +154,10 @@ class GspStatusChecker:
 
         try:
             page.goto(self.cfg["gsp_url"], wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except playwright_timeout_error():
+                pass
             page.wait_for_timeout(1500)
             if self._looks_like_login_page(page):
                 return {
@@ -210,9 +246,12 @@ class GspStatusChecker:
 
     def _click_search(self, page: Page) -> None:
         candidates = [
-            page.get_by_role("button", name=re.compile(r"Search|查询", re.I)),
+            page.get_by_role("button", name=re.compile(r"Search|Query|查询|搜索", re.I)),
             page.locator("button:has-text('Search')"),
+            page.locator("button:has-text('Query')"),
             page.locator("button:has-text('查询')"),
+            page.locator("button:has-text('搜索')"),
+            page.locator("button[type='submit']"),
         ]
         for locator in candidates:
             try:
@@ -225,7 +264,7 @@ class GspStatusChecker:
             """
             () => {
               const nodes = Array.from(document.querySelectorAll('button,span,a'));
-              const el = nodes.find((x) => /Search|查询/i.test(x.textContent || ''));
+              const el = nodes.find((x) => /Search|Query|查询|搜索/i.test(x.textContent || ''));
               if (!el) return false;
               el.click();
               return true;
@@ -238,7 +277,7 @@ class GspStatusChecker:
     def _extract_status(self, page: Page, pla_no: str) -> dict[str, Any]:
         try:
             page.locator(f"text={pla_no}").first.wait_for(timeout=15000)
-        except PlaywrightTimeoutError:
+        except playwright_timeout_error():
             pass
 
         result = page.evaluate(
@@ -246,22 +285,51 @@ class GspStatusChecker:
             (plaNo) => {
               const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
               const normalize = (s) => clean(s).toLowerCase();
-              const tableEls = Array.from(document.querySelectorAll('table'));
-              for (const table of tableEls) {
-                const headerCells = Array.from(table.querySelectorAll('thead th, thead td, tr:first-child th, tr:first-child td'));
+              const statusHeader = (x) => {
+                const n = normalize(x);
+                return n === 'status' || n.includes('status') || clean(x).includes('状态');
+              };
+              const statusValue = (x) => {
+                const text = clean(x);
+                const match = text.match(/(Approved|Unapproved|Rejected|Pending|Draft|Submitted|Submit|Processing|Completed|Closed|Canceled|Cancelled|In Approval|审批中|未审批|已审批|审批通过|已批准|驳回|待处理|待审批|草稿|已提交|进行中|已完成|已关闭|已取消)/i);
+                return match ? match[0] : '';
+              };
+              const readRows = (root, rowSelector, cellSelector, headerSelector) => {
+                const headerCells = Array.from(root.querySelectorAll(headerSelector));
                 const headers = headerCells.map((x) => clean(x.textContent));
-                let statusIndex = headers.findIndex((x) => normalize(x) === 'status' || x.includes('状态'));
-                const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                const statusIndex = headers.findIndex(statusHeader);
+                const rows = Array.from(root.querySelectorAll(rowSelector));
                 for (const row of rows) {
                   const text = clean(row.textContent);
                   if (!text.includes(plaNo)) continue;
-                  const cells = Array.from(row.querySelectorAll('td,th')).map((x) => clean(x.textContent));
+                  const cells = Array.from(row.querySelectorAll(cellSelector)).map((x) => clean(x.textContent));
                   let status = '';
                   if (statusIndex >= 0 && statusIndex < cells.length) status = cells[statusIndex];
-                  if (!status) {
-                    status = cells.find((x) => /Approved|Unapproved|Rejected|Pending|Draft|Submit|审批|未审批|驳回|待/i.test(x)) || '';
-                  }
+                  if (!status) status = cells.map(statusValue).find(Boolean) || '';
                   return { found: true, status, headers, cells, rowText: text };
+                }
+                return null;
+              };
+              const tableEls = Array.from(document.querySelectorAll('table'));
+              for (const table of tableEls) {
+                const found = readRows(table, 'tbody tr, tr', 'td,th', 'thead th, thead td, tr:first-child th, tr:first-child td');
+                if (found) return found;
+              }
+              const grids = Array.from(document.querySelectorAll('[role="table"],[role="grid"],.ant-table,.el-table,.vxe-table'));
+              for (const grid of grids) {
+                const found = readRows(grid, '[role="row"],.ant-table-row,.el-table__row,.vxe-body--row', '[role="cell"],[role="gridcell"],td,th,.ant-table-cell,.el-table__cell,.vxe-body--column', '[role="columnheader"],th,.ant-table-thead .ant-table-cell,.el-table__header th,.vxe-header--column');
+                if (found) return found;
+              }
+              const plaNodes = Array.from(document.querySelectorAll('td,div,span,p')).filter((x) => clean(x.textContent).includes(plaNo));
+              for (const node of plaNodes) {
+                let cur = node;
+                for (let depth = 0; cur && depth < 8; depth += 1, cur = cur.parentElement) {
+                  const text = clean(cur.textContent);
+                  if (!text.includes(plaNo)) continue;
+                  const status = statusValue(text);
+                  if (status) {
+                    return { found: true, status, headers: [], cells: [], rowText: text };
+                  }
                 }
               }
               return { found: false, status: '', headers: [], cells: [], rowText: '' };
@@ -286,22 +354,234 @@ class GspStatusChecker:
         }
 
 
-def run_once(cfg: dict[str, Any]) -> None:
+class GspApiStatusChecker:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Content-Type": "application/json;charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+        )
+
+    def __enter__(self) -> "GspApiStatusChecker":
+        self._ensure_auth()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.session.close()
+
+    def login(self) -> dict[str, Any]:
+        username = str(self.cfg.get("gsp_username") or "").strip()
+        password = str(self.cfg.get("gsp_password") or "")
+        if not username or not password:
+            raise ValueError("gsp_username/gsp_password are required for API login")
+        resp = self.session.post(
+            self.cfg["gsp_base_url"] + "/dahua-b-usercenter/oauth/token",
+            params={
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+                "client_id": "client_1",
+                "client_secret": "B0123456!AbC",
+            },
+            timeout=30,
+        )
+        body = self._json_response(resp)
+        token = body.get("access_token")
+        if resp.status_code >= 400 or not token:
+            msg = body.get("error_description") or body.get("message") or body.get("msg") or body.get("error") or body
+            raise RuntimeError(f"GSP API login failed HTTP {resp.status_code}: {msg}")
+        auth = {
+            "access_token": token,
+            "refresh_token": body.get("refresh_token"),
+            "token_type": body.get("token_type") or "bearer",
+            "expires_in": body.get("expires_in"),
+            "saved_at": utc_now_iso(),
+        }
+        auth_path = Path(self.cfg["gsp_auth_path"])
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = auth_path.with_suffix(auth_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(auth, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(auth_path)
+        self._apply_auth(auth)
+        return {"ok": True, "auth_path": str(auth_path), "refresh_token_set": bool(auth.get("refresh_token"))}
+
+    def query_status(self, pla_no: str) -> dict[str, Any]:
+        pla_no = str(pla_no or "").strip()
+        if not pla_no:
+            return {"ok": False, "pla_no": pla_no, "status": "", "error": "empty PLA"}
+        try:
+            return self._query_status(pla_no)
+        except RuntimeError as err:
+            if "HTTP 401" not in str(err) and "unauthorized" not in str(err).lower():
+                raise
+            self.login()
+            return self._query_status(pla_no)
+
+    def _query_status(self, pla_no: str) -> dict[str, Any]:
+        checked_at = utc_now_iso()
+        last_body: Any = None
+        for country_code in self.cfg["gsp_country_codes"]:
+            payload = {
+                "pageNum": 1,
+                "pageSize": 10,
+                "countryCode": country_code,
+                "priceListApplicationId": pla_no,
+            }
+            resp = self.session.post(
+                self.cfg["gsp_base_url"] + "/dahua-b-pricing/priceListApplication/pageByEntity",
+                json=payload,
+                timeout=30,
+            )
+            body = self._json_response(resp)
+            last_body = body
+            if resp.status_code == 401:
+                raise RuntimeError(f"GSP status query failed HTTP 401: {body}")
+            if resp.status_code >= 400:
+                continue
+            records = self._records_from_body(body)
+            matched = [row for row in records if str(row.get("priceListApplicationId") or "").strip() == pla_no]
+            if matched:
+                row = matched[0]
+                detail_body = self._fetch_application_detail(pla_no)
+                app_detail = self._application_from_detail(detail_body) or {}
+                merged = dict(row)
+                merged.update({k: v for k, v in app_detail.items() if v not in (None, "")})
+                status = str(merged.get("status") or "UNKNOWN").strip() or "UNKNOWN"
+                current_step = str(merged.get("currentStep") or "").strip()
+                taskers = str(merged.get("taskers") or "").strip()
+                detail_parts = [
+                    str(merged.get("priceListApplicationId") or pla_no),
+                    str(merged.get("countryName") or country_code),
+                    str(merged.get("priceListType") or ""),
+                    str(merged.get("clientName") or ""),
+                ]
+                if current_step:
+                    detail_parts.append(f"current_step={current_step}")
+                if taskers:
+                    detail_parts.append(f"taskers={taskers}")
+                return {
+                    "ok": True,
+                    "pla_no": pla_no,
+                    "status": status,
+                    "detail": " | ".join([x for x in detail_parts if x]),
+                    "approval_current_step": current_step,
+                    "approval_taskers": taskers,
+                    "checked_at": checked_at,
+                    "raw": {
+                        "country_code": country_code,
+                        "record": row,
+                        "detail": detail_body,
+                    },
+                }
+        return {
+            "ok": False,
+            "pla_no": pla_no,
+            "status": "NOT_FOUND",
+            "detail": f"No GSP API row found in countries: {', '.join(self.cfg['gsp_country_codes'])}",
+            "checked_at": checked_at,
+            "raw": last_body,
+        }
+
+    def _ensure_auth(self) -> None:
+        auth_path = Path(self.cfg["gsp_auth_path"])
+        if auth_path.exists():
+            try:
+                auth = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+                if auth.get("access_token"):
+                    self._apply_auth(auth)
+                    return
+            except Exception:
+                pass
+        self.login()
+
+    def _fetch_application_detail(self, pla_no: str) -> dict[str, Any]:
+        resp = self.session.post(
+            self.cfg["gsp_base_url"] + "/dahua-b-pricing/priceListApplication/getApplicationDetailAndCategory",
+            json={"priceListApplicationId": pla_no},
+            timeout=30,
+        )
+        body = self._json_response(resp)
+        if resp.status_code == 401:
+            raise RuntimeError(f"GSP detail query failed HTTP 401: {body}")
+        if resp.status_code >= 400:
+            return {"http_status": resp.status_code, "body": body}
+        return body
+
+    def _application_from_detail(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        data = body.get("data")
+        if not isinstance(data, dict):
+            return None
+        app = data.get("priceListApplication")
+        return app if isinstance(app, dict) else None
+
+    def _apply_auth(self, auth: dict[str, Any]) -> None:
+        self.session.headers.update({"Authorization": "Bearer " + str(auth.get("access_token") or "")})
+        username = str(self.cfg.get("gsp_username") or "").strip()
+        if username:
+            self.session.headers.update({"apm-user-no": username})
+
+    def _json_response(self, resp: requests.Response) -> dict[str, Any]:
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text}
+        return body if isinstance(body, dict) else {"data": body}
+
+    def _records_from_body(self, body: dict[str, Any]) -> list[dict[str, Any]]:
+        data = body.get("data")
+        if isinstance(data, dict):
+            records = data.get("records") or data.get("list") or data.get("rows") or data.get("data") or []
+        elif isinstance(data, list):
+            records = data
+        else:
+            records = []
+        return [x for x in records if isinstance(x, dict)]
+
+
+def print_queue(tasks: list[dict[str, Any]]) -> None:
+    print(json.dumps({"event": "queue", "count": len(tasks)}, ensure_ascii=False))
+    for task in tasks:
+        print(
+            json.dumps(
+                {
+                    "event": "queue_item",
+                    "pla_no": task.get("pla_no"),
+                    "sheet": task.get("sheet"),
+                    "row_index": task.get("row_index"),
+                    "pn": task.get("pn"),
+                    "sheet_status": task.get("sheet_status"),
+                    "requester": task.get("requester"),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+
+def run_once(cfg: dict[str, Any], *, no_push: bool = False) -> None:
     tasks = fetch_queue(cfg)
     print(json.dumps({"event": "queue", "count": len(tasks)}, ensure_ascii=False))
     if not tasks:
         return
-    with GspStatusChecker(cfg) as checker:
+    checker_cls = GspApiStatusChecker if cfg.get("gsp_query_mode") == "api" else GspStatusChecker
+    with checker_cls(cfg) as checker:
         for task in tasks:
             pla_no = task.get("pla_no") or ""
             result = checker.query_status(pla_no)
-            saved = push_result(cfg, task, result)
+            if no_push or cfg.get("dry_run"):
+                saved = {"ok": True, "skipped": True, "reason": "dry_run/no_push"}
+            else:
+                saved = push_result(cfg, task, result)
             print(
                 json.dumps(
                     {
                         "event": "checked",
                         "pla_no": pla_no,
                         "status": result.get("status"),
+                        "approval_current_step": result.get("approval_current_step"),
+                        "approval_taskers": result.get("approval_taskers"),
                         "ok": result.get("ok"),
                         "saved": saved,
                     },
@@ -310,21 +590,57 @@ def run_once(cfg: dict[str, Any]) -> None:
             )
 
 
+def query_one_pla(cfg: dict[str, Any], pla_no: str) -> None:
+    checker_cls = GspApiStatusChecker if cfg.get("gsp_query_mode") == "api" else GspStatusChecker
+    with checker_cls(cfg) as checker:
+        result = checker.query_status(pla_no)
+        print(
+            json.dumps(
+                {
+                    "event": "pla_checked",
+                    "pla_no": pla_no,
+                    "status": result.get("status"),
+                    "approval_current_step": result.get("approval_current_step"),
+                    "approval_taskers": result.get("approval_taskers"),
+                    "ok": result.get("ok"),
+                    "detail": result.get("detail"),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--login", action="store_true")
+    parser.add_argument("--queue-only", action="store_true", help="fetch and print backend queue without opening GSP")
+    parser.add_argument("--no-push", action="store_true", help="query GSP but do not POST status results")
+    parser.add_argument("--max-tasks", type=int, default=None, help="override config max_tasks for this run")
+    parser.add_argument("--pla", default="", help="query one PLA directly without reading backend queue")
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
+    if args.max_tasks is not None:
+        cfg["max_tasks"] = max(1, min(500, int(args.max_tasks)))
     if args.login:
-        with GspStatusChecker(cfg, login_mode=True) as checker:
-            checker.login()
+        if cfg.get("gsp_query_mode") == "api":
+            with GspApiStatusChecker(cfg) as checker:
+                print(json.dumps({"event": "api_login", **checker.login()}, ensure_ascii=False))
+        else:
+            with GspStatusChecker(cfg, login_mode=True) as checker:
+                checker.login()
+        return 0
+    if args.queue_only:
+        print_queue(fetch_queue(cfg))
+        return 0
+    if args.pla:
+        query_one_pla(cfg, args.pla)
         return 0
 
     while True:
-        run_once(cfg)
+        run_once(cfg, no_push=bool(args.no_push))
         if args.once or cfg["poll_interval_seconds"] <= 0:
             return 0
         time.sleep(cfg["poll_interval_seconds"])

@@ -25,6 +25,8 @@ from backend.app.agent_ops import (
     AgentGspStatusResultReq,
     AgentNotifyTestReq,
     AgentPricingTaskReq,
+    AgentSheetStatusUpdateAckReq,
+    AgentSheetStatusUpdatesReq,
     AgentSheetProbeReq,
     AgentSheetPushReq,
 )
@@ -1149,6 +1151,38 @@ def agent_gsp_status_queue(req: AgentGspQueueReq) -> Dict[str, Any]:
 @app.post("/api/agent/gsp/status-result")
 def agent_gsp_status_result(req: AgentGspStatusResultReq) -> Dict[str, Any]:
     return _require_agent().save_gsp_status_result(req)
+
+
+@app.options("/api/agent/sheet/status-updates/pending")
+def agent_sheet_status_updates_pending_options(request: Request, response: Response) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return {"ok": True}
+
+
+@app.post("/api/agent/sheet/status-updates/pending")
+def agent_sheet_status_updates_pending(
+    req: AgentSheetStatusUpdatesReq,
+    request: Request,
+    response: Response,
+) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return _require_agent().sheet_status_updates(req)
+
+
+@app.options("/api/agent/sheet/status-updates/ack")
+def agent_sheet_status_updates_ack_options(request: Request, response: Response) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return {"ok": True}
+
+
+@app.post("/api/agent/sheet/status-updates/ack")
+def agent_sheet_status_updates_ack(
+    req: AgentSheetStatusUpdateAckReq,
+    request: Request,
+    response: Response,
+) -> Dict[str, Any]:
+    _agent_sheet_push_cors(request, response)
+    return _require_agent().ack_sheet_status_updates(req)
 
 
 @app.get("/api/agent/tasks/{task_id}/download")

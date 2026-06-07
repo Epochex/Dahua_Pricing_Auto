@@ -79,11 +79,27 @@ class AgentGspStatusResultReq(BaseModel):
     row_index: Optional[int] = Field(default=None)
     pn: Optional[str] = Field(default=None)
     requester: Optional[str] = Field(default=None)
+    sheet_status: Optional[str] = Field(default=None)
+    approval_current_step: Optional[str] = Field(default=None)
+    approval_taskers: Optional[str] = Field(default=None)
     checked_at: Optional[str] = Field(default=None)
     source: str = Field(default="windows-desktop-agent")
     detail: Optional[str] = Field(default=None)
     error: Optional[str] = Field(default=None)
     raw: Any = Field(default=None)
+
+
+class AgentSheetStatusUpdatesReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class AgentSheetStatusUpdateAckReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    update_ids: List[str] = Field(default_factory=list)
+    ok: bool = Field(default=True)
+    error: Optional[str] = Field(default=None)
+    applied_by: str = Field(default="alidocs-script")
 
 
 ComputeRows = Callable[[List[str], bool], Dict[str, Any]]
@@ -98,6 +114,7 @@ class AgentAutomation:
         self.sheet_push_dir = self.agent_dir / "sheet_push"
         self.sheet_parsed_dir = self.agent_dir / "sheet_parsed"
         self.gsp_status_dir = self.agent_dir / "gsp_status"
+        self.sheet_update_dir = self.agent_dir / "sheet_updates"
         self.config_path = self.agent_dir / "config.json"
         self.state_path = self.agent_dir / "state.json"
         self._poller_thread: Optional[threading.Thread] = None
@@ -111,6 +128,7 @@ class AgentAutomation:
         self.sheet_push_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_parsed_dir.mkdir(parents=True, exist_ok=True)
         self.gsp_status_dir.mkdir(parents=True, exist_ok=True)
+        self.sheet_update_dir.mkdir(parents=True, exist_ok=True)
         if not self.config_path.exists():
             self._write_json(self.config_path, self._default_config())
         if not self.state_path.exists():
@@ -387,6 +405,7 @@ class AgentAutomation:
         with jsonl_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+        sheet_update = self._maybe_queue_sheet_status_update(payload)
         self._update_state(
             {
                 "last_gsp_status_result": {
@@ -394,13 +413,165 @@ class AgentAutomation:
                     "pla_no": payload["pla_no"],
                     "status": payload["status"],
                     "ok": bool(payload.get("ok")),
+                    "sheet_update": sheet_update,
                     "received_at": payload["received_at"],
                     "path": str(result_file),
                 },
                 "last_error": None,
             }
         )
-        return {"ok": True, "result_id": result_id, "path": str(result_file)}
+        return {"ok": True, "result_id": result_id, "path": str(result_file), "sheet_update": sheet_update}
+
+    def sheet_status_updates(self, req: AgentSheetStatusUpdatesReq) -> Dict[str, Any]:
+        self._check_desktop_agent_token(req.token)
+        updates = self._read_sheet_updates()
+        pending = [u for u in updates if self._safe_text(u.get("state")) == "pending"]
+        pending.sort(key=lambda u: self._safe_text(u.get("created_at")))
+        return {
+            "ok": True,
+            "generated_at": utc_now_iso(),
+            "count": min(len(pending), int(req.limit)),
+            "updates": pending[: int(req.limit)],
+        }
+
+    def ack_sheet_status_updates(self, req: AgentSheetStatusUpdateAckReq) -> Dict[str, Any]:
+        self._check_desktop_agent_token(req.token)
+        ids = {self._safe_text(x) for x in req.update_ids if self._safe_text(x)}
+        if not ids:
+            raise HTTPException(status_code=400, detail="update_ids is empty")
+        now = utc_now_iso()
+        updates = self._read_sheet_updates()
+        acked = 0
+        with self._lock:
+            for update in updates:
+                if self._safe_text(update.get("update_id")) not in ids:
+                    continue
+                update["state"] = "applied" if bool(req.ok) else "failed"
+                update["acked_at"] = now
+                update["applied_by"] = self._safe_text(req.applied_by) or "alidocs-script"
+                update["ack_error"] = self._safe_text(req.error)
+                acked += 1
+            self._write_sheet_updates(updates)
+        return {"ok": True, "acked": acked, "state": "applied" if bool(req.ok) else "failed"}
+
+    def _maybe_queue_sheet_status_update(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(payload.get("ok")):
+            return {"queued": False, "reason": "gsp query failed"}
+        if not self._is_approved_gsp_status(payload.get("status")):
+            return {"queued": False, "reason": "gsp status is not approved"}
+
+        sheet = self._safe_text(payload.get("sheet"))
+        row_index = payload.get("row_index")
+        pla_no = self._safe_text(payload.get("pla_no"))
+        if not sheet or not row_index or not pla_no:
+            return {"queued": False, "reason": "sheet, row_index, or pla_no missing"}
+
+        latest_task = self._find_latest_sheet_task(sheet, int(row_index), pla_no)
+        old_status = self._safe_text(payload.get("sheet_status")) or self._safe_text(
+            (latest_task or {}).get("status")
+        )
+        if self._is_completed_status_text(old_status):
+            return {"queued": False, "reason": "sheet row is already completed"}
+
+        dedupe_src = f"{sheet}|{row_index}|{pla_no}|L|已完成"
+        update_id = hashlib.sha1(dedupe_src.encode("utf-8")).hexdigest()[:16]
+        now = utc_now_iso()
+        record = {
+            "update_id": update_id,
+            "state": "pending",
+            "created_at": now,
+            "sheet": sheet,
+            "row_index": int(row_index),
+            "col": "L",
+            "cell": f"L{int(row_index)}",
+            "pla_no": pla_no,
+            "old_status": old_status,
+            "new_status": "已完成",
+            "gsp_status": self._safe_text(payload.get("status")),
+            "approval_current_step": self._safe_text(payload.get("approval_current_step")),
+            "approval_taskers": self._safe_text(payload.get("approval_taskers")),
+            "source_result_id": self._safe_text(payload.get("result_id")),
+        }
+        if latest_task:
+            record["pn"] = latest_task.get("pn")
+            record["requester"] = latest_task.get("requester")
+
+        with self._lock:
+            updates = self._read_sheet_updates()
+            for existing in updates:
+                if self._safe_text(existing.get("update_id")) == update_id:
+                    if self._safe_text(existing.get("state")) == "pending":
+                        return {"queued": False, "reason": "update already pending", "update_id": update_id}
+                    if self._safe_text(existing.get("state")) == "applied":
+                        return {"queued": False, "reason": "update already applied", "update_id": update_id}
+                    existing.clear()
+                    existing.update(record)
+                    self._write_sheet_updates(updates)
+                    return {
+                        "queued": True,
+                        "reason": "failed update requeued",
+                        "update_id": update_id,
+                        "cell": record["cell"],
+                        "new_status": record["new_status"],
+                    }
+            updates.append(record)
+            self._write_sheet_updates(updates)
+        return {"queued": True, "update_id": update_id, "cell": record["cell"], "new_status": record["new_status"]}
+
+    def _read_sheet_updates(self) -> list[Dict[str, Any]]:
+        self.ensure_dirs()
+        path = self.sheet_update_dir / "updates.json"
+        data = self._read_json(path, [])
+        return data if isinstance(data, list) else []
+
+    def _write_sheet_updates(self, updates: list[Dict[str, Any]]) -> None:
+        self.ensure_dirs()
+        path = self.sheet_update_dir / "updates.json"
+        self._write_json(path, updates)
+        pending = [u for u in updates if self._safe_text(u.get("state")) == "pending"]
+        self._write_json(self.sheet_update_dir / "pending.json", pending)
+
+    def _find_latest_sheet_task(self, sheet: str, row_index: int, pla_no: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = self.read_parsed_sheet_push("latest")
+        except Exception:
+            return None
+        for task in parsed.get("tasks") or []:
+            if self._safe_text(task.get("sheet")) != sheet:
+                continue
+            if int(task.get("row_index") or 0) != int(row_index):
+                continue
+            pla_numbers = [self._safe_text(x) for x in (task.get("pla_numbers") or [])]
+            if pla_no in pla_numbers or self._safe_text(task.get("pla_no")) == pla_no:
+                return task
+        return None
+
+    def _is_approved_gsp_status(self, value: Any) -> bool:
+        text = self._safe_text(value).strip().lower()
+        compact = re.sub(r"[\s_\-]+", "", text)
+        if compact in {"approved", "approve"}:
+            return True
+        return any(x in text for x in ("审批通过", "已批准", "已审批", "審批通過"))
+
+    def _is_completed_status_text(self, value: Any) -> bool:
+        text = self._safe_text(value).strip().lower()
+        if not text:
+            return False
+        compact = re.sub(r"[\s_\-]+", "", text)
+        return any(
+            x in compact
+            for x in (
+                "已完成",
+                "完成",
+                "done",
+                "closed",
+                "complete",
+                "completed",
+                "finished",
+                "termine",
+                "terminé",
+            )
+        )
 
     def _check_desktop_agent_token(self, token: Optional[str]) -> None:
         expected_token = self._sheet_push_token()
@@ -1036,7 +1207,7 @@ class AgentAutomation:
         return "pending"
 
     def _is_completed_task(self, task: Dict[str, Any]) -> bool:
-        return task.get("normalized_status") == "completed"
+        return task.get("normalized_status") == "completed" or self._is_completed_status_text(task.get("status"))
 
     def _is_blocked_task(self, task: Dict[str, Any]) -> bool:
         return task.get("normalized_status") == "blocked"
