@@ -107,6 +107,11 @@ code_description_server.txt
 .env
 .env.*
 !.env.example
+desktop_agent/config.json
+desktop_agent/edge-profile/
+desktop_agent/screenshots/
+desktop_agent/*.trace.zip
+desktop_agent/playwright-report/
 
 # 私钥 / 凭据（不要提交）
 *.pem

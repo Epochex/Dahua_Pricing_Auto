@@ -2449,6 +2449,290 @@ function AdminConsole() {
 }
 
 /* =========================
+ * Agent automation
+ * ========================= */
+
+function cleanPnLines(text) {
+  const seen = new Set();
+  const out = [];
+  String(text || "")
+    .split(/[\n,;\t]+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .forEach((x) => {
+      if (seen.has(x)) return;
+      seen.add(x);
+      out.push(x);
+    });
+  return out;
+}
+
+function AgentConsole() {
+  const [cfg, setCfg] = useState(null);
+  const [state, setState] = useState(null);
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookSecret, setWebhookSecret] = useState("");
+  const [message, setMessage] = useState("测试消息：自动化系统已接入当前服务器");
+  const [probeResult, setProbeResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+
+  const loadAgent = async () => {
+    setErr("");
+    setLoading(true);
+    try {
+      const [c, s] = await Promise.all([
+        apiGetJson("/api/agent/config"),
+        apiGetJson("/api/agent/state"),
+      ]);
+      setCfg(c);
+      setState(s);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadAgent();
+  }, []);
+
+  const updateCfg = (patch) => {
+    setCfg((c) => ({ ...(c || {}), ...patch }));
+  };
+
+  const saveConfig = async () => {
+    if (!cfg) return;
+    setErr("");
+    setInfo("");
+    setSaving(true);
+    try {
+      const saved = await apiPutJson("/api/agent/config", {
+        enabled: Boolean(cfg.enabled),
+        mode: cfg.mode || "pricing_ops",
+        notification_keyword: cfg.notification_keyword || "定价Agent",
+        webhook_url: webhookUrl.trim() ? webhookUrl.trim() : null,
+        webhook_secret: webhookSecret.trim() ? webhookSecret.trim() : null,
+        notify_on_task_done: Boolean(cfg.notify_on_task_done),
+        notify_on_task_failed: Boolean(cfg.notify_on_task_failed),
+        poller_enabled: Boolean(cfg.poller_enabled),
+        poll_interval_seconds: Number(cfg.poll_interval_seconds || 60),
+        sheet_source_type: cfg.sheet_source_type || "file",
+        sheet_source_path: cfg.sheet_source_path || "",
+        apply_black_markup: Boolean(cfg.apply_black_markup),
+        dry_run: Boolean(cfg.dry_run),
+      });
+      setCfg(saved);
+      setWebhookUrl("");
+      setWebhookSecret("");
+      setInfo("AGENT CONFIG SAVED");
+      await loadAgent();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const testNotify = async () => {
+    setErr("");
+    setInfo("");
+    try {
+      const r = await apiPostJson("/api/agent/notify/test", { message });
+      setInfo(JSON.stringify(r, null, 2));
+    } catch (e) {
+      setErr(String(e.message || e));
+    }
+  };
+
+  const probeSheet = async () => {
+    setErr("");
+    setInfo("");
+    try {
+      const r = await apiPostJson("/api/agent/sheet/probe", {
+        source_path: cfg?.sheet_source_path || null,
+      });
+      setProbeResult(r);
+      setInfo(JSON.stringify(r, null, 2));
+      await loadAgent();
+    } catch (e) {
+      setErr(String(e.message || e));
+    }
+  };
+
+  const runPollOnce = async () => {
+    setErr("");
+    setInfo("");
+    try {
+      const r = await apiPostJson("/api/agent/poller/run-once", {});
+      setProbeResult(r);
+      setInfo(JSON.stringify(r, null, 2));
+      await loadAgent();
+    } catch (e) {
+      setErr(String(e.message || e));
+    }
+  };
+
+  return (
+    <div className="stack">
+      <Card
+        title="AGENT OPS · HERMES-READY AUTOMATION"
+        right={
+          <div className="row wrap">
+            {cfg ? <Badge status={cfg.enabled ? "ok" : "disabled"} /> : null}
+            <button className="btn" onClick={loadAgent} disabled={loading}>
+              RELOAD
+            </button>
+            <button className="btn primary" onClick={saveConfig} disabled={!cfg || saving}>
+              SAVE CONFIG
+            </button>
+          </div>
+        }
+      >
+        {err ? <div className="small err">{err}</div> : null}
+        {info ? <pre className="codebox">{info}</pre> : null}
+        {!cfg ? <div className="small">/api/agent/config</div> : null}
+        {cfg ? (
+          <div className="stack">
+            <div className="agentGrid">
+              <label className="batchCheck">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfg.enabled)}
+                  onChange={(e) => updateCfg({ enabled: e.target.checked })}
+                />
+                ENABLED
+              </label>
+              <label className="batchCheck">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfg.apply_black_markup)}
+                  onChange={(e) => updateCfg({ apply_black_markup: e.target.checked })}
+                />
+                VARIANT MARKUP
+              </label>
+              <label className="batchCheck">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfg.notify_on_task_done)}
+                  onChange={(e) => updateCfg({ notify_on_task_done: e.target.checked })}
+                />
+                NOTIFY DONE
+              </label>
+              <label className="batchCheck">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfg.poller_enabled)}
+                  onChange={(e) => updateCfg({ poller_enabled: e.target.checked })}
+                />
+                FILE POLLER
+              </label>
+            </div>
+
+            <div className="agentGrid two">
+              <div>
+                <div className="sectionTitle">KEYWORD</div>
+                <input
+                  className="input"
+                  value={cfg.notification_keyword || ""}
+                  onChange={(e) => updateCfg({ notification_keyword: e.target.value })}
+                />
+              </div>
+              <div>
+                <div className="sectionTitle">POLL INTERVAL SECONDS</div>
+                <input
+                  className="input mono"
+                  type="number"
+                  min="10"
+                  max="3600"
+                  value={cfg.poll_interval_seconds || 60}
+                  onChange={(e) => updateCfg({ poll_interval_seconds: e.target.value })}
+                />
+              </div>
+              <div>
+                <div className="sectionTitle">NEW WEBHOOK URL</div>
+                <input
+                  className="input mono"
+                  value={webhookUrl}
+                  placeholder={cfg.has_webhook_url ? cfg.webhook_url || "configured" : "https://..."}
+                  onChange={(e) => setWebhookUrl(e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="sectionTitle">NEW WEBHOOK SECRET</div>
+                <input
+                  className="input mono"
+                  value={webhookSecret}
+                  placeholder={cfg.has_webhook_secret ? "configured" : "optional DingTalk sign secret"}
+                  onChange={(e) => setWebhookSecret(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="sectionTitle">SHEET SOURCE PATH</div>
+              <input
+                className="input mono"
+                value={cfg.sheet_source_path || ""}
+                placeholder="/data/dahua_pricing_runtime/agent/inbox/inquiry.xlsx"
+                onChange={(e) => updateCfg({ sheet_source_path: e.target.value })}
+              />
+            </div>
+
+            <details>
+              <summary>CONFIG / STATE</summary>
+              <div className="agentSplit">
+                <KV obj={cfg} />
+                <KV obj={state} />
+              </div>
+            </details>
+          </div>
+        ) : null}
+      </Card>
+
+      <Card
+        title="NOTIFICATION TEST"
+        right={
+          <button className="btn primary" onClick={testNotify} disabled={!cfg?.has_webhook_url}>
+            SEND TEST
+          </button>
+        }
+      >
+        <textarea
+          className="textarea mono short"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+        />
+      </Card>
+
+      <Card
+        title="SHEET PULL TEST"
+        right={
+          <div className="row wrap">
+            <button className="btn" onClick={runPollOnce}>
+              RUN POLLER ONCE
+            </button>
+            <button className="btn primary" onClick={probeSheet}>
+              PROBE SHEET
+            </button>
+          </div>
+        }
+      >
+        <div className="small">
+          This phase only checks whether the configured online/local sheet can be fetched and previewed.
+          It does not run pricing, export templates, or operate GSP.
+        </div>
+        <Hr />
+        {probeResult ? <pre className="codebox">{JSON.stringify(probeResult, null, 2)}</pre> : null}
+      </Card>
+    </div>
+  );
+}
+
+/* =========================
  * Meta
  * ========================= */
 
@@ -2537,6 +2821,12 @@ export default function App() {
             KEYWORD
           </button>
           <button
+            className={`tab ${tab === "agent" ? "active" : ""}`}
+            onClick={() => setTab("agent")}
+          >
+            AGENT
+          </button>
+          <button
             className={`tab ${tab === "meta" ? "active" : ""}`}
             onClick={() => setTab("meta")}
           >
@@ -2551,6 +2841,7 @@ export default function App() {
         {tab === "batch" ? <BatchExport /> : null}
         {tab === "rules" ? <AdminConsole /> : null}
         {tab === "keyword" ? <KeywordAdjustConsole /> : null}
+        {tab === "agent" ? <AgentConsole /> : null}
         {tab === "meta" ? <MetaPanel meta={meta} metaErr={metaErr} /> : null}
       </div>
     </div>
