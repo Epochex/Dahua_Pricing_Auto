@@ -324,6 +324,13 @@ Windows Agent 文件：
 Hermes 化实体已在后端落地：
 
 - `GET /api/agent/traces` / `GET /api/agent/traces/{run_id}`：查看每次业务触发、队列、GSP 回传和表格回写的执行轨迹
+- `GET /api/agent/events` / `GET /api/agent/events/{event_id}`：查看外部触发标准化后的业务事件账本
+- `GET /api/agent/sessions` / `GET /api/agent/sessions/{session_id}`：查看一次业务动作的会话对象和运行 lineage
+- `GET /api/agent/contexts` / `GET /api/agent/contexts/{context_id}`：查看执行前组装的上下文包，包括候选行、压缩记忆、策略和候选执行器
+- `GET /api/agent/skill-calls`：查看本次运行调用的技能版本、风险等级、前后置条件和 plan graph
+- `GET /api/agent/dispatches`：查看工具调度决策，包括候选执行器、选中执行器和选择理由
+- `GET /api/agent/observations`：查看工具执行后的结构化观察证据，例如 GSP 查询结果和表格写回 ACK
+- `GET /api/agent/memory-updates`：查看每次长期记忆更新的改前/改后压缩摘要
 - `GET /api/agent/memory/pla/{pla_no}`：查看单个 PLA 的 timeline memory 和 `compact_memory`
 - `GET /api/agent/skills` / `GET /api/agent/skills/{skill_name}`：查看当前可版本化业务技能、风险等级、前后置条件和 plan graph
 - `GET /api/agent/tool-backends` / `POST /api/agent/tool-backends/heartbeat`：查看和注册 Windows/GSP/Alidocs 等执行器能力，用于多 agent 动态切换

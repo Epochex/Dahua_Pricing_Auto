@@ -1129,6 +1129,56 @@ def agent_trace(run_id: str) -> Dict[str, Any]:
     return _require_agent().read_agent_trace(run_id)
 
 
+@app.get("/api/agent/events")
+def agent_events(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_business_events(limit=limit)
+
+
+@app.get("/api/agent/events/{event_id}")
+def agent_event(event_id: str) -> Dict[str, Any]:
+    return _require_agent().read_business_event(event_id)
+
+
+@app.get("/api/agent/sessions")
+def agent_sessions(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_agent_sessions(limit=limit)
+
+
+@app.get("/api/agent/sessions/{session_id}")
+def agent_session(session_id: str) -> Dict[str, Any]:
+    return _require_agent().read_agent_session(session_id)
+
+
+@app.get("/api/agent/contexts")
+def agent_contexts(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_context_packages(limit=limit)
+
+
+@app.get("/api/agent/contexts/{context_id}")
+def agent_context(context_id: str) -> Dict[str, Any]:
+    return _require_agent().read_context_package(context_id)
+
+
+@app.get("/api/agent/skill-calls")
+def agent_skill_calls(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_skill_calls(limit=limit)
+
+
+@app.get("/api/agent/dispatches")
+def agent_dispatches(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_dispatch_decisions(limit=limit)
+
+
+@app.get("/api/agent/observations")
+def agent_observations(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_observations(limit=limit)
+
+
+@app.get("/api/agent/memory-updates")
+def agent_memory_updates(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_memory_updates(limit=limit)
+
+
 @app.get("/api/agent/memory/pla/{pla_no}")
 def agent_pla_timeline(pla_no: str) -> Dict[str, Any]:
     return _require_agent().read_pla_timeline(pla_no)

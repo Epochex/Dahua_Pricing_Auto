@@ -49,14 +49,27 @@ class AgentHermesEntityTests(unittest.TestCase):
             self.assertEqual(queue["count"], 1)
             item = queue["tasks"][0]
             self.assertTrue(item["run_id"].startswith("run_"))
+            self.assertTrue(item["session_id"].startswith("ses_"))
+            self.assertTrue(item["context_id"].startswith("ctx_"))
+            self.assertTrue(item["skill_call_id"].startswith("skillcall_"))
+            self.assertTrue(item["dispatch_id"].startswith("dispatch_"))
             self.assertEqual(item["skill"]["name"], "check_gsp_approval_status")
             self.assertEqual(item["selected_tool_backend"]["capability"], "gsp.status_check")
+            self.assertEqual(agent.list_business_events()["count"], 1)
+            self.assertEqual(agent.list_agent_sessions()["count"], 1)
+            self.assertEqual(agent.list_context_packages()["count"], 1)
+            self.assertEqual(agent.list_skill_calls()["count"], 1)
+            self.assertEqual(agent.list_dispatch_decisions()["count"], 1)
 
             saved = agent.save_gsp_status_result(
                 AgentGspStatusResultReq(
                     token="token",
                     run_id=item["run_id"],
                     queue_id=item["queue_id"],
+                    session_id=item["session_id"],
+                    context_id=item["context_id"],
+                    skill_call_id=item["skill_call_id"],
+                    dispatch_id=item["dispatch_id"],
                     pla_no=item["pla_no"],
                     status="Approved",
                     ok=True,
@@ -68,10 +81,13 @@ class AgentHermesEntityTests(unittest.TestCase):
                 )
             )
             self.assertTrue(saved["sheet_update"]["queued"])
+            self.assertTrue(saved["observation_id"].startswith("obs_"))
+            self.assertEqual(agent.list_observations()["count"], 1)
 
             trace = agent.read_agent_trace(item["run_id"])
             self.assertEqual(trace["status"], "completed")
             self.assertTrue(any(s["name"] == "gsp_status_result" for s in trace["spans"]))
+            self.assertEqual(trace["metadata"]["context_id"], item["context_id"])
 
             timeline = agent.read_pla_timeline(item["pla_no"])
             self.assertEqual(timeline["pla_no"], item["pla_no"])
@@ -82,6 +98,7 @@ class AgentHermesEntityTests(unittest.TestCase):
             self.assertEqual(compact["latest_gsp_status"], "Approved")
             self.assertEqual(compact["writeback_state"], "pending")
             self.assertEqual(compact["approved_status_count"], 1)
+            self.assertGreaterEqual(agent.list_memory_updates()["count"], 3)
 
             evaluation = agent.run_replay_eval(AgentReplayEvalReq(token="token"))
             self.assertTrue(evaluation["ok"])
@@ -143,6 +160,9 @@ class AgentHermesEntityTests(unittest.TestCase):
             queue = agent.gsp_status_queue(AgentGspQueueReq(token="token", limit=1))
             item = queue["tasks"][0]
             self.assertEqual(item["selected_tool_backend"]["backend_id"], "win-gsp-01")
+            dispatch = agent.list_dispatch_decisions()["dispatches"][0]
+            self.assertEqual(dispatch["selected_backend"]["backend_id"], "win-gsp-01")
+            self.assertTrue(dispatch["candidate_backends"])
 
 
 if __name__ == "__main__":

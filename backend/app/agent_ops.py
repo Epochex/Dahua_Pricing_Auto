@@ -19,9 +19,6 @@ import pandas as pd
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from backend.engine.core.formatter import build_export_frames, write_export_xlsx
-from backend.engine.core.loader import parse_pn_list_file
-
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -74,6 +71,10 @@ class AgentGspStatusResultReq(BaseModel):
     token: Optional[str] = Field(default=None)
     run_id: Optional[str] = Field(default=None)
     queue_id: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(default=None)
+    context_id: Optional[str] = Field(default=None)
+    skill_call_id: Optional[str] = Field(default=None)
+    dispatch_id: Optional[str] = Field(default=None)
     pla_no: str = Field(default="")
     status: str = Field(default="")
     ok: bool = Field(default=True)
@@ -102,11 +103,6 @@ class AgentSheetStatusUpdateAckReq(BaseModel):
     ok: bool = Field(default=True)
     error: Optional[str] = Field(default=None)
     applied_by: str = Field(default="alidocs-script")
-
-
-class AgentDingtalkEventReq(BaseModel):
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    source: str = Field(default="hermes")
 
 
 class AgentReplayEvalReq(BaseModel):
@@ -139,6 +135,13 @@ class AgentAutomation:
         self.gsp_status_dir = self.agent_dir / "gsp_status"
         self.sheet_update_dir = self.agent_dir / "sheet_updates"
         self.trace_dir = self.agent_dir / "traces"
+        self.event_dir = self.agent_dir / "events"
+        self.session_dir = self.agent_dir / "sessions"
+        self.context_dir = self.agent_dir / "contexts"
+        self.skill_call_dir = self.agent_dir / "skill_calls"
+        self.dispatch_dir = self.agent_dir / "dispatches"
+        self.observation_dir = self.agent_dir / "observations"
+        self.memory_update_dir = self.agent_dir / "memory_updates"
         self.memory_dir = self.agent_dir / "memory"
         self.skill_dir = self.agent_dir / "skills"
         self.tool_backend_dir = self.agent_dir / "tool_backends"
@@ -159,6 +162,13 @@ class AgentAutomation:
         self.gsp_status_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_update_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self.event_dir.mkdir(parents=True, exist_ok=True)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.context_dir.mkdir(parents=True, exist_ok=True)
+        self.skill_call_dir.mkdir(parents=True, exist_ok=True)
+        self.dispatch_dir.mkdir(parents=True, exist_ok=True)
+        self.observation_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_update_dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         (self.memory_dir / "pla").mkdir(parents=True, exist_ok=True)
         self.skill_dir.mkdir(parents=True, exist_ok=True)
@@ -225,6 +235,312 @@ class AgentAutomation:
             if len(out) >= int(limit):
                 break
         return out
+
+    def _record_entity(
+        self,
+        directory: Path,
+        *,
+        id_field: str,
+        prefix: str,
+        payload: Dict[str, Any],
+        id_parts: Optional[list[Any]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_dirs()
+        now = utc_now_iso()
+        record = dict(payload)
+        entity_id = self._safe_text(record.get(id_field))
+        if not entity_id:
+            entity_id = self._make_id(prefix, *(id_parts or [now, uuid.uuid4().hex]))
+        record[id_field] = entity_id
+        record.setdefault("created_at", now)
+        record["updated_at"] = now
+        self._write_json(directory / f"{self._safe_id(entity_id)}.json", record)
+        return record
+
+    def _read_entity(self, directory: Path, entity_id: str, *, label: str) -> Dict[str, Any]:
+        self.ensure_dirs()
+        path = directory / f"{self._safe_id(entity_id)}.json"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"{label} not found")
+        return self._read_json(path, {})
+
+    def _update_trace_metadata(self, run_id: Optional[str], patch: Dict[str, Any]) -> None:
+        if not run_id:
+            return
+        path = self._trace_path(run_id)
+        trace = self._read_json(path, {})
+        if not isinstance(trace, dict) or not trace:
+            return
+        meta = trace.get("metadata") if isinstance(trace.get("metadata"), dict) else {}
+        meta.update(patch)
+        trace["metadata"] = meta
+        trace["updated_at"] = utc_now_iso()
+        self._write_json(path, trace)
+
+    def _record_business_event(
+        self,
+        *,
+        source: str,
+        event_type: str,
+        source_ref: Optional[str] = None,
+        intent: Optional[str] = None,
+        summary: Optional[Dict[str, Any]] = None,
+        payload: Any = None,
+        event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        safe_source = self._safe_text(source) or "unknown"
+        safe_type = self._safe_text(event_type) or "business_event"
+        payload_preview = payload
+        if isinstance(payload_preview, str):
+            payload_preview = payload_preview[:2000]
+        return self._record_entity(
+            self.event_dir,
+            id_field="event_id",
+            prefix="evt",
+            id_parts=[safe_source, safe_type, source_ref, json.dumps(summary or {}, sort_keys=True, default=str)],
+            payload={
+                "event_id": event_id,
+                "source": safe_source,
+                "event_type": safe_type,
+                "source_ref": self._safe_text(source_ref),
+                "intent": self._safe_text(intent),
+                "summary": summary or {},
+                "payload_preview": payload_preview,
+                "received_at": utc_now_iso(),
+            },
+        )
+
+    def _start_agent_session(
+        self,
+        *,
+        event: Dict[str, Any],
+        session_type: str,
+        intent: str,
+        run_id: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event_id = self._safe_text(event.get("event_id"))
+        safe_type = self._safe_text(session_type) or "agent_session"
+        session = self._record_entity(
+            self.session_dir,
+            id_field="session_id",
+            prefix="ses",
+            id_parts=[event_id, safe_type, intent, run_id, utc_now_iso()],
+            payload={
+                "session_type": safe_type,
+                "intent": self._safe_text(intent),
+                "status": "running",
+                "event_id": event_id,
+                "run_ids": [run_id] if run_id else [],
+                "metadata": metadata or {},
+                "started_at": utc_now_iso(),
+                "ended_at": None,
+            },
+        )
+        self._update_trace_metadata(run_id, {"event_id": event_id, "session_id": session.get("session_id")})
+        return session
+
+    def _finish_agent_session(
+        self,
+        session_id: Optional[str],
+        *,
+        status: str,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sid = self._safe_text(session_id)
+        if not sid:
+            return
+        path = self.session_dir / f"{self._safe_id(sid)}.json"
+        session = self._read_json(path, {})
+        if not isinstance(session, dict) or not session:
+            return
+        session["status"] = self._safe_text(status) or "completed"
+        session["ended_at"] = utc_now_iso()
+        session["updated_at"] = session["ended_at"]
+        if summary:
+            session["summary"] = summary
+        self._write_json(path, session)
+
+    def _patch_agent_session(
+        self,
+        session_id: Optional[str],
+        *,
+        status: Optional[str] = None,
+        patch: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sid = self._safe_text(session_id)
+        if not sid:
+            return
+        path = self.session_dir / f"{self._safe_id(sid)}.json"
+        session = self._read_json(path, {})
+        if not isinstance(session, dict) or not session:
+            return
+        if status:
+            session["status"] = self._safe_text(status)
+        if patch:
+            meta = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+            meta.update(patch)
+            session["metadata"] = meta
+        session["updated_at"] = utc_now_iso()
+        self._write_json(path, session)
+
+    def _record_context_package(
+        self,
+        *,
+        run_id: str,
+        session_id: Optional[str],
+        event_id: Optional[str],
+        intent: str,
+        trigger_summary: Dict[str, Any],
+        target_scope: Dict[str, Any],
+        candidate_tasks: list[Dict[str, Any]],
+        skill: Dict[str, Any],
+        tool_backends: list[Dict[str, Any]],
+        policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._record_entity(
+            self.context_dir,
+            id_field="context_id",
+            prefix="ctx",
+            id_parts=[run_id, intent, json.dumps(target_scope, sort_keys=True, default=str)],
+            payload={
+                "run_id": run_id,
+                "session_id": self._safe_text(session_id),
+                "event_id": self._safe_text(event_id),
+                "intent": self._safe_text(intent),
+                "trigger_summary": trigger_summary,
+                "target_scope": target_scope,
+                "candidate_tasks": candidate_tasks,
+                "skill": skill,
+                "tool_backends": tool_backends,
+                "policy": policy,
+            },
+        )
+
+    def _record_skill_call(
+        self,
+        *,
+        run_id: str,
+        session_id: Optional[str],
+        context_id: Optional[str],
+        skill_name: str,
+        skill: Dict[str, Any],
+        status: str = "planned",
+    ) -> Dict[str, Any]:
+        full_skill = self._read_json(self.skill_dir / f"{self._safe_id(skill_name)}.json", {})
+        versions = full_skill.get("versions") if isinstance(full_skill.get("versions"), list) else []
+        active = int(full_skill.get("active_version") or skill.get("active_version") or 1)
+        version = next((v for v in versions if int(v.get("version") or 0) == active), {})
+        return self._record_entity(
+            self.skill_call_dir,
+            id_field="skill_call_id",
+            prefix="skillcall",
+            id_parts=[run_id, skill_name, active],
+            payload={
+                "run_id": run_id,
+                "session_id": self._safe_text(session_id),
+                "context_id": self._safe_text(context_id),
+                "skill": skill,
+                "skill_name": self._safe_text(skill_name),
+                "skill_version": active,
+                "status": self._safe_text(status) or "planned",
+                "risk_level": self._safe_text(version.get("risk_level")),
+                "allowed_tools": version.get("allowed_tools") or [],
+                "preconditions": version.get("preconditions") or [],
+                "postconditions": version.get("postconditions") or [],
+                "eval_criteria": version.get("eval_criteria") or [],
+                "plan_graph": version.get("plan_graph") or [],
+            },
+        )
+
+    def _record_dispatch_decision(
+        self,
+        *,
+        run_id: str,
+        session_id: Optional[str],
+        context_id: Optional[str],
+        skill_call_id: Optional[str],
+        capability: str,
+        selected_backend: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidates = selected_backend.get("candidates") if isinstance(selected_backend.get("candidates"), list) else []
+        selected_id = self._safe_text(selected_backend.get("backend_id"))
+        reason = selected_backend.get("reason")
+        if not reason:
+            reason = "selected by capability and freshness-adjusted load" if selected_id else "no eligible backend"
+        return self._record_entity(
+            self.dispatch_dir,
+            id_field="dispatch_id",
+            prefix="dispatch",
+            id_parts=[run_id, capability, selected_id, json.dumps(candidates, sort_keys=True, default=str)],
+            payload={
+                "run_id": run_id,
+                "session_id": self._safe_text(session_id),
+                "context_id": self._safe_text(context_id),
+                "skill_call_id": self._safe_text(skill_call_id),
+                "capability": self._safe_text(capability),
+                "selected_backend": {k: v for k, v in selected_backend.items() if k != "candidates"},
+                "candidate_backends": candidates,
+                "reason": reason,
+            },
+        )
+
+    def _record_observation(
+        self,
+        *,
+        run_id: Optional[str],
+        observation_type: str,
+        source: str,
+        subject: Dict[str, Any],
+        ok: bool,
+        raw_status: Optional[str] = None,
+        normalized_status: Optional[str] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._record_entity(
+            self.observation_dir,
+            id_field="observation_id",
+            prefix="obs",
+            id_parts=[run_id, observation_type, source, json.dumps(subject, sort_keys=True, default=str), raw_status, error],
+            payload={
+                "run_id": self._safe_text(run_id),
+                "observation_type": self._safe_text(observation_type),
+                "source": self._safe_text(source),
+                "subject": subject,
+                "ok": bool(ok),
+                "raw_status": self._safe_text(raw_status),
+                "normalized_status": self._safe_text(normalized_status),
+                "evidence": evidence or {},
+                "error": self._safe_text(error),
+                "observed_at": utc_now_iso(),
+            },
+        )
+
+    def _record_memory_update(
+        self,
+        *,
+        run_id: Optional[str],
+        memory_type: str,
+        subject: Dict[str, Any],
+        event_type: str,
+        before: Optional[Dict[str, Any]],
+        after: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._record_entity(
+            self.memory_update_dir,
+            id_field="memory_update_id",
+            prefix="memupd",
+            id_parts=[run_id, memory_type, json.dumps(subject, sort_keys=True, default=str), event_type, utc_now_iso()],
+            payload={
+                "run_id": self._safe_text(run_id),
+                "memory_type": self._safe_text(memory_type),
+                "subject": subject,
+                "event_type": self._safe_text(event_type),
+                "before": before or {},
+                "after": after,
+            },
+        )
 
     def _make_id(self, prefix: str, *parts: Any) -> str:
         raw = "|".join(self._safe_text(x) for x in parts if self._safe_text(x))
@@ -600,6 +916,7 @@ class AgentAutomation:
                 "reflections": [],
                 "runs": [],
             }
+        before_compact = dict(timeline.get("compact_memory") or {})
         timeline["last_seen"] = now
         if run_id:
             runs = timeline.get("runs") if isinstance(timeline.get("runs"), list) else []
@@ -619,6 +936,14 @@ class AgentAutomation:
         timeline[bucket] = values[-200:]
         timeline["compact_memory"] = self._compact_pla_timeline(timeline)
         self._write_json(path, timeline)
+        self._record_memory_update(
+            run_id=run_id,
+            memory_type="pla_timeline",
+            subject={"pla_no": pla},
+            event_type=event_type,
+            before=before_compact,
+            after=timeline.get("compact_memory") or {},
+        )
         return timeline
 
     def _compact_pla_timeline(self, timeline: Dict[str, Any]) -> Dict[str, Any]:
@@ -697,7 +1022,19 @@ class AgentAutomation:
                 "status": "missing",
                 "capability": cap,
                 "reason": "no backend advertises requested capability",
+                "candidates": [],
             }
+        compact_candidates = [
+            {
+                "backend_id": self._safe_text(c.get("backend_id")),
+                "display_name": self._safe_text(c.get("display_name")),
+                "status": self._safe_text(c.get("status")),
+                "load": c.get("load"),
+                "last_heartbeat_at": c.get("last_heartbeat_at"),
+                "selection_score": c.get("_selection_score"),
+            }
+            for c in candidates
+        ]
         chosen = sorted(
             candidates,
             key=lambda r: (
@@ -713,6 +1050,8 @@ class AgentAutomation:
             "load": chosen.get("load"),
             "last_heartbeat_at": chosen.get("last_heartbeat_at"),
             "selection_score": chosen.get("_selection_score"),
+            "reason": "selected by capability and freshness-adjusted load",
+            "candidates": compact_candidates,
         }
 
     def _create_reflection_candidate(
@@ -832,9 +1171,6 @@ class AgentAutomation:
     def _task_state_path(self, task_id: str) -> Path:
         return self.tasks_dir / task_id / "state.json"
 
-    def _write_task_state(self, task_id: str, state: Dict[str, Any]) -> None:
-        self._write_json(self._task_state_path(task_id), state)
-
     def read_config(self, *, redacted: bool = True) -> Dict[str, Any]:
         self.ensure_dirs()
         cfg = self._default_config()
@@ -892,6 +1228,43 @@ class AgentAutomation:
         if not path.exists():
             raise HTTPException(status_code=404, detail="agent trace not found")
         return self._read_json(path, {})
+
+    def list_business_events(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.event_dir, limit=limit)
+        return {"ok": True, "count": len(items), "events": items}
+
+    def read_business_event(self, event_id: str) -> Dict[str, Any]:
+        return self._read_entity(self.event_dir, event_id, label="business event")
+
+    def list_agent_sessions(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.session_dir, limit=limit)
+        return {"ok": True, "count": len(items), "sessions": items}
+
+    def read_agent_session(self, session_id: str) -> Dict[str, Any]:
+        return self._read_entity(self.session_dir, session_id, label="agent session")
+
+    def list_context_packages(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.context_dir, limit=limit)
+        return {"ok": True, "count": len(items), "contexts": items}
+
+    def read_context_package(self, context_id: str) -> Dict[str, Any]:
+        return self._read_entity(self.context_dir, context_id, label="context package")
+
+    def list_skill_calls(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.skill_call_dir, limit=limit)
+        return {"ok": True, "count": len(items), "skill_calls": items}
+
+    def list_dispatch_decisions(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.dispatch_dir, limit=limit)
+        return {"ok": True, "count": len(items), "dispatches": items}
+
+    def list_observations(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.observation_dir, limit=limit)
+        return {"ok": True, "count": len(items), "observations": items}
+
+    def list_memory_updates(self, limit: int = 50) -> Dict[str, Any]:
+        items = self._list_json_records(self.memory_update_dir, limit=limit)
+        return {"ok": True, "count": len(items), "memory_updates": items}
 
     def list_agent_reflections(self, limit: int = 50) -> Dict[str, Any]:
         self.ensure_dirs()
@@ -1083,12 +1456,26 @@ class AgentAutomation:
 
         text = self._extract_event_text(payload)
         command = self._parse_approval_command(text)
+        event = self._record_business_event(
+            source=source,
+            event_type="incoming_message",
+            source_ref=self._safe_text(payload.get("msgId") or payload.get("messageId") or payload.get("conversationId")),
+            intent="check_gsp_approval_status" if command.get("matched") else "",
+            summary={
+                "matched": bool(command.get("matched")),
+                "reason": command.get("reason"),
+                "sheet": command.get("sheet"),
+                "limit": command.get("limit"),
+            },
+            payload={"text": text[:2000], "raw_keys": sorted([str(k) for k in payload.keys()])},
+        )
         if not command.get("matched"):
             return {
                 "ok": True,
                 "matched": False,
                 "reason": command.get("reason") or "not a known command",
                 "source": source,
+                "event_id": event.get("event_id"),
                 "raw_text": text,
             }
 
@@ -1107,7 +1494,9 @@ class AgentAutomation:
                 token=token,
                 limit=int(command.get("limit") or 200),
                 sheet=command.get("sheet"),
-            )
+            ),
+            trigger_event=event,
+            session_type="chat_command",
         )
 
         event_record = {
@@ -1125,6 +1514,7 @@ class AgentAutomation:
             "ok": True,
             "matched": True,
             "source": source,
+            "event_id": event.get("event_id"),
             "command": command,
             "queue": queue,
             "event": event_record,
@@ -1255,49 +1645,6 @@ class AgentAutomation:
         _ = compute_rows
         raise HTTPException(status_code=403, detail="agent pricing task is disabled in sheet-probe phase")
 
-    def _create_pricing_task_disabled_archive(
-        self,
-        req: AgentPricingTaskReq,
-        compute_rows: ComputeRows,
-    ) -> Dict[str, Any]:
-        self.ensure_dirs()
-        cfg = self.read_config(redacted=False)
-        pns = self._clean_pns(req.pns)
-        if not pns:
-            raise HTTPException(status_code=400, detail="pns is empty")
-        apply_black_markup = (
-            bool(cfg.get("apply_black_markup", True))
-            if req.apply_black_markup is None
-            else bool(req.apply_black_markup)
-        )
-        task_id = uuid.uuid4().hex[:16]
-        task_dir = self.tasks_dir / task_id
-        out_dir = task_dir / "outputs"
-        state = {
-            "task_id": task_id,
-            "status": "queued",
-            "source": str(req.source or "manual"),
-            "created_at": utc_now_iso(),
-            "started_at": None,
-            "finished_at": None,
-            "pns": pns,
-            "apply_black_markup": apply_black_markup,
-            "notify": bool(req.notify),
-            "output_files": [],
-            "report": None,
-            "error": None,
-        }
-        self._write_task_state(task_id, state)
-        worker = threading.Thread(
-            target=self._run_pricing_task,
-            args=(task_id, out_dir, compute_rows),
-            daemon=True,
-            name=f"agent-pricing-task-{task_id}",
-        )
-        worker.start()
-        self._update_state({"last_task_id": task_id, "last_error": None})
-        return {"task_id": task_id, "status": "queued", "count": len(pns)}
-
     def read_task(self, task_id: str) -> Dict[str, Any]:
         path = self._task_state_path(task_id)
         if not path.exists():
@@ -1312,15 +1659,30 @@ class AgentAutomation:
             raise HTTPException(status_code=404, detail="parsed sheet push not found")
         return self._read_json(path, {})
 
-    def gsp_status_queue(self, req: AgentGspQueueReq) -> Dict[str, Any]:
+    def gsp_status_queue(
+        self,
+        req: AgentGspQueueReq,
+        *,
+        trigger_event: Optional[Dict[str, Any]] = None,
+        session_type: str = "approval_check",
+    ) -> Dict[str, Any]:
         self._check_desktop_agent_token(req.token)
         parsed = self.read_parsed_sheet_push("latest")
         skill = self._skill_version("check_gsp_approval_status")
+        event = trigger_event or self._record_business_event(
+            source="backend",
+            event_type="gsp_status_queue_request",
+            source_ref=parsed.get("push_id"),
+            intent="check_gsp_approval_status",
+            summary={"sheet": req.sheet, "limit": int(req.limit), "push_id": parsed.get("push_id")},
+            payload={},
+        )
         selected_backend = self._select_tool_backend("gsp.status_check")
         run_id = self._start_trace(
             source="backend-gsp-queue",
             intent="check_gsp_approval_status",
             metadata={
+                "event_id": event.get("event_id"),
                 "push_id": parsed.get("push_id"),
                 "sheet": req.sheet,
                 "limit": int(req.limit),
@@ -1328,10 +1690,18 @@ class AgentAutomation:
                 "selected_tool_backend": selected_backend,
             },
         )
+        session = self._start_agent_session(
+            event=event,
+            session_type=session_type,
+            intent="check_gsp_approval_status",
+            run_id=run_id,
+            metadata={"push_id": parsed.get("push_id"), "sheet": req.sheet, "limit": int(req.limit)},
+        )
         tasks = parsed.get("gsp_check_tasks") or []
         sheet_filter = self._safe_text(req.sheet)
         if sheet_filter:
             tasks = [t for t in tasks if self._safe_text(t.get("sheet")) == sheet_filter]
+        task_backend = {k: v for k, v in selected_backend.items() if k != "candidates"}
 
         queued: list[Dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
@@ -1347,8 +1717,9 @@ class AgentAutomation:
                     {
                         "queue_id": queue_id,
                         "run_id": run_id,
+                        "session_id": session.get("session_id"),
                         "skill": skill,
-                        "selected_tool_backend": selected_backend,
+                        "selected_tool_backend": task_backend,
                         "pla_no": pla,
                         "sheet": task.get("sheet"),
                         "row_index": task.get("row_index"),
@@ -1367,6 +1738,7 @@ class AgentAutomation:
                     "queue_selected",
                     event={
                         "queue_id": queue_id,
+                        "session_id": session.get("session_id"),
                         "sheet": task.get("sheet"),
                         "row_index": task.get("row_index"),
                         "pn": task.get("pn"),
@@ -1381,20 +1753,102 @@ class AgentAutomation:
             if len(queued) >= int(req.limit):
                 break
 
+        context_tasks: list[Dict[str, Any]] = []
+        for item in queued[: int(req.limit)]:
+            timeline = self._read_json(self._pla_timeline_path(self._safe_text(item.get("pla_no"))), {})
+            context_tasks.append(
+                {
+                    "queue_id": item.get("queue_id"),
+                    "sheet": item.get("sheet"),
+                    "row_index": item.get("row_index"),
+                    "pla_no": item.get("pla_no"),
+                    "pn": item.get("pn"),
+                    "requester": item.get("requester"),
+                    "sheet_status": item.get("sheet_status"),
+                    "compact_memory": (timeline.get("compact_memory") if isinstance(timeline, dict) else {}) or {},
+                }
+            )
+        context = self._record_context_package(
+            run_id=run_id,
+            session_id=session.get("session_id"),
+            event_id=event.get("event_id"),
+            intent="check_gsp_approval_status",
+            trigger_summary=event.get("summary") or {},
+            target_scope={"sheet": sheet_filter, "limit": int(req.limit), "source_push_id": parsed.get("push_id")},
+            candidate_tasks=context_tasks,
+            skill=skill,
+            tool_backends=selected_backend.get("candidates") or [],
+            policy={
+                "allow_gsp_query": True,
+                "allow_sheet_writeback": True,
+                "allow_group_notify": not bool(self.read_config(redacted=False).get("dry_run")),
+                "failure_to_reflection": True,
+            },
+        )
+        skill_call = self._record_skill_call(
+            run_id=run_id,
+            session_id=session.get("session_id"),
+            context_id=context.get("context_id"),
+            skill_name="check_gsp_approval_status",
+            skill=skill,
+        )
+        dispatch = self._record_dispatch_decision(
+            run_id=run_id,
+            session_id=session.get("session_id"),
+            context_id=context.get("context_id"),
+            skill_call_id=skill_call.get("skill_call_id"),
+            capability="gsp.status_check",
+            selected_backend=selected_backend,
+        )
+        for item in queued:
+            item["context_id"] = context.get("context_id")
+            item["skill_call_id"] = skill_call.get("skill_call_id")
+            item["dispatch_id"] = dispatch.get("dispatch_id")
+        self._patch_agent_session(
+            session.get("session_id"),
+            status="queued",
+            patch={
+                "context_id": context.get("context_id"),
+                "skill_call_id": skill_call.get("skill_call_id"),
+                "dispatch_id": dispatch.get("dispatch_id"),
+                "queued_count": len(queued),
+            },
+        )
+
         self._add_trace_span(
             run_id,
             "task_filter",
             metadata={
+                "event_id": event.get("event_id"),
+                "session_id": session.get("session_id"),
+                "context_id": context.get("context_id"),
+                "skill_call_id": skill_call.get("skill_call_id"),
+                "dispatch_id": dispatch.get("dispatch_id"),
                 "candidate_count": len(tasks),
                 "queued_count": len(queued),
                 "sheet_filter": sheet_filter,
                 "selected_tool_backend": selected_backend,
             },
         )
+        self._update_trace_metadata(
+            run_id,
+            {
+                "event_id": event.get("event_id"),
+                "session_id": session.get("session_id"),
+                "context_id": context.get("context_id"),
+                "skill_call_id": skill_call.get("skill_call_id"),
+                "dispatch_id": dispatch.get("dispatch_id"),
+            },
+        )
         self._finish_trace(run_id, status="queued", scores={"queued_count": len(queued)})
         return {
             "ok": True,
             "run_id": run_id,
+            "event_id": event.get("event_id"),
+            "session_id": session.get("session_id"),
+            "context_id": context.get("context_id"),
+            "skill_call_id": skill_call.get("skill_call_id"),
+            "dispatch_id": dispatch.get("dispatch_id"),
             "generated_at": utc_now_iso(),
             "source_push_id": parsed.get("push_id"),
             "summary": parsed.get("summary") or {},
@@ -1410,6 +1864,10 @@ class AgentAutomation:
         payload["status"] = self._safe_text(payload.get("status"))
         payload["run_id"] = self._safe_text(payload.get("run_id"))
         payload["queue_id"] = self._safe_text(payload.get("queue_id"))
+        payload["session_id"] = self._safe_text(payload.get("session_id"))
+        payload["context_id"] = self._safe_text(payload.get("context_id"))
+        payload["skill_call_id"] = self._safe_text(payload.get("skill_call_id"))
+        payload["dispatch_id"] = self._safe_text(payload.get("dispatch_id"))
         payload["received_at"] = utc_now_iso()
         if not payload["checked_at"]:
             payload["checked_at"] = payload["received_at"]
@@ -1427,6 +1885,13 @@ class AgentAutomation:
                     "recovered_trace": True,
                 },
             )
+        trace_meta: Dict[str, Any] = {}
+        if payload.get("run_id"):
+            trace = self._read_json(self._trace_path(payload["run_id"]), {})
+            trace_meta = trace.get("metadata") if isinstance(trace.get("metadata"), dict) else {}
+        for key in ("session_id", "context_id", "skill_call_id", "dispatch_id"):
+            if not payload.get(key):
+                payload[key] = self._safe_text(trace_meta.get(key))
 
         result_id_src = f"{payload['pla_no']}|{payload.get('sheet') or ''}|{payload.get('row_index') or ''}|{payload['received_at']}"
         result_id = hashlib.sha1(result_id_src.encode("utf-8")).hexdigest()[:16]
@@ -1440,11 +1905,35 @@ class AgentAutomation:
         with jsonl_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+        observation = self._record_observation(
+            run_id=payload.get("run_id"),
+            observation_type="gsp_status_result",
+            source=payload.get("source") or "windows-desktop-agent",
+            subject={
+                "pla_no": payload.get("pla_no"),
+                "sheet": payload.get("sheet"),
+                "row_index": payload.get("row_index"),
+                "queue_id": payload.get("queue_id"),
+            },
+            ok=bool(payload.get("ok")),
+            raw_status=payload.get("status"),
+            normalized_status="approved"
+            if self._is_approved_gsp_status(payload.get("status"))
+            else self._safe_text(payload.get("status")),
+            evidence={
+                "result_id": result_id,
+                "approval_current_step": payload.get("approval_current_step"),
+                "approval_taskers": payload.get("approval_taskers"),
+                "detail": payload.get("detail"),
+            },
+            error=payload.get("error"),
+        )
         sheet_update = self._maybe_queue_sheet_status_update(payload)
         self._update_state(
             {
                 "last_gsp_status_result": {
                     "result_id": result_id,
+                    "observation_id": observation.get("observation_id"),
                     "pla_no": payload["pla_no"],
                     "status": payload["status"],
                     "ok": bool(payload.get("ok")),
@@ -1460,6 +1949,7 @@ class AgentAutomation:
             "gsp_status_result",
             event={
                 "result_id": result_id,
+                "observation_id": observation.get("observation_id"),
                 "queue_id": payload.get("queue_id"),
                 "status": payload["status"],
                 "ok": bool(payload.get("ok")),
@@ -1479,9 +1969,19 @@ class AgentAutomation:
             status="ok" if bool(payload.get("ok")) else "failed",
             metadata={
                 "result_id": result_id,
+                "observation_id": observation.get("observation_id"),
                 "pla_no": payload["pla_no"],
                 "status": payload["status"],
                 "sheet_update": sheet_update,
+            },
+        )
+        self._patch_agent_session(
+            payload.get("session_id"),
+            status="observed",
+            patch={
+                "last_observation_id": observation.get("observation_id"),
+                "last_result_id": result_id,
+                "last_result_status": payload.get("status"),
             },
         )
         reflection = self._reflect_on_gsp_result(payload, sheet_update)
@@ -1499,6 +1999,11 @@ class AgentAutomation:
         return {
             "ok": True,
             "run_id": payload.get("run_id"),
+            "session_id": payload.get("session_id"),
+            "context_id": payload.get("context_id"),
+            "skill_call_id": payload.get("skill_call_id"),
+            "dispatch_id": payload.get("dispatch_id"),
+            "observation_id": observation.get("observation_id"),
             "result_id": result_id,
             "path": str(result_file),
             "sheet_update": sheet_update,
@@ -1556,6 +2061,36 @@ class AgentAutomation:
                         "cell": update.get("cell"),
                         "state": update["state"],
                         "error": update["ack_error"],
+                    },
+                )
+                run_id = self._safe_text(update.get("source_run_id"))
+                observation = self._record_observation(
+                    run_id=run_id,
+                    observation_type="sheet_writeback_ack",
+                    source=update["applied_by"],
+                    subject={
+                        "update_id": update.get("update_id"),
+                        "pla_no": update.get("pla_no"),
+                        "sheet": update.get("sheet"),
+                        "cell": update.get("cell"),
+                    },
+                    ok=bool(req.ok),
+                    raw_status=update["state"],
+                    normalized_status=update["state"],
+                    evidence={
+                        "new_status": update.get("new_status"),
+                        "acked_at": update.get("acked_at"),
+                    },
+                    error=update["ack_error"],
+                )
+                trace = self._read_json(self._trace_path(run_id), {}) if run_id else {}
+                trace_meta = trace.get("metadata") if isinstance(trace.get("metadata"), dict) else {}
+                self._patch_agent_session(
+                    self._safe_text(trace_meta.get("session_id")),
+                    status="writeback_observed",
+                    patch={
+                        "last_writeback_observation_id": observation.get("observation_id"),
+                        "last_writeback_state": update["state"],
                     },
                 )
                 acked += 1
@@ -1770,15 +2305,43 @@ class AgentAutomation:
 
         summary = self._summarize_push_payload(req.payload)
         parsed = self.parse_sheet_payload(req.payload, push_id=push_id, received_at=received_at)
+        event = self._record_business_event(
+            source=payload["source"],
+            event_type="sheet_push",
+            source_ref=push_id,
+            intent="sheet_push_ingest",
+            summary=summary,
+            payload={"push_id": push_id, "source": payload["source"]},
+        )
         run_id = self._start_trace(
             source=str(req.source or "alidocs-script"),
             intent="sheet_push_ingest",
-            metadata={"push_id": push_id, "summary": parsed.get("summary") or {}},
+            metadata={"event_id": event.get("event_id"), "push_id": push_id, "summary": parsed.get("summary") or {}},
+        )
+        session = self._start_agent_session(
+            event=event,
+            session_type="sheet_sync",
+            intent="sheet_push_ingest",
+            run_id=run_id,
+            metadata={"push_id": push_id, "source": payload["source"]},
+        )
+        observation = self._record_observation(
+            run_id=run_id,
+            observation_type="sheet_parse_result",
+            source=payload["source"],
+            subject={"push_id": push_id},
+            ok=True,
+            raw_status="parsed",
+            normalized_status="parsed",
+            evidence=parsed.get("summary") or {},
         )
         self._add_trace_span(
             run_id,
             "sheet_parse",
             metadata={
+                "event_id": event.get("event_id"),
+                "session_id": session.get("session_id"),
+                "observation_id": observation.get("observation_id"),
                 "sheet_count": (parsed.get("summary") or {}).get("sheet_count"),
                 "task_count": (parsed.get("summary") or {}).get("task_count"),
                 "gsp_check_count": (parsed.get("summary") or {}).get("gsp_check_count"),
@@ -1808,6 +2371,15 @@ class AgentAutomation:
                 "gsp_check_count": (parsed.get("summary") or {}).get("gsp_check_count", 0),
             },
         )
+        self._finish_agent_session(
+            session.get("session_id"),
+            status="completed",
+            summary={
+                "push_id": push_id,
+                "observation_id": observation.get("observation_id"),
+                "parsed_summary": parsed.get("summary") or {},
+            },
+        )
         parsed_file = self.sheet_parsed_dir / f"{push_id}.json"
         parsed_latest_file = self.sheet_parsed_dir / "latest.json"
         self._write_json(parsed_file, parsed)
@@ -1820,6 +2392,9 @@ class AgentAutomation:
             "source": payload["source"],
             "summary": summary,
             "run_id": run_id,
+            "event_id": event.get("event_id"),
+            "session_id": session.get("session_id"),
+            "observation_id": observation.get("observation_id"),
             "path": str(out_file),
             "parsed_path": str(parsed_file),
             "parsed_summary": parsed.get("summary"),
@@ -1916,37 +2491,6 @@ class AgentAutomation:
         _ = compute_rows
         return self.probe_sheet_source()
 
-    def _legacy_run_poll_once_with_pricing_disabled(self, compute_rows: ComputeRows) -> Dict[str, Any]:
-        self.ensure_dirs()
-        cfg = self.read_config(redacted=False)
-        self._update_state({"last_poll_at": utc_now_iso()})
-        source_path = str(cfg.get("sheet_source_path") or "").strip()
-        if not source_path:
-            return {"ok": True, "changed": False, "reason": "sheet_source_path is empty"}
-        path = Path(source_path)
-        if not path.exists() or not path.is_file():
-            msg = f"sheet_source_path not found: {source_path}"
-            self._update_state({"last_error": msg})
-            raise HTTPException(status_code=400, detail=msg)
-        digest = self._file_sha256(path)
-        state = self.read_state()
-        if state.get("last_source_hash") == digest:
-            return {"ok": True, "changed": False, "source_hash": digest}
-        pns = self._clean_pns(parse_pn_list_file(path))
-        self._update_state({"last_source_hash": digest, "last_error": None})
-        if not pns:
-            return {"ok": True, "changed": True, "source_hash": digest, "count": 0}
-        task = self.create_pricing_task(
-            AgentPricingTaskReq(
-                pns=pns,
-                source=f"poller:{path}",
-                notify=bool(cfg.get("notify_on_task_done", True)),
-                apply_black_markup=bool(cfg.get("apply_black_markup", True)),
-            ),
-            compute_rows,
-        )
-        return {"ok": True, "changed": True, "source_hash": digest, "count": len(pns), "task": task}
-
     def start_poller(self, compute_rows: ComputeRows) -> None:
         self.ensure_dirs()
         if self._poller_thread and self._poller_thread.is_alive():
@@ -1970,50 +2514,6 @@ class AgentAutomation:
                 except Exception as e:
                     self._update_state({"last_error": f"{type(e).__name__}: {e}"})
             self._poller_stop.wait(max(10, min(3600, interval)))
-
-    def _run_pricing_task(self, task_id: str, out_dir: Path, compute_rows: ComputeRows) -> None:
-        state = self.read_task(task_id)
-        try:
-            state["status"] = "running"
-            state["started_at"] = utc_now_iso()
-            self._write_task_state(task_id, state)
-
-            result = compute_rows(state["pns"], bool(state.get("apply_black_markup")))
-            rows = list(result.get("rows") or [])
-            frames = build_export_frames(rows)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_file = write_export_xlsx(frames, out_dir=out_dir, level="country")
-
-            report = dict(result.get("report") or {})
-            report.setdefault("count_total", len(rows))
-            report.setdefault("count_not_found", len(report.get("not_found") or []))
-            report["output_file"] = str(out_file)
-
-            state["status"] = "done"
-            state["finished_at"] = utc_now_iso()
-            state["output_files"] = [str(out_file)]
-            state["report"] = report
-            state["error"] = None
-            self._write_task_state(task_id, state)
-
-            cfg = self.read_config(redacted=False)
-            if bool(state.get("notify")) and bool(cfg.get("notify_on_task_done", True)):
-                self.send_notification(
-                    "自动定价任务完成："
-                    f"{task_id}，共 {report.get('count_total', 0)} 条，"
-                    f"未命中 {report.get('count_not_found', 0)} 条。"
-                )
-        except Exception as e:
-            state["status"] = "failed"
-            state["finished_at"] = utc_now_iso()
-            state["error"] = f"{type(e).__name__}: {e}"
-            self._write_task_state(task_id, state)
-            cfg = self.read_config(redacted=False)
-            if bool(state.get("notify")) and bool(cfg.get("notify_on_task_failed", True)):
-                try:
-                    self.send_notification(f"自动定价任务失败：{task_id}，{state['error']}")
-                except Exception:
-                    pass
 
     def _update_state(self, patch: Dict[str, Any]) -> None:
         with self._lock:
