@@ -1,557 +1,720 @@
-# Dahua Pricing Agent: Hermes-Native Upgrade Blueprint
+# 大华定价自动化智能体架构蓝图
 
-## 1. Positioning
+## 0. 反包装原则
 
-This project should not be framed as "a bot that checks PLA status".
+这套系统不能靠把普通接口包装成高级概念来讲。
 
-The stronger framing is:
+必须先承认：
 
-- a persistent enterprise agent that grows with the business workflow
-- with a messaging gateway, scheduled automations, and tool dispatch
-- with Hermes-style prompt/context assembly before action
-- with bounded curated memory plus external workflow memory
-- with reusable procedural skills for GSP, Alidocs, and notification tasks
-- with a closed learning loop: observe, reflect, consolidate, improve
+- 群消息进入后端，只是入口适配。
+- 表格脚本推送数据，只是数据适配。
+- 视窗端执行器查询内网，只是工具执行。
+- 机器人往群里发消息，只是通知出口。
 
-The current repository already contains the seed of that system:
+这些都不是核心智能。
 
-- Alidocs push script as a business-event adapter
-- Linux backend as the Hermes-inspired agent core
-- Windows desktop agent as a tool backend with GSP capability
-- GSP as a protected enterprise tool environment
-- DingTalk/Huachat as the messaging gateway and notification surface
+真正值得讲的部分是：
 
-This is already beyond a toy MVP. The upgrade path is to formalize it into a Hermes-style architecture.
+- 一次业务触发如何形成可追踪的会话；
+- 执行前到底组装了哪些业务上下文；
+- 技能如何约束动作、风险和后置验证；
+- 工具如何按能力调度，而不是写死某台机器；
+- 执行结果如何变成观察证据；
+- 记忆如何沉淀和压缩，而不是无限堆日志；
+- 反思如何生成候选改进，而不是让系统自己乱改；
+- 评估如何回放历史，证明没有误查、误写、误通知。
 
-## 2. Current State
+所以本文档不把“收到消息然后调接口”吹成架构亮点。入口只是入口，核心在后面的控制面。
 
-Current implemented flow:
+## 1. 系统定位
 
-1. `script/alidocs_push_all_sheets.js`
-   pushes all sheet rows to `/api/agent/sheet/push`
-2. backend parses rows into structured tasks
-3. backend filters rows where PLA exists and sheet status is not completed
-4. Windows agent fetches queue from `/api/agent/gsp/status-queue`
-5. Windows agent checks GSP via API-first mode and browser fallback mode
-6. Windows agent posts result to `/api/agent/gsp/status-result`
-7. backend queues online sheet write-back
-8. `script/alidocs_apply_status_updates.js`
-   writes `L{row}=已完成` and ACKs the update
+这个项目不是“群机器人查审批”。
 
-This means the system already has:
+更准确的定位是：
 
-- event ingestion
-- task parsing
-- execution routing
-- result persistence
-- feedback write-back
-- partial observability
+> 面向企业定价流程的常驻业务智能体。它接收来自群聊、在线表格、定时任务或人工操作的业务事件，围绕一次业务会话组装上下文，选择版本化技能，调度视窗端和在线表格执行器，收集观察证据，更新结构化记忆，并通过反思和回放评估持续提高流程可靠性。
 
-Hermes-native entities now implemented in the backend:
+这套系统里，大模型不是必需前提。
 
-- trace store: `GET /api/agent/traces`, `GET /api/agent/traces/{run_id}`
-- PLA timeline memory: `GET /api/agent/memory/pla/{pla_no}`
-- compact PLA memory: stored inside each PLA timeline as `compact_memory`
-- versioned skills with plan graphs: `GET /api/agent/skills`, `GET /api/agent/skills/{skill_name}`
-- tool backend registry: `GET /api/agent/tool-backends`, `POST /api/agent/tool-backends/heartbeat`
-- reflection candidates: `GET /api/agent/reflections`
-- replay evaluation: `POST /api/agent/evals/replay`
+稳定规则能解决的部分用确定性代码：
 
-These are intentionally file-backed first, because the current deployment already uses filesystem-backed agent state. The schema is shaped so it can later move to Postgres and Langfuse without changing the agent contract.
+- 表格行筛选；
+- 申请单号提取；
+- 写回幂等；
+- 状态归一化；
+- 权限和风险校验。
 
-## 3. Why Hermes Fits
+只有在自然语言理解、异常总结、策略建议这类地方，才值得引入大模型。
 
-Hermes is a better conceptual match than a thin "chat bot" because this project is:
+## 2. 当前核心业务闭环
 
-- long-horizon
-- multi-system
-- stateful
-- repetitive
-- failure-prone in the real world
-- improved by persistent context and memory
-
-The key value is not the loop itself. Plenty of agent systems have loops.
-
-The value is:
-
-- bounded but durable memory
-- context assembly before execution
-- post-run learning and strategy refinement
-- a persistent execution identity across tasks
-
-That maps very naturally to the PLA / inquiry / GSP workflow.
-
-## 4. Hermes-Native Target Architecture
-
-The design should map directly to Hermes concepts instead of becoming a generic workflow backend.
+当前已经形成的基础闭环是：
 
 ```text
-Messaging Gateway / Cron / Alidocs Adapter
-  -> Business MessageEvent
-  -> Agent Session
-  -> Prompt + Context Assembly
-  -> Memory Snapshot + Relevant Workflow Records
-  -> Skill Selection
-  -> Tool Dispatch
-  -> Observation
-  -> Reflection
-  -> Memory / Skill Update
-  -> Delivery / Write-back
+在线表格脚本推送全量表格
+  -> 后端解析成结构化任务
+  -> 后端筛选有申请单号且未完成的行
+  -> 视窗端执行器领取查询任务
+  -> 视窗端查询内网审批系统
+  -> 查询结果回传后端
+  -> 后端判断是否需要写回表格
+  -> 在线表格脚本拉取写回任务并更新状态
+  -> 后端记录轨迹、记忆、反思和评估材料
 ```
 
-### 4.1 Gateway Layer
+群聊入站接通后，只是在这个闭环前面增加一个触发来源：
 
-This is the project equivalent of Hermes Gateway plus Cron.
+```text
+群里提到机器人
+  -> 入口适配器生成业务事件
+  -> 后端创建业务会话
+  -> 进入同一套审批检查闭环
+```
 
-Sources:
+所以群聊不是另一套系统。它只是多了一个入口。
 
-- Alidocs push
-- DingTalk incoming callback
-- scheduled poll runs
-- manual backend trigger
-- future email / ticket / CRM events
+## 3. 总体结构
 
-Every source should be normalized into a business message event:
+有效结构应该是下面这样：
+
+```text
+边界适配器
+  -> 业务事件
+  -> 会话控制面
+  -> 上下文包
+  -> 技能调用
+  -> 工具调度决策
+  -> 工具执行器
+  -> 观察结果
+  -> 状态决策
+  -> 记忆更新
+  -> 反思候选
+  -> 回放评估
+  -> 通知或写回
+```
+
+这里每一层都必须有明确输入、输出和边界。
+
+## 4. 边界适配器
+
+### 4.1 它负责什么
+
+边界适配器只负责把外部世界的输入转成系统内部业务事件。
+
+来源包括：
+
+- 群消息事件；
+- 在线表格推送；
+- 定时任务；
+- 手动后端触发；
+- 未来的邮件、工单或客户关系系统事件。
+
+它应该做：
+
+- 来源校验；
+- 群或用户权限检查；
+- 消息去重；
+- 文本或载荷抽取；
+- 标准化成业务事件；
+- 记录原始事件摘要。
+
+### 4.2 它不负责什么
+
+它不负责：
+
+- 读表格；
+- 筛选业务行；
+- 选择技能；
+- 选择视窗端执行器；
+- 判断审批是否通过；
+- 写回在线表格；
+- 生成反思。
+
+这些都不属于入口。
+
+### 4.3 输出
+
+边界适配器输出的是业务事件：
 
 ```json
 {
-  "event_id": "evt_xxx",
-  "source": "alidocs|dingtalk|scheduler|manual",
-  "source_ref": "sheet_push_id|conversation_id|job_id",
-  "intent": "check_approval_status",
-  "payload": {},
-  "received_at": "2026-06-10T00:00:00Z"
+  "事件编号": "evt_xxx",
+  "来源": "群聊",
+  "来源编号": "消息编号或推送编号",
+  "触发人": "用户标识",
+  "会话来源": "群编号",
+  "原始文本": "帮我查审批 2026.06",
+  "接收时间": "2026-06-10T00:00:00Z"
 }
 ```
 
-### 4.2 Agent Session Layer
+注意：业务事件不是执行计划。它只是后续会话的来源证据。
 
-This is where the system stops being a webhook handler.
+## 5. 会话控制面
 
-Each trigger opens or resumes an agent session:
+### 5.1 为什么需要会话
 
-- sheet-scoped session: for one Alidocs push
-- PLA-scoped session: for one approval lifecycle
-- user/group-scoped session: for incoming chat commands
-- scheduled session: for cron-like unattended audits
+如果没有会话，系统就只是一串接口调用。
 
-The session carries lineage, so follow-up checks, write-backs, and manual reviews are tied to the same history.
+会话的价值是把一次业务动作从头到尾串起来：
 
-### 4.3 Prompt And Context Assembly
+- 起点是哪条业务事件；
+- 本次识别出的意图是什么；
+- 当时看到了哪些上下文；
+- 选了哪个技能版本；
+- 派给哪个工具后端；
+- 工具返回了什么观察；
+- 做了什么状态决策；
+- 更新了哪些记忆；
+- 有没有写回；
+- 有没有反思候选；
+- 评估分数如何。
 
-This is the Hermes heart: context is deliberately assembled before tools run.
+### 5.2 会话类型
 
-Inputs:
+至少有四种会话：
 
-- latest parsed sheet snapshot
-- row-level task info
-- relevant PLA memory
-- relevant PN/product memory
-- latest GSP result
-- notification policy
-- operator hints
-- enabled skills
-- allowed tools and risk policy
+- 表格同步会话：一次在线表格推送触发；
+- 审批检查会话：一次查审批动作触发；
+- 单号生命周期会话：围绕一个申请单号长期跟踪；
+- 高风险操作会话：例如未来产品释放、正式写入内网系统。
 
-Output:
+### 5.3 会话输出
+
+会话控制面生成稳定的运行编号，并创建轨迹：
 
 ```json
 {
-  "run_id": "run_xxx",
-  "intent": "check_approval_status",
-  "sheet": "2026.06",
-  "row_index": 23,
-  "pla_no": "PLA20260605143508433",
-  "pn": "1.0.01.15.12158",
-  "requester": "xiyan",
-  "current_sheet_status": "进行中",
-  "last_known_gsp_status": "Approved",
-  "execution_policy": {
-    "query_mode": "api_first",
-    "retry_limit": 2,
-    "allow_browser_fallback": true,
-    "notify": false
+  "运行编号": "run_xxx",
+  "父事件编号": "evt_xxx",
+  "会话类型": "审批检查",
+  "状态": "运行中",
+  "创建时间": "...",
+  "轨迹": []
+}
+```
+
+当前代码里已经有运行编号和轨迹存储，但会话对象还需要进一步显式化。
+
+## 6. 上下文包
+
+### 6.1 上下文组装不是什么
+
+上下文组装不是触发。
+
+触发已经在边界适配器完成。
+
+上下文组装也不是把所有日志拼起来。
+
+它只做一件事：
+
+> 为某个技能调用准备最小但足够的执行材料。
+
+### 6.2 上下文包包含什么
+
+以“检查审批状态”为例，上下文包应该包含：
+
+- 触发事件摘要；
+- 意图解析结果；
+- 当前目标范围，例如指定子表或最大处理数；
+- 最新表格结构化快照；
+- 候选业务行；
+- 每行的关键字段；
+- 相关申请单号的压缩记忆；
+- 当前可用技能版本；
+- 当前可用工具后端；
+- 策略约束，例如是否允许写回、是否允许群通知、失败是否进入人工处理。
+
+### 6.3 上下文包示例
+
+```json
+{
+  "上下文编号": "ctx_xxx",
+  "运行编号": "run_xxx",
+  "意图": "检查审批状态",
+  "触发摘要": {
+    "来源": "群聊",
+    "触发人": "用户A",
+    "消息": "帮我查审批 2026.06"
+  },
+  "目标范围": {
+    "子表": "2026.06",
+    "最大处理数": 200
+  },
+  "候选任务": [
+    {
+      "子表": "2026.06",
+      "行号": 23,
+      "申请单号": "PLA20260605143508433",
+      "料号": "1.0.01.xx",
+      "申请人": "xiyan",
+      "表格状态": "进行中",
+      "压缩记忆": {
+        "上次审批状态": "Pending",
+        "写回状态": "",
+        "失败次数": 0,
+        "需要关注": false
+      }
+    }
+  ],
+  "候选工具后端": [
+    {
+      "执行器编号": "windows-gsp-agent",
+      "能力": ["查询审批状态"],
+      "状态": "在线",
+      "负载": 0.1
+    }
+  ],
+  "策略": {
+    "允许查询内网": true,
+    "允许写回表格": true,
+    "允许群通知": true,
+    "失败进入反思候选": true
   }
 }
 ```
 
-The important point: this context is not a large dump of logs. It is a compact, curated working set, similar in spirit to Hermes prompt tiers and context compression.
+### 6.4 为什么上下文包是核心
 
-### 4.4 Memory Manager
+上下文包回答的是：
 
-Memory should be explicit and layered, not just "lots of logs".
+- 当时系统看到了什么；
+- 它为什么选这些行；
+- 它为什么不是查全部；
+- 它为什么允许写回；
+- 它为什么选择这个执行器；
+- 后续如果结果错了，能不能复盘当时依据。
 
-Hermes has bounded curated memory. This project should keep the same discipline:
+没有上下文包，所谓智能体就很容易退化成“接口串联”。
 
-- small always-active memory for durable facts and conventions
-- larger external memory for structured workflow history
-- consolidation rules that decide what graduates from trace to memory
+## 7. 技能层
 
-#### Core Memory
+### 7.1 技能是什么
 
-Small curated facts that should affect every future run:
+技能不是工具。
 
-- GSP is the source of truth for approval status
-- Alidocs can write back only through sheet-side scripts unless official API permission exists
-- high-risk GSP write actions require approval
-- current robot notification policy
+工具是“能做什么动作”。
 
-This is the project equivalent of `MEMORY.md`: compact, opinionated, and always injected.
+技能是“在什么业务条件下，按什么步骤，带着什么风险约束，调用哪些工具，最终要满足什么后置条件”。
 
-#### Episodic Memory
+### 7.2 当前核心技能
 
-Per-PLA / per-task history:
+当前应该保留三个主要技能：
 
-- when first seen
-- which sheet rows it appeared in
-- status timeline
-- who triggered checks
-- how it was resolved
+- 检查定价申请审批状态；
+- 应用在线表格状态写回；
+- 正式释放产品到内网系统。
 
-This is not prompt bloat. It is retrieved and compressed into the session only when relevant.
+第三个是高风险技能，必须保持人工确认和干跑验证。
 
-#### Procedural Memory / Skills
+### 7.3 技能结构
 
-Reusable business procedures:
+每个技能需要包含：
 
-- `check_gsp_approval_status`
-- `apply_alidocs_status_update`
-- `official_release_product_in_gsp`
-- `summarize_blocked_approval`
-- `escalate_manual_review`
+- 技能名；
+- 当前版本；
+- 风险等级；
+- 适用条件；
+- 禁用条件；
+- 允许工具；
+- 前置条件；
+- 后置条件；
+- 计划图；
+- 评估标准；
+- 升级记录。
 
-Each Skill carries:
+### 7.4 技能计划图
 
-- active version
-- risk level
-- allowed tools
-- preconditions and postconditions
-- evaluation criteria
-- plan graph
-
-The plan graph is the answer to "how do you decompose complex tasks?" It makes each business procedure inspectable before it is executed.
-
-#### Compact Memory
-
-PLA timeline memory keeps the raw event stream, but the session should normally consume the compact view:
-
-- latest sheet / row / PN / requester
-- latest GSP status
-- write-back state
-- run count
-- status event count
-- approved / failed counts
-- reflection count
-- attention flag
-
-This prevents the memory layer from becoming prompt bloat or an unbounded log dump.
-
-Each skill should contain:
-
-- when to use it
-- required context
-- allowed tools
-- risk level
-- preconditions
-- postconditions
-- eval criteria
-
-This is the Hermes "skills evolve during use" angle. A failed official-release run should improve the skill notes, not just leave an error log.
-
-#### Operational Memory
-
-System behavior memory:
-
-- GSP API failure patterns
-- browser fallback success rate
-- frequent approval bottlenecks by owner / country / product line
-- recurring parsing ambiguities
-
-#### Policy Memory / Soul
-
-Human-curated memory:
-
-- allowed groups
-- escalation rules
-- notification style
-- quiet hours
-- preferred execution strategy per environment
-
-This is closer to Hermes `USER.md` / policy context than a generic config table: it shapes the agent's behavior across sessions.
-
-### 4.5 Tool Registry And Dispatch
-
-Executors should be exposed as tools with capability metadata:
-
-- `sheet.push_parse`
-- `alidocs.status_writeback`
-- `gsp.status_check`
-- `gsp.status_api`
-- `gsp.browser_status_checker`
-- `gsp.product_release_browser`
-- `dingtalk.notify`
-- `human.approval_gate`
-
-Each tool needs:
-
-- schema
-- capability tags
-- risk level
-- idempotency key rules
-- observable result schema
-- failure classification
-
-Tool backends register themselves separately from Skills:
-
-- backend ID
-- display name
-- capabilities
-- online/degraded/offline status
-- load
-- last heartbeat
-- environment metadata
-
-This is the multi-agent switching layer. A Skill chooses required capability; the Hermes core selects the currently healthy backend and records that choice in the trace.
-
-### 4.6 Reflection And Learning Loop
-
-After each run, the agent should ask:
-
-- what worked?
-- what failed?
-- which skill note should be updated?
-- which memory should be consolidated?
-- should executor preference change?
-- should this case become an eval dataset item?
-
-That is the Hermes flavor. The system learns from work without pretending every action needs an LLM.
-
-## 5. Agent Control Loop
-
-This is the real heart of the system.
-
-Hermes-style run state:
+例如“检查定价申请审批状态”：
 
 ```text
-ingested
-  -> session_resolved
-  -> context_assembled
-  -> skill_selected
-  -> tool_plan_ready
-  -> policy_checked
-  -> executing
-  -> observed
-  -> reflected
-  -> memory_consolidated
-  -> writeback_pending
-  -> completed
-  -> or failed / manual_review
+组装上下文
+  -> 检查行身份
+  -> 选择审批查询执行器
+  -> 查询内网审批状态
+  -> 归一化状态
+  -> 保存观察结果
+  -> 判断是否写回
+  -> 更新记忆
+  -> 触发反思或评估
 ```
 
-Each run should have:
+这个计划图不是为了显得复杂，而是为了高风险流程可以被拆解、审核、回放。
 
-- stable `run_id`
-- parent trigger reference
-- selected strategy
-- execution trace
-- result artifact
-- evaluation result
+## 8. 工具调度层
 
-This is where Hermes-style control pays off:
+### 8.1 工具后端是什么
 
-- idempotency
-- retries
-- fallbacks
-- branch decisions
-- post-run summarization
+工具后端是可以执行动作的外部能力提供者。
 
-## 6. Tool Backend Layer
+包括：
 
-Windows agents, API clients, and Alidocs scripts are not "the agent". They are tool backends.
+- 视窗端内网审批查询执行器；
+- 视窗端内网浏览器操作执行器；
+- 在线表格脚本；
+- 群通知机器人；
+- 未来人工审批门；
+- 未来产品释放执行器。
 
-### Current Tool Backends
+### 8.2 为什么需要工具调度
 
-- `sheet_push_parser`
-- `gsp_api_status_checker`
-- `gsp_browser_status_checker`
-- `sheet_writeback_script`
-- `dingtalk_notify_webhook`
+如果只有一台机器，写死也能跑。
 
-### Future Tool Backends
+但业务扩展后会出现：
 
-- `dingtalk_incoming_gateway`
-- `manual_review_gate`
-- `gsp_product_release_browser`
-- `pricing_executor` when re-enabled
-- `crm_sync_tool`
-- `approval_escalation_tool`
+- 多台视窗端执行器；
+- 有的只能查审批；
+- 有的能做产品释放；
+- 有的登录态失效；
+- 有的负载高；
+- 有的只允许干跑；
+- 有的在办公室网络，有的不在。
 
-Execution strategy should be dynamic:
+这时后端必须根据能力调度，而不是写死调用某台机器。
 
-- default `api_first`
-- fallback `browser`
-- final fallback `manual_review`
+### 8.3 工具后端心跳
 
-## 7. Evaluation Layer
+工具后端需要上报：
 
-This is where the system becomes "not just MVP".
+- 执行器编号；
+- 能力列表；
+- 在线状态；
+- 当前负载；
+- 最近心跳；
+- 环境信息；
+- 风险等级能力。
 
-Every run should be scored on:
+后端选择时看：
 
-- trigger understanding correctness
-- row selection correctness
-- PLA extraction correctness
-- GSP query success
-- returned status correctness
-- sheet write-back correctness
-- notification correctness
-- time to completion
+- 是否具备所需能力；
+- 是否在线；
+- 心跳是否新鲜；
+- 负载是否合适；
+- 当前技能是否允许调用它。
 
-Two eval modes should exist:
+### 8.4 工具调度决策
 
-### Offline Eval
+调度结果必须持久化：
 
-Replay historical sheet pushes and historical PLA outcomes as datasets.
+```json
+{
+  "调度编号": "dispatch_xxx",
+  "运行编号": "run_xxx",
+  "技能": "检查审批状态",
+  "所需能力": "查询审批状态",
+  "选中执行器": "windows-gsp-agent-01",
+  "候选执行器": ["windows-gsp-agent-01", "windows-gsp-agent-02"],
+  "选择理由": "在线且负载最低",
+  "时间": "..."
+}
+```
 
-Questions:
+这才是真正能回答“多智能体怎么切换”的部分。
 
-- Did we select the right rows?
-- Did we mark the right rows complete?
-- Did we avoid false positives?
-- Did API-first reduce failures vs browser-first?
+不要把“有多个脚本”说成多智能体。只有调度决策可追踪，才算工程上站得住。
 
-### Online Eval
+## 9. 工具执行器
 
-Capture production traces and compute:
+执行器只做动作，不做最终业务决策。
 
-- queue success rate
-- GSP lookup success rate
-- write-back success rate
-- manual intervention rate
-- mean end-to-end latency
-- false completion rate
+### 9.1 视窗端执行器
 
-## 8. Langfuse Fit
+负责：
 
-Langfuse fits this project very well, even if most of the current chain is not LLM-driven yet.
+- 接收审批查询任务；
+- 使用接口或浏览器查询内网审批状态；
+- 返回状态、节点、处理人、原始证据和错误信息。
 
-Why it still fits:
+不负责：
 
-- traces are still useful for agent runs
-- evals are useful for workflow correctness
-- datasets are useful for regression testing
-- future incoming natural-language commands will likely use LLM interpretation
+- 判断是否写回表格；
+- 判断是否通知群；
+- 修改技能；
+- 直接修改长期记忆。
 
-Recommended Langfuse usage:
+### 9.2 在线表格脚本
 
-1. trace each run as one top-level trace
-2. create spans for:
-   - sheet_push_parse
-   - task_filter
-   - gsp_queue_fetch
-   - gsp_api_query
-   - gsp_browser_fallback
-   - result_persist
-   - sheet_writeback
-   - notification
-3. attach scores:
-   - `row_selection_correct`
-   - `status_match`
-   - `writeback_applied`
-   - `manual_intervention_required`
-4. later, when incoming chat is enabled:
-   - log user prompt
-   - log intent classification
-   - log tool routing decision
+负责：
 
-## 9. Loop Agent vs Hermes
+- 推送全量表格；
+- 拉取待写回任务；
+- 在在线表格环境内写入状态；
+- 回传写回确认。
 
-If by "Loop Agent" you mean the current wave of loop-centric agents, then the overlap is real:
+不负责：
 
-- both rely on perceive / reason / act / observe cycles
-- both can persist state across steps
-- both can route tools conditionally
+- 判断哪些单号该查；
+- 判断审批是否通过；
+- 决定群通知。
 
-But in practice the difference is usually one of emphasis:
+### 9.3 群通知机器人
 
-- loop agents emphasize the control cycle
-- Hermes emphasizes memory, continuity, and post-run improvement
+负责：
 
-For this project, a plain loop is not enough.
+- 按后端给定内容发消息。
 
-Why:
+不负责：
 
-- the system must remember prior PLA runs
-- the system must learn which executor path is more reliable
-- the system must avoid duplicate writes and duplicate notifications
-- the system must accumulate operational knowledge over time
+- 入站消息理解；
+- 业务决策；
+- 执行状态判断。
 
-So the right conclusion is:
+## 10. 观察结果
 
-- loop mechanics are necessary
-- Hermes-style memory and evaluation are what make the project resume-worthy
+工具执行完成后，必须回传观察结果。
 
-## 10. Resume Narrative
+观察结果不是一句“成功了”。
 
-Weak narrative:
+它需要包含：
 
-- built a bot to query approval status
+- 来自哪个工具；
+- 对应哪个运行；
+- 对应哪个申请单号；
+- 原始状态；
+- 归一化状态；
+- 证据摘要；
+- 是否成功；
+- 错误分类；
+- 查询时间。
 
-Strong narrative:
+审批查询的观察结果示例：
 
-- designed and implemented a context-aware enterprise agent system spanning online sheets, internal approval systems, Linux orchestration services, and Windows execution agents
-- built adaptive API-first / browser-fallback execution for approval-state automation in restricted intranet environments
-- introduced structured run memory, evaluation hooks, and traceable write-back loops to improve workflow reliability and reduce manual follow-up
+```json
+{
+  "运行编号": "run_xxx",
+  "工具后端": "windows-gsp-agent-01",
+  "申请单号": "PLA20260605143508433",
+  "原始状态": "Approved",
+  "归一化状态": "已审批通过",
+  "当前节点": "End",
+  "处理人": "",
+  "是否成功": true,
+  "证据来源": "内网审批系统接口",
+  "查询时间": "..."
+}
+```
 
-## 11. Recommended Next Build Stages
+后端只基于观察结果和策略做状态决策。
 
-### Stage A: Operational Backbone
+## 11. 状态决策与写回
 
-- formalize run IDs and trace records
-- add run history listing APIs
-- add executor decision records
-- add manual review queue
+状态决策不是工具执行器做的，而是后端控制面做的。
 
-### Stage B: Memory
+它判断：
 
-- per-PLA timeline store
-- per-run artifact store
-- environment reliability memory
-- notification policy memory
+- 观察是否可信；
+- 状态是否等价于审批通过；
+- 表格行是否仍然匹配；
+- 该行是否已经完成；
+- 是否已有同样写回任务；
+- 当前策略是否允许写回；
+- 是否需要通知群或进入人工处理。
 
-### Stage C: Eval
+写回必须幂等。
 
-- historical replay dataset
-- automated regression checks
-- write-back correctness evaluation
-- latency / failure dashboards
+同一张表、同一行、同一个申请单号、同一个目标状态，只能生成一条有效写回任务。
 
-### Stage D: Incoming
+这样才能避免：
 
-- DingTalk event callback
-- intent classification
-- safe command gating
-- group / user authorization
+- 重复写表；
+- 重复通知；
+- 表格状态倒退；
+- 错把别人的行标成完成。
 
-### Stage E: Intelligence
+## 12. 记忆层
 
-- LLM-based incoming command understanding
-- approval anomaly summarization
-- operator-facing explanations
-- policy suggestions from historical traces
+记忆不是日志。
 
-## 12. Final Judgment
+日志回答“发生过什么”。
 
-This project is absolutely capable of becoming a serious Hermes-style system.
+记忆回答“以后执行时应该知道什么”。
 
-The winning move is not to turn everything into LLM calls.
+### 12.1 申请单号时间线记忆
 
-The winning move is:
+围绕每个申请单号保存：
 
-- keep deterministic automation where it is reliable
-- add context assembly where state matters
-- add memory where repeated work accumulates
-- add eval where trust matters
-- add LLM reasoning only where interpretation or adaptive decision-making truly helps
+- 第一次出现时间；
+- 出现过哪些表和行；
+- 关联料号和申请人；
+- 历次审批状态；
+- 历次写回状态；
+- 相关运行编号；
+- 失败记录；
+- 反思候选。
 
-That yields a system that is more real, more defensible, and much stronger on a resume than a generic "AI bot".
+### 12.2 压缩记忆
+
+每条申请单号记忆都生成压缩摘要：
+
+- 最新表格位置；
+- 最新料号；
+- 最新申请人；
+- 最新审批状态；
+- 写回状态；
+- 运行次数；
+- 成功次数；
+- 失败次数；
+- 是否需要关注。
+
+压缩记忆用于下一次上下文包。
+
+这样系统不会把整条历史塞进执行过程，也不会丢掉长期状态。
+
+### 12.3 技能记忆
+
+技能版本也是一种程序性记忆。
+
+它记录：
+
+- 这个流程怎么做；
+- 哪些工具允许用；
+- 哪些前置条件必须满足；
+- 哪些失败曾经发生过；
+- 后续版本为什么升级。
+
+## 13. 反思层
+
+反思不是自动改代码。
+
+反思只是生成候选改进。
+
+触发反思的情况：
+
+- 查询失败；
+- 登录态失效；
+- 审批状态无法归一化；
+- 审批通过但没能生成写回；
+- 写回失败；
+- 重复写回被拦截；
+- 工具后端长期不稳定；
+- 高风险操作前后状态不一致。
+
+反思候选必须包含：
+
+- 证据；
+- 影响范围；
+- 风险等级；
+- 建议调整；
+- 是否需要人工确认；
+- 是否需要回放评估。
+
+只有通过人工确认或评估验证后，反思才可能升级成新的技能版本或策略规则。
+
+这叫受控自进化。
+
+## 14. 评估层
+
+评估层解决的是信任问题。
+
+它不问“跑没跑”，而问：
+
+- 选行是否正确；
+- 申请单号提取是否正确；
+- 是否漏查；
+- 是否多查；
+- 审批状态判断是否正确；
+- 写回是否正确；
+- 是否出现误完成；
+- 是否重复通知；
+- 平均耗时是多少；
+- 失败集中在哪个工具后端。
+
+### 14.1 回放评估
+
+用历史表格推送、历史查询结果、历史写回记录进行回放。
+
+回放可以发现：
+
+- 新规则是否漏掉旧数据；
+- 新状态归一化是否误判；
+- 写回幂等是否还有效；
+- 工具调度是否降低失败率。
+
+### 14.2 在线评估
+
+线上每次运行记录评分：
+
+- 查询成功；
+- 写回成功；
+- 误写次数；
+- 人工介入；
+- 耗时；
+- 反思数量。
+
+这部分后续可以接入外部观测和评估平台，但核心数据结构不应该依赖某个外部平台才存在。
+
+## 15. 清晰边界总结
+
+| 层 | 负责 | 不负责 |
+| --- | --- | --- |
+| 边界适配器 | 接收外部输入、校验、去重、生成业务事件 | 业务决策、筛行、执行 |
+| 会话控制面 | 串起一次业务运行，生成轨迹 | 具体查询内网 |
+| 上下文包 | 准备技能执行所需材料 | 触发事件、执行工具 |
+| 技能层 | 定义业务流程、风险、计划和后置条件 | 直接操作系统 |
+| 工具调度 | 按能力选择执行器并记录理由 | 判断审批是否完成 |
+| 工具执行器 | 查询、写表、通知等具体动作 | 最终业务决策 |
+| 观察层 | 保存工具返回的证据 | 修改技能 |
+| 状态决策 | 判断是否写回、是否通知、是否人工处理 | 直接打开内网页面 |
+| 记忆层 | 保存长期业务状态和压缩摘要 | 替代原始证据 |
+| 反思层 | 生成候选改进 | 自动无审核改流程 |
+| 评估层 | 回放和评分 | 代替生产执行 |
+
+## 16. 当前落地程度
+
+已经落地：
+
+- 表格推送和结构化解析；
+- 申请单号待查任务筛选；
+- 视窗端查询队列；
+- 视窗端查询结果回传；
+- 在线表格写回队列和确认；
+- 运行轨迹；
+- 申请单号时间线记忆；
+- 压缩记忆；
+- 技能版本和计划图；
+- 工具后端注册和心跳；
+- 工具后端能力选择；
+- 反思候选；
+- 回放评估。
+
+还需要继续显式化：
+
+- 业务事件账本；
+- 会话对象；
+- 上下文包对象；
+- 技能调用对象；
+- 工具调度决策对象；
+- 观察结果对象；
+- 记忆更新对象。
+
+这些不是为了堆概念，而是为了让每次运行都能回答：
+
+- 当时为什么这么做；
+- 当时依据是什么；
+- 哪一步错了；
+- 能不能回放；
+- 能不能评估；
+- 能不能安全改进。
+
+## 17. 最终架构判断
+
+这套系统真正的深度不在“群里能不能叫机器人干活”。
+
+群聊只是入口。
+
+真正的深度在于：
+
+- 业务会话能追踪；
+- 上下文能持久化；
+- 技能能版本化；
+- 工具能按能力调度；
+- 观察能成为证据；
+- 记忆能压缩复用；
+- 反思能受控升级；
+- 评估能回放验证。
+
+如果这些实体继续补齐，这就是一个能经得住追问的赫尔墨斯式企业流程智能体。
+
+如果只停留在“收到消息然后调用接口”，那就是普通自动化脚本。
+
+后续开发必须围绕前者推进，不能再用概念包装后者。
