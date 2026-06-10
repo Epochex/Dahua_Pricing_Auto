@@ -315,6 +315,21 @@ Windows Agent 文件：
 > Windows Agent 默认使用 Playwright + Edge 独立 profile，并默认 `headless=true`，不会抢主屏幕鼠标键盘。
 > 第一次建立 GSP 登录态时需要运行 `login.ps1` 人工登录一次；如果 GSP 不接受 headless，会再迁到独立 Windows 用户会话、小虚拟机或办公室小主机，避免影响日常电脑使用。
 
+架构升级文档：
+
+- [Hermes Agent Upgrade Blueprint](/data/Dahua_Pricing_Auto/docs/hermes_agent_blueprint.md)
+- [Langfuse Eval Plan](/data/Dahua_Pricing_Auto/docs/langfuse_eval_plan.md)
+- [Agent Interview Attack Review](/data/Dahua_Pricing_Auto/docs/agent_interview_attack_review.md)
+
+Hermes 化实体已在后端落地：
+
+- `GET /api/agent/traces` / `GET /api/agent/traces/{run_id}`：查看每次业务触发、队列、GSP 回传和表格回写的执行轨迹
+- `GET /api/agent/memory/pla/{pla_no}`：查看单个 PLA 的 timeline memory 和 `compact_memory`
+- `GET /api/agent/skills` / `GET /api/agent/skills/{skill_name}`：查看当前可版本化业务技能、风险等级、前后置条件和 plan graph
+- `GET /api/agent/tool-backends` / `POST /api/agent/tool-backends/heartbeat`：查看和注册 Windows/GSP/Alidocs 等执行器能力，用于多 agent 动态切换
+- `GET /api/agent/reflections`：查看执行失败、重复抑制、策略缺口产生的 reflection candidates
+- `POST /api/agent/evals/replay`：基于历史 sheet push / GSP result / write-back 记录运行 replay eval
+
 ## 5. 仓库结构
 
 ```text

@@ -36,6 +36,11 @@ def load_config(path: Path) -> dict[str, Any]:
     data["gsp_url"] = str(data.get("gsp_url") or "https://gsp.dahuasecurity.com/#/pricing/application/list")
     data["gsp_base_url"] = str(data.get("gsp_base_url") or "https://gsp.dahuasecurity.com").rstrip("/")
     data["gsp_query_mode"] = str(data.get("gsp_query_mode") or "api").strip().lower()
+    data["backend_id"] = str(data.get("backend_id") or "windows-gsp-agent").strip() or "windows-gsp-agent"
+    data["backend_display_name"] = (
+        str(data.get("backend_display_name") or "Windows GSP Status Agent").strip()
+        or "Windows GSP Status Agent"
+    )
     data["gsp_username"] = str(data.get("gsp_username") or "")
     data["gsp_password"] = str(data.get("gsp_password") or "")
     data["gsp_country_code"] = str(data.get("gsp_country_code") or "FR").strip() or "FR"
@@ -75,6 +80,27 @@ def api_post(cfg: dict[str, Any], path: str, payload: dict[str, Any]) -> dict[st
     return body
 
 
+def send_heartbeat(cfg: dict[str, Any], *, status: str = "online", load: float = 0.0) -> dict[str, Any]:
+    payload = {
+        "token": cfg["agent_token"],
+        "backend_id": cfg["backend_id"],
+        "display_name": cfg["backend_display_name"],
+        "status": status,
+        "load": max(0.0, min(1.0, float(load))),
+        "capabilities": [
+            "gsp.status_check",
+            "gsp.status_api" if cfg.get("gsp_query_mode") == "api" else "gsp.browser_status_checker",
+        ],
+        "metadata": {
+            "query_mode": cfg.get("gsp_query_mode"),
+            "headless": bool(cfg.get("headless")),
+            "edge_channel": cfg.get("edge_channel"),
+            "gsp_base_url": cfg.get("gsp_base_url"),
+        },
+    }
+    return api_post(cfg, "/api/agent/tool-backends/heartbeat", payload)
+
+
 def fetch_queue(cfg: dict[str, Any], *, limit: int | None = None) -> list[dict[str, Any]]:
     body = api_post(
         cfg,
@@ -87,6 +113,8 @@ def fetch_queue(cfg: dict[str, Any], *, limit: int | None = None) -> list[dict[s
 def push_result(cfg: dict[str, Any], task: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "token": cfg["agent_token"],
+        "run_id": task.get("run_id"),
+        "queue_id": task.get("queue_id"),
         "pla_no": task.get("pla_no") or result.get("pla_no") or "",
         "status": result.get("status") or "",
         "ok": bool(result.get("ok")),
@@ -561,6 +589,11 @@ def print_queue(tasks: list[dict[str, Any]]) -> None:
 
 
 def run_once(cfg: dict[str, Any], *, no_push: bool = False) -> None:
+    try:
+        heartbeat = send_heartbeat(cfg, load=0.1)
+        print(json.dumps({"event": "heartbeat", "ok": heartbeat.get("ok")}, ensure_ascii=False))
+    except Exception as err:
+        print(json.dumps({"event": "heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
     tasks = fetch_queue(cfg)
     print(json.dumps({"event": "queue", "count": len(tasks)}, ensure_ascii=False))
     if not tasks:
@@ -633,9 +666,17 @@ def main() -> int:
                 checker.login()
         return 0
     if args.queue_only:
+        try:
+            send_heartbeat(cfg, load=0.0)
+        except Exception:
+            pass
         print_queue(fetch_queue(cfg))
         return 0
     if args.pla:
+        try:
+            send_heartbeat(cfg, load=0.2)
+        except Exception:
+            pass
         query_one_pla(cfg, args.pla)
         return 0
 

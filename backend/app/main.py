@@ -25,10 +25,12 @@ from backend.app.agent_ops import (
     AgentGspStatusResultReq,
     AgentNotifyTestReq,
     AgentPricingTaskReq,
+    AgentReplayEvalReq,
     AgentSheetStatusUpdateAckReq,
     AgentSheetStatusUpdatesReq,
     AgentSheetProbeReq,
     AgentSheetPushReq,
+    AgentToolBackendHeartbeatReq,
 )
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
@@ -1117,9 +1119,61 @@ def agent_state() -> Dict[str, Any]:
     return _require_agent().read_state()
 
 
+@app.get("/api/agent/traces")
+def agent_traces(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_agent_traces(limit=limit)
+
+
+@app.get("/api/agent/traces/{run_id}")
+def agent_trace(run_id: str) -> Dict[str, Any]:
+    return _require_agent().read_agent_trace(run_id)
+
+
+@app.get("/api/agent/memory/pla/{pla_no}")
+def agent_pla_timeline(pla_no: str) -> Dict[str, Any]:
+    return _require_agent().read_pla_timeline(pla_no)
+
+
+@app.get("/api/agent/skills")
+def agent_skills() -> Dict[str, Any]:
+    return _require_agent().list_agent_skills()
+
+
+@app.get("/api/agent/skills/{skill_name}")
+def agent_skill(skill_name: str) -> Dict[str, Any]:
+    return _require_agent().read_agent_skill(skill_name)
+
+
+@app.get("/api/agent/tool-backends")
+def agent_tool_backends() -> Dict[str, Any]:
+    return _require_agent().list_tool_backends()
+
+
+@app.post("/api/agent/tool-backends/heartbeat")
+def agent_tool_backend_heartbeat(req: AgentToolBackendHeartbeatReq) -> Dict[str, Any]:
+    return _require_agent().record_tool_backend_heartbeat(req)
+
+
+@app.get("/api/agent/reflections")
+def agent_reflections(limit: int = 50) -> Dict[str, Any]:
+    return _require_agent().list_agent_reflections(limit=limit)
+
+
+@app.post("/api/agent/evals/replay")
+def agent_replay_eval(req: AgentReplayEvalReq) -> Dict[str, Any]:
+    return _require_agent().run_replay_eval(req)
+
+
 @app.post("/api/agent/notify/test")
 def agent_notify_test(req: AgentNotifyTestReq) -> Dict[str, Any]:
     return _require_agent().test_notification(req)
+
+
+@app.post("/api/agent/dingtalk/event")
+def agent_dingtalk_event(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be object")
+    return _require_agent().handle_dingtalk_event(payload, headers=dict(request.headers), source="dingtalk")
 
 
 @app.post("/api/agent/pricing-task")
