@@ -23,14 +23,23 @@ from backend.app.agent_ops import (
     AgentConfigReq,
     AgentGspQueueReq,
     AgentGspStatusResultReq,
-    AgentNotifyTestReq,
-    AgentPricingTaskReq,
     AgentReplayEvalReq,
     AgentSheetStatusUpdateAckReq,
     AgentSheetStatusUpdatesReq,
     AgentSheetProbeReq,
     AgentSheetPushReq,
     AgentToolBackendHeartbeatReq,
+)
+from backend.app.pricing_workflow import (
+    PricingWorkflowClaimReq,
+    PricingWorkflowCreateReq,
+    PricingWorkflowReportReq,
+    PricingWorkflowRetryReq,
+    PricingWorkflowStore,
+    WorkflowConflict,
+    WorkflowError,
+    WorkflowNotFound,
+    WorkflowValidationError,
 )
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
@@ -1018,6 +1027,7 @@ app = FastAPI(title="Dahua Pricing Auto (Deploy Server)", version="0.2.0")
 
 _engine: Optional[PricingEngine] = None
 _agent: Optional[AgentAutomation] = None
+_pricing_workflows: Optional[PricingWorkflowStore] = None
 
 
 @app.on_event("startup")
@@ -1032,11 +1042,32 @@ def _startup() -> None:
     _agent = AgentAutomation(RUNTIME_DIR)
     _agent.ensure_dirs()
     _agent.start_poller(_agent_compute_rows)
+    global _pricing_workflows
+    _pricing_workflows = PricingWorkflowStore(RUNTIME_DIR)
+    _pricing_workflows.ensure_dirs()
 
 
 def _require_agent() -> AgentAutomation:
     assert _agent is not None
     return _agent
+
+
+def _require_pricing_workflows() -> PricingWorkflowStore:
+    global _pricing_workflows
+    if _pricing_workflows is None:
+        _pricing_workflows = PricingWorkflowStore(RUNTIME_DIR)
+        _pricing_workflows.ensure_dirs()
+    return _pricing_workflows
+
+
+def _workflow_http_error(exc: WorkflowError) -> HTTPException:
+    if isinstance(exc, WorkflowNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, WorkflowConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, WorkflowValidationError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail=str(exc))
 
 
 def _agent_compute_rows(pns: List[str], apply_black_markup: bool) -> Dict[str, Any]:
@@ -1214,11 +1245,6 @@ def agent_replay_eval(req: AgentReplayEvalReq) -> Dict[str, Any]:
     return _require_agent().run_replay_eval(req)
 
 
-@app.post("/api/agent/notify/test")
-def agent_notify_test(req: AgentNotifyTestReq) -> Dict[str, Any]:
-    return _require_agent().test_notification(req)
-
-
 @app.post("/api/agent/dingtalk/event")
 def agent_dingtalk_event(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     if not isinstance(payload, dict):
@@ -1227,14 +1253,80 @@ def agent_dingtalk_event(payload: Dict[str, Any], request: Request) -> Dict[str,
 
 
 @app.post("/api/agent/pricing-task")
-def agent_create_pricing_task(req: AgentPricingTaskReq) -> Dict[str, Any]:
-    _ = req
-    raise HTTPException(status_code=403, detail="agent pricing task is disabled in sheet-probe phase")
+def agent_create_pricing_task(req: PricingWorkflowCreateReq) -> Dict[str, Any]:
+    cfg = _require_agent().read_config(redacted=False)
+    if req.submission_authorized:
+        _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        task = _require_pricing_workflows().create(
+            req,
+            _agent_compute_rows,
+            default_apply_black_markup=bool(cfg.get("apply_black_markup", True)),
+        )
+        return task if req.submission_authorized else PricingWorkflowStore.redact(task)
+    except WorkflowError as exc:
+        raise _workflow_http_error(exc) from exc
+
+
+@app.get("/api/agent/pricing-workflows")
+def agent_pricing_workflows(limit: int = 50, state: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        return _require_pricing_workflows().list(limit=limit, state=state)
+    except WorkflowError as exc:
+        raise _workflow_http_error(exc) from exc
+
+
+@app.post("/api/agent/pricing-workflows/claim")
+def agent_claim_pricing_workflow(req: PricingWorkflowClaimReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_pricing_workflows().claim(
+            worker_id=req.worker_id,
+            capabilities=req.capabilities,
+            lease_seconds=req.lease_seconds,
+        )
+    except WorkflowError as exc:
+        raise _workflow_http_error(exc) from exc
+
+
+@app.post("/api/agent/pricing-workflows/{task_id}/report")
+def agent_report_pricing_workflow(task_id: str, req: PricingWorkflowReportReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_pricing_workflows().report(
+            task_id,
+            worker_id=req.worker_id,
+            lease_id=req.lease_id,
+            report_id=req.report_id,
+            outcome=req.outcome,
+            pla_no=req.pla_no,
+            detail=req.detail,
+            evidence=req.evidence,
+        )
+    except WorkflowError as exc:
+        raise _workflow_http_error(exc) from exc
+
+
+@app.post("/api/agent/pricing-workflows/{task_id}/retry")
+def agent_retry_pricing_workflow(task_id: str, req: PricingWorkflowRetryReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_pricing_workflows().retry(
+            task_id,
+            reason=req.reason,
+            target_state=req.target_state,
+            expected_version=req.expected_version,
+        )
+    except WorkflowError as exc:
+        raise _workflow_http_error(exc) from exc
 
 
 @app.get("/api/agent/tasks/{task_id}")
 def agent_task_status(task_id: str) -> Dict[str, Any]:
-    return _require_agent().read_task(task_id)
+    task = _require_agent().read_task(task_id)
+    if task.get("schema_version") == 1:
+        return PricingWorkflowStore.redact(task)
+    return task
 
 
 @app.get("/api/agent/sheet/parsed/latest")

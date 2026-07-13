@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import base64
 import hashlib
-import hmac
 import json
 import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -28,20 +27,15 @@ class AgentConfigReq(BaseModel):
     enabled: bool = Field(default=True)
     mode: str = Field(default="pricing_ops")
     notification_keyword: str = Field(default="定价Agent")
-    webhook_url: Optional[str] = Field(default=None)
-    webhook_secret: Optional[str] = Field(default=None)
-    notify_on_task_done: bool = Field(default=True)
-    notify_on_task_failed: bool = Field(default=True)
     poller_enabled: bool = Field(default=False)
     poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
     sheet_source_type: str = Field(default="file")
     sheet_source_path: str = Field(default="")
     apply_black_markup: bool = Field(default=True)
     dry_run: bool = Field(default=False)
-
-
-class AgentNotifyTestReq(BaseModel):
-    message: str = Field(default="测试消息：自动化系统已接入当前服务器")
+    group_reply_enabled: bool = Field(default=False)
+    reply_to_mentions_only: bool = Field(default=True)
+    group_reply_allowed_sender_ids: List[str] = Field(default_factory=list)
 
 
 class AgentPricingTaskReq(BaseModel):
@@ -81,10 +75,12 @@ class AgentGspStatusResultReq(BaseModel):
     sheet: Optional[str] = Field(default=None)
     row_index: Optional[int] = Field(default=None)
     pn: Optional[str] = Field(default=None)
+    internal_model: Optional[str] = Field(default=None)
     requester: Optional[str] = Field(default=None)
     sheet_status: Optional[str] = Field(default=None)
     approval_current_step: Optional[str] = Field(default=None)
     approval_taskers: Optional[str] = Field(default=None)
+    related_rows: List[Dict[str, Any]] = Field(default_factory=list)
     checked_at: Optional[str] = Field(default=None)
     source: str = Field(default="windows-desktop-agent")
     detail: Optional[str] = Field(default=None)
@@ -122,6 +118,7 @@ class AgentToolBackendHeartbeatReq(BaseModel):
 
 
 ComputeRows = Callable[[List[str], bool], Dict[str, Any]]
+CHAT_GSP_QUEUE_LIMIT = 500
 
 
 class AgentAutomation:
@@ -133,6 +130,7 @@ class AgentAutomation:
         self.sheet_push_dir = self.agent_dir / "sheet_push"
         self.sheet_parsed_dir = self.agent_dir / "sheet_parsed"
         self.gsp_status_dir = self.agent_dir / "gsp_status"
+        self.gsp_pending_queue_path = self.gsp_status_dir / "pending_queue.json"
         self.sheet_update_dir = self.agent_dir / "sheet_updates"
         self.trace_dir = self.agent_dir / "traces"
         self.event_dir = self.agent_dir / "events"
@@ -147,6 +145,7 @@ class AgentAutomation:
         self.tool_backend_dir = self.agent_dir / "tool_backends"
         self.reflection_dir = self.agent_dir / "reflections"
         self.eval_dir = self.agent_dir / "evals"
+        self.unsupported_request_dir = self.agent_dir / "unsupported_requests"
         self.config_path = self.agent_dir / "config.json"
         self.state_path = self.agent_dir / "state.json"
         self._poller_thread: Optional[threading.Thread] = None
@@ -175,6 +174,7 @@ class AgentAutomation:
         self.tool_backend_dir.mkdir(parents=True, exist_ok=True)
         self.reflection_dir.mkdir(parents=True, exist_ok=True)
         self.eval_dir.mkdir(parents=True, exist_ok=True)
+        self.unsupported_request_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_builtin_skills()
         self._ensure_builtin_tool_backends()
         if not self.config_path.exists():
@@ -197,16 +197,20 @@ class AgentAutomation:
             "enabled": True,
             "mode": "pricing_ops",
             "notification_keyword": "定价Agent",
-            "webhook_url": "",
-            "webhook_secret": "",
-            "notify_on_task_done": True,
-            "notify_on_task_failed": True,
             "poller_enabled": False,
             "poll_interval_seconds": 60,
             "sheet_source_type": "file",
             "sheet_source_path": "",
             "apply_black_markup": True,
             "dry_run": False,
+            "group_reply_enabled": False,
+            "reply_to_mentions_only": True,
+            "group_reply_allowed_sender_ids": [],
+            "llm_intent_enabled": True,
+            "llm_intent_key_path": "/data/dahua_pricing_runtime/agent/ds-api.key",
+            "llm_intent_base_url": "https://api.deepseek.com",
+            "llm_intent_model": "deepseek-chat",
+            "llm_intent_min_confidence": 0.65,
         }
 
     def _read_json(self, path: Path, fallback: Any) -> Any:
@@ -1032,6 +1036,7 @@ class AgentAutomation:
                 "load": c.get("load"),
                 "last_heartbeat_at": c.get("last_heartbeat_at"),
                 "selection_score": c.get("_selection_score"),
+                "metadata": c.get("metadata") if isinstance(c.get("metadata"), dict) else {},
             }
             for c in candidates
         ]
@@ -1048,6 +1053,7 @@ class AgentAutomation:
             "status": self._safe_text(chosen.get("status")),
             "capability": cap,
             "load": chosen.get("load"),
+            "metadata": chosen.get("metadata") if isinstance(chosen.get("metadata"), dict) else {},
             "last_heartbeat_at": chosen.get("last_heartbeat_at"),
             "selection_score": chosen.get("_selection_score"),
             "reason": "selected by capability and freshness-adjusted load",
@@ -1175,17 +1181,9 @@ class AgentAutomation:
         self.ensure_dirs()
         cfg = self._default_config()
         cfg.update(self._read_json(self.config_path, {}))
-        if os.getenv("DAHUA_AGENT_WEBHOOK_URL"):
-            cfg["webhook_url"] = os.getenv("DAHUA_AGENT_WEBHOOK_URL", "")
-        if os.getenv("DAHUA_AGENT_WEBHOOK_SECRET"):
-            cfg["webhook_secret"] = os.getenv("DAHUA_AGENT_WEBHOOK_SECRET", "")
         cfg["poll_interval_seconds"] = max(10, min(3600, int(cfg.get("poll_interval_seconds") or 60)))
         if redacted:
             out = dict(cfg)
-            out["webhook_url"] = self._redact_url(str(out.get("webhook_url") or ""))
-            out["webhook_secret"] = ""
-            out["has_webhook_url"] = bool(cfg.get("webhook_url"))
-            out["has_webhook_secret"] = bool(cfg.get("webhook_secret"))
             out["config_path"] = str(self.config_path)
             out["state_path"] = str(self.state_path)
             return out
@@ -1193,12 +1191,7 @@ class AgentAutomation:
 
     def save_config(self, req: AgentConfigReq) -> Dict[str, Any]:
         self.ensure_dirs()
-        current = self.read_config(redacted=False)
         payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-        if payload.get("webhook_url") is None:
-            payload["webhook_url"] = current.get("webhook_url", "")
-        if payload.get("webhook_secret") is None:
-            payload["webhook_secret"] = current.get("webhook_secret", "")
         payload["mode"] = str(payload.get("mode") or "pricing_ops").strip() or "pricing_ops"
         payload["notification_keyword"] = (
             str(payload.get("notification_keyword") or "定价Agent").strip() or "定价Agent"
@@ -1206,6 +1199,14 @@ class AgentAutomation:
         payload["sheet_source_type"] = str(payload.get("sheet_source_type") or "file").strip() or "file"
         payload["sheet_source_path"] = str(payload.get("sheet_source_path") or "").strip()
         payload["poll_interval_seconds"] = max(10, min(3600, int(payload.get("poll_interval_seconds") or 60)))
+        allowed_sender_ids = payload.get("group_reply_allowed_sender_ids") or []
+        if isinstance(allowed_sender_ids, str):
+            allowed_sender_ids = [x.strip() for x in allowed_sender_ids.split(",") if x.strip()]
+        elif isinstance(allowed_sender_ids, list):
+            allowed_sender_ids = [self._safe_text(x) for x in allowed_sender_ids if self._safe_text(x)]
+        else:
+            allowed_sender_ids = []
+        payload["group_reply_allowed_sender_ids"] = allowed_sender_ids
         self._write_json(self.config_path, payload)
         return self.read_config(redacted=True)
 
@@ -1399,48 +1400,6 @@ class AgentAutomation:
         self._update_state({"last_replay_eval": payload})
         return {"ok": True, **payload}
 
-    def send_notification(self, content: str) -> Dict[str, Any]:
-        cfg = self.read_config(redacted=False)
-        if not bool(cfg.get("enabled", True)):
-            return {"ok": False, "skipped": True, "reason": "agent disabled"}
-        webhook_url = str(cfg.get("webhook_url") or "").strip()
-        if not webhook_url:
-            raise HTTPException(status_code=400, detail="agent webhook_url is empty")
-
-        keyword = str(cfg.get("notification_keyword") or "").strip()
-        msg = str(content or "").strip()
-        if keyword and keyword not in msg:
-            msg = f"【{keyword}】{msg}"
-
-        payload = {
-            "msgtype": "text",
-            "text": {"content": msg},
-        }
-        url = self._signed_webhook_url(webhook_url, str(cfg.get("webhook_secret") or "").strip())
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                status = int(resp.status)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"webhook send failed: {type(e).__name__}: {e}") from e
-
-        parsed: Any
-        try:
-            parsed = json.loads(body) if body else {}
-        except Exception:
-            parsed = {"raw": body}
-        return {"ok": 200 <= status < 300, "status": status, "response": parsed, "content": msg}
-
-    def test_notification(self, req: AgentNotifyTestReq) -> Dict[str, Any]:
-        return self.send_notification(req.message)
-
     def handle_dingtalk_event(
         self,
         payload: Dict[str, Any],
@@ -1455,28 +1414,84 @@ class AgentAutomation:
             raise HTTPException(status_code=401, detail="invalid inbound event token")
 
         text = self._extract_event_text(payload)
-        command = self._parse_approval_command(text)
+        mentioned_bot = self._event_mentions_bot(payload, text)
+        command = self._parse_approval_command(text, allow_llm=mentioned_bot)
+        if command.get("matched") and self._safe_text(command.get("intent")) == "check_sheet_pla" and not self._safe_text(command.get("sheet")):
+            parsed = self.read_parsed_sheet_push("latest")
+            command = dict(command)
+            command["sheet"] = self._sheet_filter_from_month_text(text, parsed) or self._latest_sheet_filter(parsed)
+        intent = self._safe_text(command.get("intent"))
         event = self._record_business_event(
             source=source,
             event_type="incoming_message",
             source_ref=self._safe_text(payload.get("msgId") or payload.get("messageId") or payload.get("conversationId")),
-            intent="check_gsp_approval_status" if command.get("matched") else "",
+            intent=intent if command.get("matched") else "",
             summary={
                 "matched": bool(command.get("matched")),
                 "reason": command.get("reason"),
+                "intent": intent,
                 "sheet": command.get("sheet"),
                 "limit": command.get("limit"),
+                "mentioned_bot": mentioned_bot,
+                "intent_source": command.get("source"),
             },
-            payload={"text": text[:2000], "raw_keys": sorted([str(k) for k in payload.keys()])},
+            payload={
+                "text": text[:2000],
+                "mentioned_bot": mentioned_bot,
+                "sender_id": self._event_sender_id(payload),
+                "raw_keys": sorted([str(k) for k in payload.keys()]),
+            },
         )
         if not command.get("matched"):
+            unsupported = self._record_unsupported_request(
+                text=text,
+                payload=payload,
+                command=command,
+                event=event,
+                source=source,
+            )
             return {
                 "ok": True,
                 "matched": False,
                 "reason": command.get("reason") or "not a known command",
+                "unsupported": True,
+                "unsupported_request_id": unsupported.get("unsupported_request_id"),
                 "source": source,
                 "event_id": event.get("event_id"),
                 "raw_text": text,
+            }
+
+        if intent == "scan_gsp_under_approval":
+            reply_cfg = self.read_config(redacted=False)
+            event_record = {
+                "source": source,
+                "received_at": utc_now_iso(),
+                "raw_text": text[:800],
+                "command_match": command,
+                "mentioned_bot": mentioned_bot,
+                "sender_id": self._event_sender_id(payload),
+                "triggered_tasks": 0,
+                "sheet": command.get("sheet"),
+                "limit": int(command.get("limit") or 20),
+                "reply_policy": {
+                    "can_reply_to_group": bool(mentioned_bot)
+                    and bool(reply_cfg.get("group_reply_enabled"))
+                    and not bool(reply_cfg.get("dry_run"))
+                    and self._sender_allowed_for_group_reply(payload, reply_cfg),
+                    "dry_run": bool(reply_cfg.get("dry_run")),
+                    "requires_mention": bool(reply_cfg.get("reply_to_mentions_only", True)),
+                },
+            }
+            self._update_state({"last_inbound_event": event_record})
+            return {
+                "ok": True,
+                "matched": True,
+                "source": source,
+                "event_id": event.get("event_id"),
+                "command": command,
+                "queue": {"ok": True, "count": 0, "tasks": []},
+                "event": event_record,
+                "pending_integration": "windows under-approval scanner result callback is not wired yet",
             }
 
         token = self._sheet_push_token()
@@ -1499,14 +1514,29 @@ class AgentAutomation:
             session_type="chat_command",
         )
 
+        reply_cfg = self.read_config(redacted=False)
+        reply_policy = {
+            "can_reply_to_group": bool(mentioned_bot)
+            and bool(reply_cfg.get("group_reply_enabled"))
+            and not bool(reply_cfg.get("dry_run"))
+            and self._sender_allowed_for_group_reply(payload, reply_cfg),
+            "dry_run": bool(reply_cfg.get("dry_run")),
+            "requires_mention": bool(reply_cfg.get("reply_to_mentions_only", True)),
+        }
+        self._attach_async_reply_context(queue, payload, reply_policy)
+        responsive_trigger = self._trigger_responsive_tool_backend(queue)
         event_record = {
             "source": source,
             "received_at": utc_now_iso(),
             "raw_text": text[:800],
             "command_match": command,
+            "mentioned_bot": mentioned_bot,
+            "sender_id": self._event_sender_id(payload),
             "triggered_tasks": queue.get("count", 0),
             "sheet": command.get("sheet"),
             "limit": int(command.get("limit") or 200),
+            "reply_policy": reply_policy,
+            "responsive_trigger": responsive_trigger,
         }
         self._update_state({"last_inbound_event": event_record})
 
@@ -1518,6 +1548,7 @@ class AgentAutomation:
             "command": command,
             "queue": queue,
             "event": event_record,
+            "responsive_trigger": responsive_trigger,
         }
 
     def _verify_inbound_event_secret(self, headers: Dict[str, Any]) -> bool:
@@ -1552,6 +1583,272 @@ class AgentAutomation:
             if s.lower().startswith("bearer ") and s[7:].strip() == expected:
                 return True
         return False
+
+    def _event_mentions_bot(self, payload: Dict[str, Any], text: str = "") -> bool:
+        if not isinstance(payload, dict):
+            payload = {}
+
+        def _truthy(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return False
+
+        def _walk_dicts(value: Any) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            if isinstance(value, dict):
+                out.append(value)
+                for child in value.values():
+                    out.extend(_walk_dicts(child))
+            elif isinstance(value, list):
+                for child in value:
+                    out.extend(_walk_dicts(child))
+            return out
+
+        for item in _walk_dicts(payload):
+            for key in ("isInAtList", "isAt", "atMe", "mentioned", "mentionedBot", "robotMentioned"):
+                if _truthy(item.get(key)):
+                    return True
+
+        combined = " ".join(
+            [
+                self._safe_text(text),
+                self._safe_text(payload.get("text")),
+                self._safe_text(payload.get("content")),
+                self._safe_text(payload.get("message")),
+            ]
+        )
+        names = [
+            "机器人",
+            "定价询价自动化Agent",
+            "定价询价自动化",
+            self._safe_text(self.read_config(redacted=False).get("notification_keyword")),
+            self._safe_text(payload.get("robotCode")),
+            self._safe_text(payload.get("chatbotCorpId")),
+        ]
+        names = [x for x in names if x]
+        return any(f"@{name}" in combined or f"@ {name}" in combined for name in names)
+
+    def _event_sender_id(self, payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+
+        def _find(value: Any) -> str:
+            if isinstance(value, dict):
+                for key in (
+                    "senderStaffId",
+                    "senderId",
+                    "senderUserId",
+                    "staffId",
+                    "userId",
+                    "userid",
+                    "openId",
+                    "senderNick",
+                ):
+                    found = self._safe_text(value.get(key))
+                    if found:
+                        return found
+                for child in value.values():
+                    found = _find(child)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = _find(child)
+                    if found:
+                        return found
+            return ""
+
+        return _find(payload)
+
+    def _sender_allowed_for_group_reply(self, payload: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+        allowed = cfg.get("group_reply_allowed_sender_ids") or []
+        if isinstance(allowed, str):
+            allowed = [x.strip() for x in allowed.split(",") if x.strip()]
+        allowed_set = {self._safe_text(x) for x in allowed if self._safe_text(x)}
+        if not allowed_set:
+            return True
+        sender_id = self._event_sender_id(payload)
+        return bool(sender_id and sender_id in allowed_set)
+
+    def _attach_async_reply_context(
+        self,
+        queue: Dict[str, Any],
+        payload: Dict[str, Any],
+        reply_policy: Dict[str, Any],
+    ) -> None:
+        session_id = self._safe_text(queue.get("session_id"))
+        run_id = self._safe_text(queue.get("run_id"))
+        session_webhook = self._safe_text(payload.get("sessionWebhook"))
+        if not session_id or not run_id:
+            return
+        patch = {
+            "async_reply": {
+                "enabled": bool(reply_policy.get("can_reply_to_group")) and bool(session_webhook),
+                "session_webhook": session_webhook,
+                "session_webhook_expired_time": self._safe_text(payload.get("sessionWebhookExpiredTime")),
+                "sender_staff_id": self._safe_text(payload.get("senderStaffId")),
+                "sender_id": self._safe_text(payload.get("senderId")),
+                "conversation_id": self._safe_text(payload.get("conversationId")),
+                "conversation_title": self._safe_text(payload.get("conversationTitle")),
+                "message_id": self._safe_text(payload.get("msgId") or payload.get("messageId")),
+                "reply_policy": reply_policy,
+                "queued_count": int(queue.get("count") or 0),
+                "created_at": utc_now_iso(),
+            }
+        }
+        self._patch_agent_session(session_id, patch=patch)
+        self._update_trace_metadata(run_id, {"async_reply_session_id": session_id})
+
+    def _post_dingtalk_session_text(self, session_webhook: str, text: str, *, at_user_id: str = "") -> Dict[str, Any]:
+        values: Dict[str, Any] = {
+            "msgtype": "text",
+            "text": {"content": text},
+        }
+        if at_user_id:
+            values["at"] = {"atUserIds": [at_user_id]}
+        req = urllib.request.Request(
+            session_webhook,
+            data=json.dumps(values, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "*/*"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                body_text = resp.read().decode("utf-8", errors="replace")
+                body = json.loads(body_text) if body_text else {}
+                return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status), "response": body}
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return {"ok": False, "status": int(e.code), "error": body[:1000]}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _post_agent_control_run_once(self, control_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        token = self._sheet_push_token()
+        url = control_url.rstrip("/") + "/run-once"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+                "X-Agent-Token": token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                body_text = resp.read().decode("utf-8", errors="replace")
+                body = json.loads(body_text) if body_text else {}
+                return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status), "response": body}
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            return {"ok": False, "status": int(e.code), "error": body}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _trigger_responsive_tool_backend(self, queue: Dict[str, Any]) -> Dict[str, Any]:
+        if int(queue.get("count") or 0) <= 0:
+            return {"triggered": False, "reason": "queue is empty"}
+        tasks = queue.get("tasks") if isinstance(queue.get("tasks"), list) else []
+        first = tasks[0] if tasks else {}
+        backend = first.get("selected_tool_backend") if isinstance(first.get("selected_tool_backend"), dict) else {}
+        backend_id = self._safe_text(backend.get("backend_id"))
+        if backend_id:
+            record = self._read_json(self.tool_backend_dir / f"{self._safe_id(backend_id)}.json", {})
+            if isinstance(record, dict):
+                merged = dict(record)
+                merged.update(backend)
+                if isinstance(record.get("metadata"), dict):
+                    merged["metadata"] = record.get("metadata")
+                backend = merged
+        metadata = backend.get("metadata") if isinstance(backend.get("metadata"), dict) else {}
+        control_url = self._safe_text(
+            metadata.get("control_url") or metadata.get("responsive_url") or metadata.get("run_once_url")
+        )
+        if not control_url:
+            return {"triggered": False, "reason": "selected backend has no control_url", "backend_id": backend_id}
+        payload = {
+            "run_id": self._safe_text(queue.get("run_id")),
+            "session_id": self._safe_text(queue.get("session_id")),
+            "sheet": self._safe_text(first.get("sheet")),
+            "max_tasks": min(max(1, int(queue.get("count") or 1)), 500),
+            "no_push": False,
+            "source": "linux-backend-responsive-trigger",
+        }
+        result = self._post_agent_control_run_once(control_url, payload)
+        triggered = bool(result.get("ok"))
+        out = {
+            "triggered": triggered,
+            "backend_id": backend_id,
+            "control_url": control_url,
+            "payload": payload,
+            "result": result,
+        }
+        run_id = self._safe_text(queue.get("run_id"))
+        self._add_trace_span(
+            run_id,
+            "responsive_windows_agent_trigger",
+            status="ok" if triggered else "failed",
+            metadata=out,
+        )
+        self._update_trace_metadata(run_id, {"responsive_trigger": out})
+        return out
+
+    def _record_unsupported_request(
+        self,
+        *,
+        text: str,
+        payload: Dict[str, Any],
+        command: Dict[str, Any],
+        event: Dict[str, Any],
+        source: str,
+    ) -> Dict[str, Any]:
+        self.ensure_dirs()
+        request_id = self._make_id(
+            "unsupported",
+            self._safe_text(source),
+            self._safe_text(event.get("event_id")),
+            self._safe_text(text)[:200],
+            utc_now_iso(),
+        )
+        record = {
+            "unsupported_request_id": request_id,
+            "created_at": utc_now_iso(),
+            "source": self._safe_text(source),
+            "event_id": self._safe_text(event.get("event_id")),
+            "message_id": self._safe_text(payload.get("msgId") or payload.get("messageId")),
+            "conversation_id": self._safe_text(payload.get("conversationId")),
+            "conversation_title": self._safe_text(payload.get("conversationTitle")),
+            "sender_id": self._event_sender_id(payload),
+            "mentioned_bot": self._event_mentions_bot(payload, text),
+            "text": self._safe_text(text)[:2000],
+            "router_reason": self._safe_text(command.get("reason")),
+            "router_source": self._safe_text(command.get("source")),
+            "raw_intent": {
+                k: v
+                for k, v in command.items()
+                if k
+                in {
+                    "intent",
+                    "sheet",
+                    "pla_no",
+                    "country",
+                    "limit",
+                    "confidence",
+                    "reason",
+                    "source",
+                }
+            },
+            "status": "new",
+        }
+        self._write_json(self.unsupported_request_dir / f"{request_id}.json", record)
+        self._update_state({"last_unsupported_request": record})
+        return record
 
     def _extract_event_text(self, payload: Dict[str, Any]) -> str:
         def _coerce(val: Any) -> str:
@@ -1592,48 +1889,196 @@ class AgentAutomation:
 
         return text.strip()
 
-    def _parse_approval_command(self, text: str) -> Dict[str, Any]:
+    def _parse_approval_command(self, text: str, *, allow_llm: bool = False) -> Dict[str, Any]:
         norm = self._safe_text(text)
         if not norm:
             return {"matched": False, "reason": "empty message"}
 
         lowered = norm.lower()
-        has_action = any(
-            k in norm
-            for k in [
-                "查审批",
-                "查一下审批",
-                "帮我查",
-                "帮我查一下",
-                "查询审批",
-                "审批状态",
-                "pla",
-                "gsp",
-                "审批",
-            ]
-        )
+        under_approval_markers = [
+            "under approval",
+            "gsp所有待审批",
+            "gsp 所有待审批",
+            "当前gsp",
+            "当前 GSP",
+            "所有待审批",
+            "待审批摘要",
+            "输出under approval",
+            "输出 Under Approval",
+            "谁手上卡",
+            "卡着最多",
+            "卡谁",
+        ]
+        if any(k.lower() in lowered for k in under_approval_markers):
+            return {
+                "matched": True,
+                "intent": "scan_gsp_under_approval",
+                "source": "rules",
+                "text": norm,
+                "sheet": None,
+                "limit": CHAT_GSP_QUEUE_LIMIT,
+                "country": "FR",
+                "keywords": [
+                    k
+                    for k in ["GSP", "Under Approval", "待审批", "谁手上卡", "摘要"]
+                    if k.lower() in lowered
+                ],
+                "confidence": 1.0,
+            }
+
+        action_markers = [
+            "查审批",
+            "查一下审批",
+            "帮我查",
+            "帮我查一下",
+            "查询审批",
+            "审批状态",
+            "在线表格",
+            "表格pla",
+            "表格 pla",
+            "pla",
+            "gsp",
+            "审批",
+        ]
+        has_action = any(k.lower() in lowered for k in action_markers)
         if not has_action:
+            if allow_llm:
+                llm_command = self._parse_deepseek_intent(norm)
+                if llm_command.get("matched"):
+                    return llm_command
             return {"matched": False, "reason": "no command keyword"}
 
         sheet: Optional[str] = None
-        m = re.search(r"\b(\d{4}\.\d{2})\b", norm)
+        m = re.search(r"\b(\d{4}\.\d{1,2})\b", norm)
         if m:
-            sheet = m.group(1)
-
-        limit = 200
-        m = re.search(r"(?:前|查|处理|limit|只查)\s*(\d{1,3})\s*(?:条|个|项)?", lowered)
-        if m:
-            try:
-                limit = min(max(1, int(m.group(1))), 500)
-            except Exception:
-                pass
+            sheet = self._normalize_sheet_filter(m.group(1))
 
         return {
             "matched": True,
+            "intent": "check_sheet_pla",
+            "source": "rules",
             "text": norm,
             "sheet": sheet,
-            "limit": limit,
+            "limit": CHAT_GSP_QUEUE_LIMIT,
             "keywords": [k for k in ["查审批", "查一下", "帮我查", "审批", "PLA", "GSP"] if k.lower() in lowered],
+            "confidence": 1.0,
+        }
+
+    def _parse_deepseek_intent(self, text: str) -> Dict[str, Any]:
+        cfg = self.read_config(redacted=False)
+        if not bool(cfg.get("llm_intent_enabled", True)):
+            return {"matched": False, "reason": "llm intent disabled"}
+        api_key = self._read_deepseek_api_key(cfg)
+        if not api_key:
+            return {"matched": False, "reason": "deepseek api key missing"}
+
+        system_prompt = (
+            "你是定价询价自动化Agent的意图路由器。只输出 JSON，不要解释。"
+            "允许的 intent 只有：check_sheet_pla, scan_gsp_under_approval, unknown。"
+            "check_sheet_pla 表示查询线上表格里的待处理 PLA/GSP 审批队列，可包含 sheet 如 2026.07。"
+            "scan_gsp_under_approval 表示扫描 GSP 当前所有 Under Approval/待审批，或统计谁手上卡着最多，或输出 Under Approval 摘要。"
+            "不要编造工具结果，只抽取意图和参数。"
+        )
+        user_prompt = {
+            "message": text[:1000],
+            "output_schema": {
+                "intent": "check_sheet_pla | scan_gsp_under_approval | unknown",
+                "sheet": "YYYY.MM or empty",
+                "pla_no": "PLA... or empty",
+                "country": "country code, default FR",
+                "limit": "integer, ignored for check_sheet_pla because table PLA checks are always full-scan",
+                "confidence": "0.0 to 1.0",
+            },
+        }
+        base_url = self._safe_text(cfg.get("llm_intent_base_url")) or "https://api.deepseek.com"
+        url = base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self._safe_text(cfg.get("llm_intent_model")) or "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+            "max_tokens": 256,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                body_text = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            return {"matched": False, "reason": f"deepseek intent HTTP {e.code}: {body}"}
+        except Exception as e:
+            return {"matched": False, "reason": f"deepseek intent failed: {type(e).__name__}: {e}"}
+
+        try:
+            body = json.loads(body_text or "{}")
+            content = (
+                ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if isinstance(body, dict)
+                else ""
+            )
+            parsed = json.loads(self._safe_text(content))
+        except Exception as e:
+            return {"matched": False, "reason": f"deepseek intent parse failed: {type(e).__name__}"}
+        return self._coerce_intent_command(parsed, text, source="deepseek")
+
+    def _read_deepseek_api_key(self, cfg: Dict[str, Any]) -> str:
+        env_key = self._safe_text(os.getenv("DEEPSEEK_API_KEY"))
+        if env_key:
+            return env_key
+        key_path = self._safe_text(cfg.get("llm_intent_key_path")) or "/data/dahua_pricing_runtime/agent/ds-api.key"
+        try:
+            return Path(key_path).read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+
+    def _coerce_intent_command(self, payload: Dict[str, Any], text: str, *, source: str) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"matched": False, "reason": "intent payload is not object"}
+        intent = self._safe_text(payload.get("intent"))
+        if intent not in {"check_sheet_pla", "scan_gsp_under_approval"}:
+            return {"matched": False, "reason": "intent unknown"}
+        try:
+            confidence = float(payload.get("confidence") or 0)
+        except Exception:
+            confidence = 0
+        min_conf = float(self.read_config(redacted=False).get("llm_intent_min_confidence") or 0.65)
+        if confidence < min_conf:
+            return {"matched": False, "reason": f"intent confidence too low: {confidence:.2f}"}
+
+        sheet = self._normalize_sheet_filter(payload.get("sheet"))
+        if not sheet:
+            m = re.search(r"\b(\d{4}\.\d{1,2})\b", text)
+            if m:
+                sheet = self._normalize_sheet_filter(m.group(1))
+        try:
+            limit = min(max(1, int(payload.get("limit") or CHAT_GSP_QUEUE_LIMIT)), CHAT_GSP_QUEUE_LIMIT)
+        except Exception:
+            limit = CHAT_GSP_QUEUE_LIMIT
+        if intent == "check_sheet_pla":
+            limit = CHAT_GSP_QUEUE_LIMIT
+        return {
+            "matched": True,
+            "intent": intent,
+            "source": source,
+            "text": self._safe_text(text),
+            "sheet": sheet or None,
+            "pla_no": self._safe_text(payload.get("pla_no")),
+            "country": self._safe_text(payload.get("country")) or "FR",
+            "limit": limit,
+            "keywords": [],
+            "confidence": confidence,
         }
 
     def create_pricing_task(
@@ -1668,6 +2113,12 @@ class AgentAutomation:
     ) -> Dict[str, Any]:
         self._check_desktop_agent_token(req.token)
         parsed = self.read_parsed_sheet_push("latest")
+        sheet_filter = self._normalize_sheet_filter(req.sheet) or self._latest_sheet_filter(parsed)
+        if trigger_event is None and session_type != "chat_command":
+            pending_response = self._pending_gsp_queue_response(req, sheet_filter)
+            if pending_response:
+                return pending_response
+
         skill = self._skill_version("check_gsp_approval_status")
         event = trigger_event or self._record_business_event(
             source="backend",
@@ -1697,42 +2148,73 @@ class AgentAutomation:
             run_id=run_id,
             metadata={"push_id": parsed.get("push_id"), "sheet": req.sheet, "limit": int(req.limit)},
         )
-        tasks = parsed.get("gsp_check_tasks") or []
-        sheet_filter = self._safe_text(req.sheet)
+        tasks = [
+            t
+            for t in (parsed.get("gsp_check_tasks") or [])
+            if self._is_running_task(t) and (t.get("pla_numbers") or [])
+        ]
         if sheet_filter:
             tasks = [t for t in tasks if self._safe_text(t.get("sheet")) == sheet_filter]
         task_backend = {k: v for k, v in selected_backend.items() if k != "candidates"}
 
         queued: list[Dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
+        queued_by_pla: Dict[tuple[str, str], Dict[str, Any]] = {}
         for task in tasks:
             for pla_no in task.get("pla_numbers") or []:
                 pla = self._safe_text(pla_no)
-                key = (self._safe_text(task.get("sheet")), str(task.get("row_index") or ""), pla)
-                if not pla or key in seen:
+                sheet = self._safe_text(task.get("sheet"))
+                key = (sheet, pla)
+                if not pla:
                     continue
-                seen.add(key)
+                related_row = {
+                    "sheet": task.get("sheet"),
+                    "row_index": task.get("row_index"),
+                    "pla_no": pla,
+                    "requester": task.get("requester"),
+                    "pn": task.get("pn"),
+                    "internal_model": task.get("internal_model"),
+                    "price_level": task.get("price_level"),
+                    "description": task.get("description"),
+                    "owner": task.get("owner"),
+                    "sheet_status": task.get("status"),
+                    "stage": task.get("stage"),
+                    "note": task.get("note"),
+                }
+                if key in queued_by_pla:
+                    queued_by_pla[key].setdefault("related_rows", []).append(related_row)
+                    continue
                 queue_id = hashlib.sha1("|".join(key).encode("utf-8")).hexdigest()[:16]
-                queued.append(
-                    {
-                        "queue_id": queue_id,
-                        "run_id": run_id,
-                        "session_id": session.get("session_id"),
-                        "skill": skill,
-                        "selected_tool_backend": task_backend,
-                        "pla_no": pla,
-                        "sheet": task.get("sheet"),
-                        "row_index": task.get("row_index"),
-                        "requester": task.get("requester"),
-                        "pn": task.get("pn"),
-                        "price_level": task.get("price_level"),
-                        "description": task.get("description"),
-                        "owner": task.get("owner"),
-                        "sheet_status": task.get("status"),
-                        "stage": task.get("stage"),
-                        "task": task,
-                    }
+                latest_gsp = self._latest_gsp_status_result(
+                    sheet=sheet,
+                    row_index=int(task.get("row_index") or 0),
+                    pla_no=pla,
                 )
+                item = {
+                    "queue_id": queue_id,
+                    "run_id": run_id,
+                    "session_id": session.get("session_id"),
+                    "skill": skill,
+                    "selected_tool_backend": task_backend,
+                    "pla_no": pla,
+                    "sheet": task.get("sheet"),
+                    "row_index": task.get("row_index"),
+                    "requester": task.get("requester"),
+                    "pn": task.get("pn"),
+                    "internal_model": task.get("internal_model"),
+                    "price_level": task.get("price_level"),
+                    "description": task.get("description"),
+                    "owner": task.get("owner"),
+                    "sheet_status": task.get("status"),
+                    "stage": task.get("stage"),
+                    "note": task.get("note"),
+                    "related_rows": [related_row],
+                    "latest_gsp_result": latest_gsp,
+                    "event_id": event.get("event_id"),
+                    "source_push_id": parsed.get("push_id"),
+                    "task": task,
+                }
+                queued.append(item)
+                queued_by_pla[key] = item
                 self._update_pla_timeline(
                     pla,
                     "queue_selected",
@@ -1763,6 +2245,8 @@ class AgentAutomation:
                     "row_index": item.get("row_index"),
                     "pla_no": item.get("pla_no"),
                     "pn": item.get("pn"),
+                    "internal_model": item.get("internal_model"),
+                    "related_rows": item.get("related_rows") or [],
                     "requester": item.get("requester"),
                     "sheet_status": item.get("sheet_status"),
                     "compact_memory": (timeline.get("compact_memory") if isinstance(timeline, dict) else {}) or {},
@@ -1804,6 +2288,7 @@ class AgentAutomation:
             item["context_id"] = context.get("context_id")
             item["skill_call_id"] = skill_call.get("skill_call_id")
             item["dispatch_id"] = dispatch.get("dispatch_id")
+        self._upsert_pending_gsp_queue(queued, source=session_type)
         self._patch_agent_session(
             session.get("session_id"),
             status="queued",
@@ -1856,6 +2341,283 @@ class AgentAutomation:
             "tasks": queued,
         }
 
+    def _latest_gsp_status_result(self, *, sheet: str, row_index: int, pla_no: str) -> Dict[str, Any]:
+        jsonl_file = self.gsp_status_dir / "results.jsonl"
+        if not jsonl_file.exists():
+            return {}
+        safe_sheet = self._safe_text(sheet)
+        safe_pla = self._safe_text(pla_no)
+        try:
+            lines = jsonl_file.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        for line in reversed(lines[-1000:]):
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if self._safe_text(record.get("pla_no")) != safe_pla:
+                continue
+            if safe_sheet and self._safe_text(record.get("sheet")) != safe_sheet:
+                continue
+            if row_index and int(record.get("row_index") or 0) != int(row_index):
+                continue
+            return {
+                "status": self._safe_text(record.get("status")),
+                "ok": bool(record.get("ok")),
+                "approval_current_step": self._safe_text(record.get("approval_current_step")),
+                "approval_taskers": self._safe_text(record.get("approval_taskers")),
+                "checked_at": self._safe_text(record.get("checked_at") or record.get("received_at")),
+                "detail": self._safe_text(record.get("detail")),
+                "source": self._safe_text(record.get("source")),
+                "result_id": self._safe_text(record.get("result_id")),
+            }
+        return {}
+
+    def _read_pending_gsp_queue(self) -> list[Dict[str, Any]]:
+        data = self._read_json(self.gsp_pending_queue_path, [])
+        return data if isinstance(data, list) else []
+
+    def _write_pending_gsp_queue(self, tasks: list[Dict[str, Any]]) -> None:
+        self._write_json(self.gsp_pending_queue_path, tasks)
+
+    def _pending_gsp_queue_response(self, req: AgentGspQueueReq, sheet_filter: str) -> Dict[str, Any]:
+        pending = self._read_pending_gsp_queue()
+        if sheet_filter:
+            pending = [t for t in pending if self._safe_text(t.get("sheet")) == sheet_filter]
+        pending = [t for t in pending if self._safe_text(t.get("pla_no"))]
+        if not pending:
+            return {}
+        pending.sort(key=lambda t: (self._safe_text(t.get("sheet")), int(t.get("row_index") or 0), self._safe_text(t.get("pla_no"))))
+        selected = pending[: int(req.limit)]
+        first = selected[0] if selected else {}
+        return {
+            "ok": True,
+            "run_id": self._safe_text(first.get("run_id")),
+            "event_id": self._safe_text(first.get("event_id")),
+            "session_id": self._safe_text(first.get("session_id")),
+            "context_id": self._safe_text(first.get("context_id")),
+            "skill_call_id": self._safe_text(first.get("skill_call_id")),
+            "dispatch_id": self._safe_text(first.get("dispatch_id")),
+            "generated_at": utc_now_iso(),
+            "source_push_id": self._safe_text(first.get("source_push_id")),
+            "summary": {"source": "pending_gsp_queue", "sheet": sheet_filter, "pending_count": len(pending)},
+            "count": len(selected),
+            "tasks": selected,
+        }
+
+    def _upsert_pending_gsp_queue(self, tasks: list[Dict[str, Any]], *, source: str) -> None:
+        if not tasks:
+            return
+        now = utc_now_iso()
+        with self._lock:
+            existing = self._read_pending_gsp_queue()
+            by_queue_id = {self._safe_text(t.get("queue_id")): t for t in existing if self._safe_text(t.get("queue_id"))}
+            for task in tasks:
+                queue_id = self._safe_text(task.get("queue_id"))
+                if not queue_id:
+                    continue
+                record = dict(task)
+                record["pending_queue_source"] = self._safe_text(source)
+                record["pending_queue_updated_at"] = now
+                record.setdefault("pending_queue_created_at", now)
+                previous = by_queue_id.get(queue_id)
+                if previous and self._safe_text(previous.get("pending_queue_created_at")):
+                    record["pending_queue_created_at"] = previous.get("pending_queue_created_at")
+                by_queue_id[queue_id] = record
+            out = list(by_queue_id.values())
+            out.sort(key=lambda t: (self._safe_text(t.get("sheet")), int(t.get("row_index") or 0), self._safe_text(t.get("pla_no"))))
+            self._write_pending_gsp_queue(out)
+
+    def _mark_gsp_queue_result_received(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        queue_id = self._safe_text(payload.get("queue_id"))
+        pla_no = self._safe_text(payload.get("pla_no"))
+        sheet = self._safe_text(payload.get("sheet"))
+        row_index = int(payload.get("row_index") or 0)
+        with self._lock:
+            pending = self._read_pending_gsp_queue()
+            kept: list[Dict[str, Any]] = []
+            removed = 0
+            for task in pending:
+                same_queue = queue_id and self._safe_text(task.get("queue_id")) == queue_id
+                same_row = (
+                    pla_no
+                    and sheet
+                    and self._safe_text(task.get("pla_no")) == pla_no
+                    and self._safe_text(task.get("sheet")) == sheet
+                    and int(task.get("row_index") or 0) == row_index
+                )
+                if same_queue or same_row:
+                    removed += 1
+                    continue
+                kept.append(task)
+            if removed:
+                self._write_pending_gsp_queue(kept)
+        return {"removed": removed, "remaining": len(kept) if removed else len(self._read_pending_gsp_queue())}
+
+    def _collect_run_gsp_results(self, run_id: str) -> list[Dict[str, Any]]:
+        safe_run = self._safe_text(run_id)
+        jsonl_file = self.gsp_status_dir / "results.jsonl"
+        if not safe_run or not jsonl_file.exists():
+            return []
+        try:
+            lines = jsonl_file.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        by_queue: Dict[str, Dict[str, Any]] = {}
+        loose: list[Dict[str, Any]] = []
+        for line in lines[-2000:]:
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if self._safe_text(record.get("run_id")) != safe_run:
+                continue
+            queue_id = self._safe_text(record.get("queue_id"))
+            if queue_id:
+                by_queue[queue_id] = record
+            else:
+                loose.append(record)
+        results = list(by_queue.values()) + loose
+        results.sort(key=lambda r: (self._safe_text(r.get("sheet")), int(r.get("row_index") or 0), self._safe_text(r.get("pla_no"))))
+        return results
+
+    def _build_async_gsp_reply_text(
+        self,
+        *,
+        session: Dict[str, Any],
+        results: list[Dict[str, Any]],
+    ) -> str:
+        lines: list[str] = []
+        visible_results = results[:10]
+        for idx, r in enumerate(visible_results, start=1):
+            status = self._safe_text(r.get("status")) or "-"
+            step = self._safe_text(r.get("approval_current_step")) or "-"
+            taskers = self._safe_text(r.get("approval_taskers"))
+            requester = self._safe_text(r.get("requester")) or "-"
+            model_lines = self._async_gsp_internal_model_lines(idx, r)
+            is_approved = self._is_approved_gsp_status(status) or step.lower() == "end"
+            if is_approved:
+                requester_line = f"requester: @{requester}" if requester != "-" else "requester: -"
+                detail_lines = [
+                    f"{idx}. row {r.get('row_index')} / {self._safe_text(r.get('pla_no'))}",
+                    f"PN: {self._safe_text(r.get('pn')) or '-'}",
+                    *model_lines,
+                    requester_line,
+                    "GSP: 审批已通过 Approved",
+                ]
+            elif bool(r.get("ok")):
+                approver_parts = [x for x in (step if step != "-" else "", taskers) if x]
+                approver = " - ".join(approver_parts)
+                detail_lines = [
+                    f"{idx}. row {r.get('row_index')} / {self._safe_text(r.get('pla_no'))}",
+                    f"PN: {self._safe_text(r.get('pn')) or '-'}",
+                    *model_lines,
+                    f"requester: {requester}",
+                    "GSP: 还在审批中",
+                    f"审批人：{approver or '-'}",
+                ]
+            elif taskers:
+                detail_lines = [
+                    f"{idx}. row {r.get('row_index')} / {self._safe_text(r.get('pla_no'))}",
+                    f"PN: {self._safe_text(r.get('pn')) or '-'}",
+                    *model_lines,
+                    f"requester: {requester}",
+                    f"GSP: 查询异常 {status}",
+                    f"审批人：{taskers}",
+                ]
+            else:
+                detail_lines = [
+                    f"{idx}. row {r.get('row_index')} / {self._safe_text(r.get('pla_no'))}",
+                    f"PN: {self._safe_text(r.get('pn')) or '-'}",
+                    *model_lines,
+                    f"requester: {requester}",
+                    f"GSP: 查询异常 {status}",
+                ]
+            lines.extend(detail_lines)
+            if idx < len(visible_results):
+                lines.append("------")
+        if len(results) > 10:
+            lines.append(f"... 还有 {len(results) - 10} 条未展开。")
+        return "\n".join(lines)
+
+    def _async_gsp_internal_model_lines(self, idx: int, result: Dict[str, Any]) -> list[str]:
+        related_rows = result.get("related_rows") if isinstance(result.get("related_rows"), list) else []
+        if not related_rows:
+            related_rows = [
+                t
+                for t in self._find_latest_sheet_tasks_by_pla(
+                    self._safe_text(result.get("sheet")),
+                    self._safe_text(result.get("pla_no")),
+                )
+                if self._is_running_task(t)
+            ]
+        if len(related_rows) <= 1:
+            internal_model = self._safe_text(result.get("internal_model"))
+            if not internal_model and related_rows:
+                internal_model = self._safe_text(related_rows[0].get("internal_model"))
+            if not internal_model:
+                latest_task = self._find_latest_sheet_task(
+                    self._safe_text(result.get("sheet")),
+                    int(result.get("row_index") or 0),
+                    self._safe_text(result.get("pla_no")),
+                )
+                internal_model = self._safe_text((latest_task or {}).get("internal_model"))
+            return [f"内部型号：{internal_model or '-'}"]
+
+        lines = ["内部型号："]
+        for sub_idx, row in enumerate(related_rows, start=1):
+            lines.append(f"{idx}.{sub_idx} {self._safe_text(row.get('internal_model')) or '-'}")
+        return lines
+
+    def _maybe_send_async_gsp_run_reply(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = self._safe_text(payload.get("run_id"))
+        session_id = self._safe_text(payload.get("session_id"))
+        if not run_id or not session_id:
+            return {"sent": False, "reason": "run_id or session_id missing"}
+        session_path = self.session_dir / f"{self._safe_id(session_id)}.json"
+        session = self._read_json(session_path, {})
+        if not isinstance(session, dict) or not session:
+            return {"sent": False, "reason": "session not found"}
+        meta = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+        async_reply = meta.get("async_reply") if isinstance(meta.get("async_reply"), dict) else {}
+        if not bool(async_reply.get("enabled")):
+            return {"sent": False, "reason": "async reply disabled"}
+        if self._safe_text(async_reply.get("sent_at")):
+            return {"sent": False, "reason": "async reply already sent"}
+        expected = int(async_reply.get("queued_count") or meta.get("queued_count") or 0)
+        if expected <= 0:
+            return {"sent": False, "reason": "queued_count missing"}
+        results = self._collect_run_gsp_results(run_id)
+        if len(results) < expected:
+            return {"sent": False, "reason": "waiting for more results", "received": len(results), "expected": expected}
+        session_webhook = self._safe_text(async_reply.get("session_webhook"))
+        if not session_webhook:
+            return {"sent": False, "reason": "session webhook missing"}
+        text = self._build_async_gsp_reply_text(session=session, results=results)
+        post_result = self._post_dingtalk_session_text(
+            session_webhook,
+            text,
+            at_user_id=self._safe_text(async_reply.get("sender_staff_id")),
+        )
+        patch = {
+            "async_reply": {
+                **async_reply,
+                "sent_at": utc_now_iso() if post_result.get("ok") else "",
+                "last_attempt_at": utc_now_iso(),
+                "last_result": post_result,
+                "result_count": len(results),
+            }
+        }
+        self._patch_agent_session(session_id, patch=patch)
+        self._add_trace_span(
+            run_id,
+            "dingtalk_async_gsp_reply",
+            status="ok" if post_result.get("ok") else "failed",
+            metadata={"session_id": session_id, "result_count": len(results), "post_result": post_result},
+        )
+        return {"sent": bool(post_result.get("ok")), "result_count": len(results), "post_result": post_result}
+
     def save_gsp_status_result(self, req: AgentGspStatusResultReq) -> Dict[str, Any]:
         self._check_desktop_agent_token(req.token)
         self.ensure_dirs()
@@ -1892,6 +2654,18 @@ class AgentAutomation:
         for key in ("session_id", "context_id", "skill_call_id", "dispatch_id"):
             if not payload.get(key):
                 payload[key] = self._safe_text(trace_meta.get(key))
+        if not self._safe_text(payload.get("internal_model")):
+            latest_task = self._find_latest_sheet_task(
+                self._safe_text(payload.get("sheet")),
+                int(payload.get("row_index") or 0),
+                self._safe_text(payload.get("pla_no")),
+            )
+            if latest_task:
+                payload["internal_model"] = self._safe_text(latest_task.get("internal_model"))
+                if not self._safe_text(payload.get("pn")):
+                    payload["pn"] = self._safe_text(latest_task.get("pn"))
+                if not self._safe_text(payload.get("requester")):
+                    payload["requester"] = self._safe_text(latest_task.get("requester"))
 
         result_id_src = f"{payload['pla_no']}|{payload.get('sheet') or ''}|{payload.get('row_index') or ''}|{payload['received_at']}"
         result_id = hashlib.sha1(result_id_src.encode("utf-8")).hexdigest()[:16]
@@ -1928,7 +2702,9 @@ class AgentAutomation:
             },
             error=payload.get("error"),
         )
+        pending_queue = self._mark_gsp_queue_result_received(payload)
         sheet_update = self._maybe_queue_sheet_status_update(payload)
+        async_reply = self._maybe_send_async_gsp_run_reply(payload)
         self._update_state(
             {
                 "last_gsp_status_result": {
@@ -1937,7 +2713,9 @@ class AgentAutomation:
                     "pla_no": payload["pla_no"],
                     "status": payload["status"],
                     "ok": bool(payload.get("ok")),
+                    "pending_queue": pending_queue,
                     "sheet_update": sheet_update,
+                    "async_reply": async_reply,
                     "received_at": payload["received_at"],
                     "path": str(result_file),
                 },
@@ -2006,7 +2784,9 @@ class AgentAutomation:
             "observation_id": observation.get("observation_id"),
             "result_id": result_id,
             "path": str(result_file),
+            "pending_queue": pending_queue,
             "sheet_update": sheet_update,
+            "async_reply": async_reply,
             "reflection": reflection,
         }
 
@@ -2109,72 +2889,150 @@ class AgentAutomation:
         if not sheet or not row_index or not pla_no:
             return {"queued": False, "reason": "sheet, row_index, or pla_no missing"}
 
-        latest_task = self._find_latest_sheet_task(sheet, int(row_index), pla_no)
-        old_status = self._safe_text(payload.get("sheet_status")) or self._safe_text(
-            (latest_task or {}).get("status")
-        )
-        if self._is_completed_status_text(old_status):
-            return {"queued": False, "reason": "sheet row is already completed"}
+        latest_tasks = self._find_latest_sheet_tasks_by_pla(sheet, pla_no)
+        if not latest_tasks:
+            latest_task = self._find_latest_sheet_task(sheet, int(row_index), pla_no)
+            latest_tasks = [latest_task] if latest_task else []
+        if not latest_tasks:
+            latest_tasks = [
+                {
+                    "sheet": sheet,
+                    "row_index": int(row_index),
+                    "pla_no": pla_no,
+                    "status": payload.get("sheet_status"),
+                    "pn": payload.get("pn"),
+                    "requester": payload.get("requester"),
+                }
+            ]
 
-        dedupe_src = f"{sheet}|{row_index}|{pla_no}|L|已完成"
-        update_id = hashlib.sha1(dedupe_src.encode("utf-8")).hexdigest()[:16]
         now = utc_now_iso()
-        record = {
-            "update_id": update_id,
-            "state": "pending",
-            "created_at": now,
-            "sheet": sheet,
-            "row_index": int(row_index),
-            "col": "L",
-            "cell": f"L{int(row_index)}",
-            "pla_no": pla_no,
-            "old_status": old_status,
-            "new_status": "已完成",
-            "gsp_status": self._safe_text(payload.get("status")),
-            "approval_current_step": self._safe_text(payload.get("approval_current_step")),
-            "approval_taskers": self._safe_text(payload.get("approval_taskers")),
-            "source_result_id": self._safe_text(payload.get("result_id")),
-            "source_run_id": self._safe_text(payload.get("run_id")),
-        }
-        if latest_task:
-            record["pn"] = latest_task.get("pn")
-            record["requester"] = latest_task.get("requester")
+        records: list[Dict[str, Any]] = []
+        skipped: list[Dict[str, Any]] = []
+        for task in latest_tasks:
+            task_sheet = self._safe_text(task.get("sheet")) or sheet
+            task_row_index = int(task.get("row_index") or 0)
+            if not task_sheet or not task_row_index:
+                continue
+            old_status = self._safe_text(task.get("status")) or self._safe_text(task.get("sheet_status"))
+            if task_row_index == int(row_index):
+                old_status = self._safe_text(payload.get("sheet_status")) or old_status
+            if self._is_completed_status_text(old_status):
+                skipped.append({"row_index": task_row_index, "reason": "sheet row is already completed"})
+                continue
+            if not self._is_in_progress_status_text(old_status):
+                skipped.append(
+                    {
+                        "row_index": task_row_index,
+                        "reason": "sheet row is not in progress",
+                        "old_status": old_status,
+                    }
+                )
+                continue
+
+            dedupe_src = f"{task_sheet}|{task_row_index}|{pla_no}|L|已完成"
+            update_id = hashlib.sha1(dedupe_src.encode("utf-8")).hexdigest()[:16]
+            record = {
+                "update_id": update_id,
+                "state": "pending",
+                "created_at": now,
+                "sheet": task_sheet,
+                "row_index": task_row_index,
+                "col": "L",
+                "cell": f"L{task_row_index}",
+                "pla_no": pla_no,
+                "old_status": old_status,
+                "new_status": "已完成",
+                "gsp_status": self._safe_text(payload.get("status")),
+                "approval_current_step": self._safe_text(payload.get("approval_current_step")),
+                "approval_taskers": self._safe_text(payload.get("approval_taskers")),
+                "source_result_id": self._safe_text(payload.get("result_id")),
+                "source_run_id": self._safe_text(payload.get("run_id")),
+                "pn": task.get("pn") or payload.get("pn"),
+                "requester": task.get("requester") or payload.get("requester"),
+            }
+            records.append(record)
+
+        if not records:
+            first_skip = skipped[0] if skipped else {}
+            return {
+                "queued": False,
+                "reason": first_skip.get("reason") or "no in-progress related rows",
+                "old_status": first_skip.get("old_status"),
+                "skipped": skipped,
+            }
 
         with self._lock:
             updates = self._read_sheet_updates()
-            for existing in updates:
-                if self._safe_text(existing.get("update_id")) == update_id:
-                    if self._safe_text(existing.get("state")) == "pending":
-                        return {"queued": False, "reason": "update already pending", "update_id": update_id}
-                    if self._safe_text(existing.get("state")) == "applied":
-                        return {"queued": False, "reason": "update already applied", "update_id": update_id}
+            existing_by_id = {self._safe_text(u.get("update_id")): u for u in updates}
+            queued_records: list[Dict[str, Any]] = []
+            already_records: list[Dict[str, Any]] = []
+            requeued_records: list[Dict[str, Any]] = []
+            for record in records:
+                existing = existing_by_id.get(self._safe_text(record.get("update_id")))
+                if existing:
+                    state = self._safe_text(existing.get("state"))
+                    if state in {"pending", "applied"}:
+                        already_records.append(
+                            {
+                                "update_id": record["update_id"],
+                                "cell": record["cell"],
+                                "state": state,
+                            }
+                        )
+                        continue
                     existing.clear()
                     existing.update(record)
-                    self._write_sheet_updates(updates)
-                    return {
-                        "queued": True,
-                        "reason": "failed update requeued",
-                        "update_id": update_id,
-                        "cell": record["cell"],
-                        "new_status": record["new_status"],
-                    }
-            updates.append(record)
+                    requeued_records.append(record)
+                    continue
+                updates.append(record)
+                existing_by_id[self._safe_text(record.get("update_id"))] = record
+                queued_records.append(record)
             self._write_sheet_updates(updates)
-        self._update_pla_timeline(
-            pla_no,
-            "sheet_writeback_queued",
-            event={
-                "update_id": update_id,
-                "cell": record["cell"],
-                "sheet": sheet,
-                "row_index": int(row_index),
-                "old_status": old_status,
-                "new_status": record["new_status"],
-                "source_result_id": record["source_result_id"],
-            },
-            run_id=self._safe_text(payload.get("run_id")),
-        )
-        return {"queued": True, "update_id": update_id, "cell": record["cell"], "new_status": record["new_status"]}
+
+        changed_records = queued_records + requeued_records
+        for record in changed_records:
+            self._update_pla_timeline(
+                pla_no,
+                "sheet_writeback_queued",
+                event={
+                    "update_id": record["update_id"],
+                    "cell": record["cell"],
+                    "sheet": record["sheet"],
+                    "row_index": int(record["row_index"]),
+                    "old_status": record["old_status"],
+                    "new_status": record["new_status"],
+                    "source_result_id": record["source_result_id"],
+                },
+                run_id=self._safe_text(payload.get("run_id")),
+            )
+        if not changed_records:
+            return {
+                "queued": False,
+                "reason": "update already pending or applied",
+                "queued_count": 0,
+                "updates": [],
+                "already": already_records,
+                "skipped": skipped,
+            }
+        first = changed_records[0]
+        return {
+            "queued": True,
+            "update_id": first["update_id"],
+            "cell": first["cell"],
+            "new_status": first["new_status"],
+            "queued_count": len(changed_records),
+            "updates": [
+                {
+                    "update_id": r["update_id"],
+                    "cell": r["cell"],
+                    "row_index": r["row_index"],
+                    "new_status": r["new_status"],
+                }
+                for r in changed_records
+            ],
+            "already": already_records,
+            "skipped": skipped,
+        }
 
     def _read_sheet_updates(self) -> list[Dict[str, Any]]:
         self.ensure_dirs()
@@ -2190,19 +3048,27 @@ class AgentAutomation:
         self._write_json(self.sheet_update_dir / "pending.json", pending)
 
     def _find_latest_sheet_task(self, sheet: str, row_index: int, pla_no: str) -> Optional[Dict[str, Any]]:
+        for task in self._find_latest_sheet_tasks_by_pla(sheet, pla_no):
+            if int(task.get("row_index") or 0) == int(row_index):
+                return task
+        return None
+
+    def _find_latest_sheet_tasks_by_pla(self, sheet: str, pla_no: str) -> list[Dict[str, Any]]:
         try:
             parsed = self.read_parsed_sheet_push("latest")
         except Exception:
-            return None
+            return []
+        out: list[Dict[str, Any]] = []
+        safe_sheet = self._safe_text(sheet)
+        safe_pla = self._safe_text(pla_no)
         for task in parsed.get("tasks") or []:
-            if self._safe_text(task.get("sheet")) != sheet:
-                continue
-            if int(task.get("row_index") or 0) != int(row_index):
+            if self._safe_text(task.get("sheet")) != safe_sheet:
                 continue
             pla_numbers = [self._safe_text(x) for x in (task.get("pla_numbers") or [])]
-            if pla_no in pla_numbers or self._safe_text(task.get("pla_no")) == pla_no:
-                return task
-        return None
+            if safe_pla in pla_numbers or self._safe_text(task.get("pla_no")) == safe_pla:
+                out.append(task)
+        out.sort(key=lambda t: int(t.get("row_index") or 0))
+        return out
 
     def _is_approved_gsp_status(self, value: Any) -> bool:
         text = self._safe_text(value).strip().lower()
@@ -2228,6 +3094,23 @@ class AgentAutomation:
                 "finished",
                 "termine",
                 "terminé",
+            )
+        )
+
+    def _is_in_progress_status_text(self, value: Any) -> bool:
+        text = self._safe_text(value).strip().lower()
+        if not text:
+            return False
+        compact = re.sub(r"[\s_\-]+", "", text)
+        return any(
+            x in compact
+            for x in (
+                "进行中",
+                "進行中",
+                "inprogress",
+                "processing",
+                "ongoing",
+                "encours",
             )
         )
 
@@ -2385,7 +3268,6 @@ class AgentAutomation:
         self._write_json(parsed_file, parsed)
         self._write_json(parsed_latest_file, parsed)
 
-        notification_result = self._notify_sheet_push(parsed, push_id)
         state_payload = {
             "push_id": push_id,
             "received_at": received_at,
@@ -2398,7 +3280,6 @@ class AgentAutomation:
             "path": str(out_file),
             "parsed_path": str(parsed_file),
             "parsed_summary": parsed.get("summary"),
-            "notification": notification_result,
         }
         self._update_state({"last_sheet_push": state_payload, "last_error": None})
         return {"ok": True, **state_payload}
@@ -2423,7 +3304,7 @@ class AgentAutomation:
             all_tasks.extend(parsed.get("tasks") or [])
 
         pending_tasks = [t for t in all_tasks if self._is_pending_task(t)]
-        gsp_check_tasks = [t for t in pending_tasks if t.get("pla_numbers")]
+        gsp_check_tasks = [t for t in all_tasks if self._is_running_task(t) and t.get("pla_numbers")]
         completed_tasks = [t for t in all_tasks if self._is_completed_task(t)]
         blocked_tasks = [t for t in all_tasks if self._is_blocked_task(t)]
         summary = {
@@ -2456,36 +3337,6 @@ class AgentAutomation:
             "blocked_tasks": blocked_tasks,
             "sheets": parsed_sheets,
         }
-
-    def _notify_sheet_push(self, parsed: Dict[str, Any], push_id: str) -> Dict[str, Any]:
-        cfg = self.read_config(redacted=False)
-        if bool(cfg.get("dry_run")) or not bool(cfg.get("notify_on_task_done", True)):
-            return {"ok": False, "skipped": True, "reason": "notification disabled"}
-        if not str(cfg.get("webhook_url") or "").strip():
-            return {"ok": False, "skipped": True, "reason": "agent webhook_url is empty"}
-        summary = parsed.get("summary") or {}
-        pending = parsed.get("gsp_check_tasks") or parsed.get("pending_tasks") or []
-        examples = []
-        for t in pending[:5]:
-            pla = ", ".join(t.get("pla_numbers") or []) or t.get("pla_no") or "-"
-            pn = t.get("pn") or "-"
-            requester = t.get("requester") or "-"
-            desc = t.get("description") or "-"
-            level = t.get("price_level") or "-"
-            examples.append(f"- {t.get('sheet')}#{t.get('row_index')}: {pla} / {requester} / {pn} / {level} / {desc}")
-        detail = "\n".join(examples) if examples else "- 暂无待处理样例"
-        message = (
-            f"表格同步完成：push={push_id}\n"
-            f"Sheet {summary.get('sheet_count', 0)} 个，结构化任务 {summary.get('task_count', 0)} 条，"
-            f"待处理 {summary.get('pending_count', 0)} 条，可查 GSP PLA {summary.get('gsp_check_count', 0)} 条，"
-            f"已完成 {summary.get('completed_count', 0)} 条，"
-            f"异常/阻塞 {summary.get('blocked_count', 0)} 条。\n"
-            f"GSP 待查样例：\n{detail}"
-        )
-        try:
-            return self.send_notification(message)
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def run_poll_once(self, compute_rows: Optional[ComputeRows] = None) -> Dict[str, Any]:
         _ = compute_rows
@@ -2521,32 +3372,6 @@ class AgentAutomation:
             state.update(patch)
             state["updated_at"] = utc_now_iso()
             self._write_json(self.state_path, state)
-
-    def _signed_webhook_url(self, webhook_url: str, secret: str) -> str:
-        if not secret:
-            return webhook_url
-        timestamp = str(round(time.time() * 1000))
-        string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
-        sign = urllib.parse.quote_plus(
-            base64.b64encode(hmac.new(secret.encode("utf-8"), string_to_sign, hashlib.sha256).digest())
-        )
-        sep = "&" if "?" in webhook_url else "?"
-        return f"{webhook_url}{sep}timestamp={timestamp}&sign={sign}"
-
-    def _redact_url(self, url: str) -> str:
-        if not url:
-            return ""
-        parsed = urllib.parse.urlsplit(url)
-        qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        redacted_qs = []
-        for k, v in qs:
-            if k.lower() in {"access_token", "token", "sign"} and v:
-                redacted_qs.append((k, f"{v[:6]}...{v[-4:]}"))
-            else:
-                redacted_qs.append((k, v))
-        return urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(redacted_qs), parsed.fragment)
-        )
 
     def _clean_pns(self, values: List[Any]) -> List[str]:
         out: List[str] = []
@@ -2849,6 +3674,59 @@ class AgentAutomation:
             return str(int(value))
         return str(value).strip()
 
+    def _normalize_sheet_filter(self, value: Any) -> str:
+        text = self._safe_text(value)
+        if not text:
+            return ""
+        match = re.fullmatch(r"(\d{4})\.(\d{1,2})", text)
+        if match:
+            return f"{match.group(1)}.{int(match.group(2)):02d}"
+        return text
+
+    def _latest_sheet_filter(self, parsed: Dict[str, Any]) -> str:
+        names: list[str] = []
+        summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+        for sheet in summary.get("sheets") or []:
+            if isinstance(sheet, dict):
+                names.append(self._safe_text(sheet.get("name")))
+        for sheet in parsed.get("sheets") or []:
+            if isinstance(sheet, dict):
+                names.append(self._safe_text(sheet.get("name")))
+        candidates: list[tuple[int, int, str]] = []
+        for name in names:
+            for match in re.finditer(r"(\d{4})\.(\d{1,2})", name):
+                normalized = f"{match.group(1)}.{int(match.group(2)):02d}"
+                candidates.append((int(match.group(1)), int(match.group(2)), normalized))
+        if not candidates:
+            return ""
+        candidates.sort()
+        return candidates[-1][2]
+
+    def _sheet_filter_from_month_text(self, text: str, parsed: Dict[str, Any]) -> str:
+        match = re.search(r"(?<!\d)(1[0-2]|0?[1-9])\s*月", self._safe_text(text))
+        if not match:
+            return ""
+        month = int(match.group(1))
+        names: list[str] = []
+        summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+        for sheet in summary.get("sheets") or []:
+            if isinstance(sheet, dict):
+                names.append(self._safe_text(sheet.get("name")))
+        for sheet in parsed.get("sheets") or []:
+            if isinstance(sheet, dict):
+                names.append(self._safe_text(sheet.get("name")))
+        candidates: list[tuple[int, str]] = []
+        for name in names:
+            for m in re.finditer(r"(\d{4})\.(\d{1,2})", name):
+                if int(m.group(2)) == month:
+                    candidates.append((int(m.group(1)), f"{m.group(1)}.{int(m.group(2)):02d}"))
+        if candidates:
+            candidates.sort()
+            return candidates[-1][1]
+        latest = self._latest_sheet_filter(parsed)
+        latest_year = latest.split(".", 1)[0] if re.fullmatch(r"\d{4}\.\d{2}", latest) else str(datetime.now().year)
+        return f"{latest_year}.{month:02d}"
+
     def _row_is_empty(self, row: list[Any]) -> bool:
         return not any(self._safe_text(x) for x in row)
 
@@ -2873,6 +3751,9 @@ class AgentAutomation:
 
     def _is_blocked_task(self, task: Dict[str, Any]) -> bool:
         return task.get("normalized_status") == "blocked"
+
+    def _is_running_task(self, task: Dict[str, Any]) -> bool:
+        return task.get("normalized_status") == "running" or self._is_in_progress_status_text(task.get("status"))
 
     def _is_pending_task(self, task: Dict[str, Any]) -> bool:
         # Business trigger: J column (PLA NO.) has a value and L column (状态)

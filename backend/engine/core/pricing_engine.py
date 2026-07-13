@@ -1220,9 +1220,71 @@ def resolve_price_group_for_rules(price_group: str, series_key: str, series_disp
     return pg
 
 
-def _choose_sys_base_price_from_sys(sys_row: pd.Series) -> Tuple[Optional[float], str, Optional[str]]:
+def _should_follow_fob_n_for_distribution_series(
+    sys_row: Optional[pd.Series],
+    *,
+    france_row: Optional[pd.Series] = None,
+    category: Optional[str] = None,
+    price_group: Optional[str] = None,
+    series_display: Optional[str] = None,
+) -> bool:
+    """
+    业务例外：分销系列中的线缆、电源按总部 FOB N 跟价。
+
+    在 Sys 表里 FOB N 对应 Area Price；这类产品即使 Sales Type 是
+    Distribution/SMB，也不能继续取 Min Price（FOB L）。
+    """
+    cat = _norm_upper_text(category)
+    pg = _norm_upper_text(price_group)
+    if cat == "ACCESSORY线缆" or pg == "ACCESSORY线缆":
+        return True
+
+    sys_first = _norm_upper_text(sys_row.get("First Product Line")) if sys_row is not None else ""
+    sys_second = _norm_upper_text(sys_row.get("Second Product Line")) if sys_row is not None else ""
+    sys_catalog = _norm_upper_text(sys_row.get("Catelog Name")) if sys_row is not None else ""
+
+    fr_first = _norm_upper_text(france_row.get("First Level Product Category")) if france_row is not None else ""
+    fr_second = (
+        _norm_upper_text(france_row.get("Second Level Product Category"))
+        if france_row is not None
+        else ""
+    )
+
+    if sys_first == "ACCESSORY" and sys_second in {"CABLING", "POWER"}:
+        return True
+    if fr_first == "ACCESSORIES" and fr_second in {"CABLING", "POWER"}:
+        return True
+
+    # 兜底覆盖字段名或 mapping 轻微变化，同时避免把 Solar Power 扩大进来。
+    series_text = _norm_upper_text(
+        " ".join(
+            x
+            for x in (
+                series_display or "",
+                sys_second,
+                sys_catalog,
+                fr_second,
+            )
+            if x
+        )
+    )
+    has_cable = any(tok in series_text for tok in ("CABLING", "CABLE", "线缆"))
+    has_power = bool(re.search(r"(^|[^A-Z])POWER([^A-Z]|$)", series_text)) or "电源" in series_text
+    is_accessory = cat == "ACCESSORY" or pg == "ACCESSORY" or sys_first == "ACCESSORY" or fr_first == "ACCESSORIES"
+    return bool(is_accessory and (has_cable or has_power) and "SOLAR" not in series_text)
+
+
+def _choose_sys_base_price_from_sys(
+    sys_row: pd.Series,
+    *,
+    france_row: Optional[pd.Series] = None,
+    category: Optional[str] = None,
+    price_group: Optional[str] = None,
+    series_display: Optional[str] = None,
+) -> Tuple[Optional[float], str, Optional[str]]:
     """
     新规则（无交互）：
+      - Accessory Cabling / Power       -> Area Price（FOB N）
       - Sales Type in {DISTRIBUTION, SMB} -> Min Price
       - Sales Type == PROJECT            -> Area Price
       - 其他/缺失                         -> None
@@ -1232,6 +1294,15 @@ def _choose_sys_base_price_from_sys(sys_row: pd.Series) -> Tuple[Optional[float]
 
     min_price = _to_float(sys_row.get("Min Price"))
     area_price = _to_float(sys_row.get("Area Price"))
+
+    if _should_follow_fob_n_for_distribution_series(
+        sys_row,
+        france_row=france_row,
+        category=category,
+        price_group=price_group,
+        series_display=series_display,
+    ):
+        return area_price, sales, "Area Price"
 
     if sales in {"SMB", "DISTRIBUTION"}:
         return min_price, sales, "Min Price"
@@ -1450,7 +1521,13 @@ def compute_prices_for_part(
     sys_basis_field: Optional[str] = None
     sys_basis_price: Optional[float] = None
     if sys_row is not None:
-        sys_basis_price, sys_sales_type, sys_basis_field = _choose_sys_base_price_from_sys(sys_row)
+        sys_basis_price, sys_sales_type, sys_basis_field = _choose_sys_base_price_from_sys(
+            sys_row,
+            france_row=france_row,
+            category=category,
+            price_group=price_group,
+            series_display=series_display,
+        )
 
     # ===== 预计算：本次会使用的 PRICE_RULES 规则名字（即使最终不需要补全渠道价，也可输出供核对）=====
     effective_price_group = resolve_price_group_for_rules(price_group, series_key, series_display)
@@ -1578,7 +1655,13 @@ def compute_prices_for_part(
         manual_price_input = manual_fob
     # 只在 France 缺失 FOB 时，才允许从 Sys 计算 FOB（不改你原逻辑）
     elif (fob is None or fob <= 0) and sys_row is not None:
-        base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(sys_row)
+        base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(
+            sys_row,
+            france_row=france_row,
+            category=category,
+            price_group=price_group,
+            series_display=series_display,
+        )
         sys_sales_type = sales_norm
         sys_basis_price = base_price
         if base_price is not None and base_price > 0:
@@ -1748,15 +1831,27 @@ def _fill_missing_prices_from_base(
 
     pn_col = _pick_pn_col(df)
     try:
-        series_pn = df[pn_col].astype(str).str.strip().str.lower()
+        rows_with_keys = df.copy()
+        rows_with_keys["_pn_key_raw_tmp"] = rows_with_keys[pn_col].apply(normalize_pn_raw)
+        rows_with_keys["_pn_key_base_tmp"] = rows_with_keys[pn_col].apply(normalize_pn_base)
     except Exception:
         return row, False, None
 
-    hits = df[series_pn == str(base_key_raw).strip().lower()]
+    base_key = normalize_pn_base(base_key_raw)
+    hits = rows_with_keys[rows_with_keys["_pn_key_base_tmp"] == base_key]
     if hits.empty:
         return row, False, None
 
-    base_row = hits.iloc[0]
+    def _priority(candidate: pd.Series) -> int:
+        raw = str(candidate.get("_pn_key_raw_tmp") or "").strip().upper()
+        if raw == base_key:
+            return 0
+        if raw == f"{base_key}-9001":
+            return 1
+        return 2
+
+    hits = hits.assign(_pn_base_priority=hits.apply(_priority, axis=1))
+    base_row = hits.sort_values("_pn_base_priority", kind="stable").iloc[0]
 
     patched = row.copy()
     changed = False

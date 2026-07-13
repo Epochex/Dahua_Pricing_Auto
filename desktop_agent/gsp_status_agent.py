@@ -4,8 +4,10 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +28,16 @@ def playwright_timeout_error() -> type[Exception]:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_sheet_filter(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(\d{4})\.(\d{1,2})", text)
+    if match:
+        return f"{match.group(1)}.{int(match.group(2)):02d}"
+    return text
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -57,7 +69,11 @@ def load_config(path: Path) -> dict[str, Any]:
     data["user_data_dir"] = str(data.get("user_data_dir") or "C:/DahuaPricingAgent/edge-profile")
     data["headless"] = bool(data.get("headless", True))
     data["max_tasks"] = max(1, min(500, int(data.get("max_tasks") or 5)))
+    data["sheet"] = normalize_sheet_filter(data.get("sheet"))
     data["poll_interval_seconds"] = max(0, int(data.get("poll_interval_seconds") or 0))
+    data["listen_host"] = str(data.get("listen_host") or "0.0.0.0")
+    data["listen_port"] = max(1, min(65535, int(data.get("listen_port") or 8765)))
+    data["control_url"] = str(data.get("control_url") or "").strip()
     data["slow_mo_ms"] = max(0, int(data.get("slow_mo_ms") or 0))
     data["page_timeout_ms"] = max(10000, int(data.get("page_timeout_ms") or 45000))
     data["dry_run"] = bool(data.get("dry_run", False))
@@ -96,16 +112,23 @@ def send_heartbeat(cfg: dict[str, Any], *, status: str = "online", load: float =
             "headless": bool(cfg.get("headless")),
             "edge_channel": cfg.get("edge_channel"),
             "gsp_base_url": cfg.get("gsp_base_url"),
+            "control_url": cfg.get("control_url"),
+            "listen_host": cfg.get("listen_host"),
+            "listen_port": cfg.get("listen_port"),
         },
     }
     return api_post(cfg, "/api/agent/tool-backends/heartbeat", payload)
 
 
-def fetch_queue(cfg: dict[str, Any], *, limit: int | None = None) -> list[dict[str, Any]]:
+def fetch_queue(cfg: dict[str, Any], *, limit: int | None = None, sheet: str | None = None) -> list[dict[str, Any]]:
+    payload = {"token": cfg["agent_token"], "limit": limit or cfg["max_tasks"]}
+    sheet_filter = normalize_sheet_filter(sheet if sheet is not None else cfg.get("sheet"))
+    if sheet_filter:
+        payload["sheet"] = sheet_filter
     body = api_post(
         cfg,
         "/api/agent/gsp/status-queue",
-        {"token": cfg["agent_token"], "limit": limit or cfg["max_tasks"]},
+        payload,
     )
     return list(body.get("tasks") or [])
 
@@ -125,10 +148,12 @@ def push_result(cfg: dict[str, Any], task: dict[str, Any], result: dict[str, Any
         "sheet": task.get("sheet"),
         "row_index": task.get("row_index"),
         "pn": task.get("pn"),
+        "internal_model": task.get("internal_model"),
         "requester": task.get("requester"),
         "sheet_status": task.get("sheet_status"),
         "approval_current_step": result.get("approval_current_step"),
         "approval_taskers": result.get("approval_taskers"),
+        "related_rows": task.get("related_rows") or [],
         "checked_at": result.get("checked_at") or utc_now_iso(),
         "source": "windows-desktop-agent",
         "detail": result.get("detail"),
@@ -592,14 +617,15 @@ def print_queue(tasks: list[dict[str, Any]]) -> None:
         )
 
 
-def run_once(cfg: dict[str, Any], *, no_push: bool = False) -> None:
+def run_once(cfg: dict[str, Any], *, no_push: bool = False, sheet: str | None = None) -> None:
     try:
         heartbeat = send_heartbeat(cfg, load=0.1)
         print(json.dumps({"event": "heartbeat", "ok": heartbeat.get("ok")}, ensure_ascii=False))
     except Exception as err:
         print(json.dumps({"event": "heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
-    tasks = fetch_queue(cfg)
-    print(json.dumps({"event": "queue", "count": len(tasks)}, ensure_ascii=False))
+    sheet_filter = normalize_sheet_filter(sheet if sheet is not None else cfg.get("sheet"))
+    tasks = fetch_queue(cfg, sheet=sheet_filter)
+    print(json.dumps({"event": "queue", "count": len(tasks), "sheet": sheet_filter or None}, ensure_ascii=False))
     if not tasks:
         return
     checker_cls = GspApiStatusChecker if cfg.get("gsp_query_mode") == "api" else GspStatusChecker
@@ -647,20 +673,154 @@ def query_one_pla(cfg: dict[str, Any], pla_no: str) -> None:
         )
 
 
+def _control_auth_ok(cfg: dict[str, Any], headers: Any) -> bool:
+    token = str(cfg.get("agent_token") or "")
+    candidates = [
+        str(headers.get("X-Agent-Token") or ""),
+        str(headers.get("X-Dahua-Agent-Token") or ""),
+        str(headers.get("Authorization") or ""),
+    ]
+    for value in candidates:
+        value = value.strip()
+        if value == token:
+            return True
+        if value.lower().startswith("bearer ") and value[7:].strip() == token:
+            return True
+    return False
+
+
+def serve_control(cfg: dict[str, Any]) -> None:
+    state: dict[str, Any] = {
+        "running": False,
+        "started_at": "",
+        "finished_at": "",
+        "last_request": {},
+        "last_error": "",
+    }
+    lock = threading.Lock()
+
+    def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def worker(request_payload: dict[str, Any]) -> None:
+        run_cfg = dict(cfg)
+        if request_payload.get("max_tasks") is not None:
+            try:
+                run_cfg["max_tasks"] = max(1, min(500, int(request_payload.get("max_tasks"))))
+            except Exception:
+                pass
+        sheet = normalize_sheet_filter(request_payload.get("sheet"))
+        no_push = bool(request_payload.get("no_push", False))
+        with lock:
+            state.update(
+                {
+                    "running": True,
+                    "started_at": utc_now_iso(),
+                    "finished_at": "",
+                    "last_request": request_payload,
+                    "last_error": "",
+                }
+            )
+        try:
+            try:
+                send_heartbeat(run_cfg, load=1.0)
+            except Exception as err:
+                print(json.dumps({"event": "control_heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
+            run_once(run_cfg, no_push=no_push, sheet=sheet)
+        except Exception as err:
+            with lock:
+                state["last_error"] = f"{type(err).__name__}: {err}"
+            print(json.dumps({"event": "control_run_failed", "error": state["last_error"]}, ensure_ascii=False))
+        finally:
+            try:
+                send_heartbeat(run_cfg, load=0.0)
+            except Exception as err:
+                print(json.dumps({"event": "control_heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
+            with lock:
+                state["running"] = False
+                state["finished_at"] = utc_now_iso()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            print(json.dumps({"event": "control_http", "message": format % args}, ensure_ascii=False))
+
+        def do_GET(self) -> None:
+            if self.path.rstrip("/") != "/health":
+                write_json(self, 404, {"ok": False, "error": "not found"})
+                return
+            with lock:
+                snapshot = dict(state)
+            write_json(self, 200, {"ok": True, **snapshot})
+
+        def do_POST(self) -> None:
+            if self.path.rstrip("/") != "/run-once":
+                write_json(self, 404, {"ok": False, "error": "not found"})
+                return
+            if not _control_auth_ok(cfg, self.headers):
+                write_json(self, 403, {"ok": False, "error": "invalid token"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                write_json(self, 400, {"ok": False, "error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                write_json(self, 400, {"ok": False, "error": "payload must be object"})
+                return
+            with lock:
+                if state.get("running"):
+                    write_json(self, 409, {"ok": False, "error": "agent is already running", **state})
+                    return
+                state["last_request"] = payload
+            threading.Thread(target=worker, args=(payload,), daemon=True, name="gsp-control-run-once").start()
+            write_json(self, 202, {"ok": True, "accepted": True, "running": True})
+
+    try:
+        heartbeat = send_heartbeat(cfg, load=0.0)
+        print(json.dumps({"event": "control_heartbeat", "ok": heartbeat.get("ok")}, ensure_ascii=False))
+    except Exception as err:
+        print(json.dumps({"event": "control_heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
+
+    server = ThreadingHTTPServer((cfg["listen_host"], int(cfg["listen_port"])), Handler)
+    print(
+        json.dumps(
+            {
+                "event": "control_server_started",
+                "listen_host": cfg["listen_host"],
+                "listen_port": cfg["listen_port"],
+                "control_url": cfg.get("control_url"),
+            },
+            ensure_ascii=False,
+        )
+    )
+    server.serve_forever()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--serve", action="store_true", help="run a local HTTP control service for backend-triggered checks")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--login", action="store_true")
     parser.add_argument("--queue-only", action="store_true", help="fetch and print backend queue without opening GSP")
     parser.add_argument("--no-push", action="store_true", help="query GSP but do not POST status results")
     parser.add_argument("--max-tasks", type=int, default=None, help="override config max_tasks for this run")
+    parser.add_argument("--sheet", default=None, help="only fetch pending PLA rows from this sheet, e.g. 2026.07")
     parser.add_argument("--pla", default="", help="query one PLA directly without reading backend queue")
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
     if args.max_tasks is not None:
         cfg["max_tasks"] = max(1, min(500, int(args.max_tasks)))
+    if args.sheet is not None:
+        cfg["sheet"] = normalize_sheet_filter(args.sheet)
     if args.login:
         if cfg.get("gsp_query_mode") == "api":
             with GspApiStatusChecker(cfg) as checker:
@@ -669,12 +829,15 @@ def main() -> int:
             with GspStatusChecker(cfg, login_mode=True) as checker:
                 checker.login()
         return 0
+    if args.serve:
+        serve_control(cfg)
+        return 0
     if args.queue_only:
         try:
             send_heartbeat(cfg, load=0.0)
         except Exception:
             pass
-        print_queue(fetch_queue(cfg))
+        print_queue(fetch_queue(cfg, sheet=cfg.get("sheet")))
         return 0
     if args.pla:
         try:
@@ -685,7 +848,7 @@ def main() -> int:
         return 0
 
     while True:
-        run_once(cfg, no_push=bool(args.no_push))
+        run_once(cfg, no_push=bool(args.no_push), sheet=cfg.get("sheet"))
         if args.once or cfg["poll_interval_seconds"] <= 0:
             return 0
         time.sleep(cfg["poll_interval_seconds"])

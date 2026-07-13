@@ -79,6 +79,7 @@ https://gsp.dahuasecurity.com/cpqMicro/#/
 - `Sales Type` 不同，使用的系统底价层级不同：
   - `SMB / Distribution`：使用 `FOB L`
   - `Project`：使用 `FOB N`
+  - 分销系列中的 `Cabling / Power`（线缆 / 电源）：无论 Sales Type 如何，统一使用 `FOB N`
 - 具体 DDP 和渠道价公式不在 README 里维护，实际以平台当前规则为准：
   - `RULES` 页当前值
   - `/data/dahua_pricing_runtime/admin/*.json`
@@ -234,19 +235,21 @@ https://gsp.dahuasecurity.com/cpqMicro/#/
 - 测试服务器是否能拉取/读取群在线表格或同步后的本地表格
 - 为后续 Hermes / LangGraph / MCP 接入预留稳定 API 层
 
-当前阶段只测试两件事：
+当前已打通三类能力：
 
 ```text
-1. 当前服务器能否读取群里的在线表格 / 导出的表格文件
-2. 当前服务器能否通过机器人 Webhook 往群里发通知
+1. 在线表格任务解析、PLA 状态查询和审批结果回写
+2. PN 定价、校验及持久化工作流：pricing -> validating -> submitting -> verifying -> under_approval
+3. Linux 编排器与 Windows GSP Agent 的租约领取、幂等回报、超时查重和审批轮询
 ```
 
-本阶段不会：
+当前的安全边界：
 
-- 根据 PN 自动跑定价平台
-- 生成 GSP 上传模板
-- 自动登录或操作 GSP
-- 自动提交任何价格申请
+- `POST /api/agent/pricing-task` 已会根据 PN 跑定价并建立持久化任务；未找到 PN 会进入 `manual_review`。
+- 未带 Agent token 的任务只执行定价和校验，随后停在 `manual_review`；只有显式授权的任务才能进入 `submitting`。
+- Windows workflow worker 默认可以查重和查审批，但只有显式设置 `gsp_submission_enabled=true` 才会领取提交动作。
+- GSP 前端已验证为四个独立写接口；真实 payload schema 必须来自受控环境抓取，四份模板缺任何一份都会在第一次写入前失败。
+- 线上表格入站意图仍未直接自动创建定价任务；需要调用 pricing-task API 或继续扩展意图路由。
 
 AGENT 页的 Webhook 配置建议：
 
@@ -289,7 +292,7 @@ AGENT 页的 Webhook 配置建议：
 - `tasks[]`，字段包括 `sheet`、`row_index`、`requester`、`description`、`product_line`、`internal_model`、`pn`、`price_level`、`customer_name`、`deadline`、`pla_no`、`owner`、`status`、`stage`、`note`、`normalized_status`
 
 > [!NOTE]
-> 当前仍不会根据 PN 跑定价，不会生成 GSP 模板，也不会自动操作 GSP。
+> 定价工作流和 Windows 执行器已经落地，但 GSP 写开关默认关闭。状态机不是对真实 GSP payload 合同的替代；模板未经过受控抓包验证前不得开启提交。
 > bot 回群通知需要先在 AGENT 页配置 Webhook URL 和关键词。
 
 GSP 状态查询链路：
@@ -300,9 +303,8 @@ Linux 后端
   -> POST /api/agent/gsp/status-queue 暴露给 Windows Desktop Agent
 
 Windows Desktop Agent
-  -> 使用独立 Edge profile 打开 GSP
-  -> 在 PLA NO. 输入框查询
-  -> 读取结果表格 Status
+  -> 默认通过 GSP API 查询，浏览器仅作调试回退
+  -> 按 PLA NO. 读取 Status / currentStep / taskers
   -> POST /api/agent/gsp/status-result 回传服务器
 ```
 
@@ -312,8 +314,8 @@ Windows Agent 文件：
 - 结果落盘：`/data/dahua_pricing_runtime/agent/gsp_status/`
 
 > [!IMPORTANT]
-> Windows Agent 默认使用 Playwright + Edge 独立 profile，并默认 `headless=true`，不会抢主屏幕鼠标键盘。
-> 第一次建立 GSP 登录态时需要运行 `login.ps1` 人工登录一次；如果 GSP 不接受 headless，会再迁到独立 Windows 用户会话、小虚拟机或办公室小主机，避免影响日常电脑使用。
+> Windows Agent 默认使用后台 HTTP API，不会抢主屏幕鼠标键盘。Playwright + Edge 独立 profile 仅是状态查询的调试回退。
+> 完整状态机和 GSP 写入保护见 `desktop_agent/PRICING_WORKFLOW.md`。
 
 架构升级文档：
 
@@ -428,12 +430,16 @@ Runtime
 5. 从 `runtime/mapping` 读取 France 与 Sys 两套 mapping
 6. 建立原始 PN 索引与 base PN 索引
 
+如果 `runtime/data` 下存在 `reportPrice_*.xlsx`，后端加载前会自动取最新文件的第二个 `products` sheet，跳过第一行 `Back to Navigation` 辅助行，生成新的 `FrancePrice.xlsx` 并替换旧文件。
+
+如果 `runtime/data` 下存在类似 `(20260629122325) PriceList.xls` 的 Sys 导出文件，后端加载前会自动校验 PN 列并生成新的 `SysPrice.xlsx`，替换旧文件。
+
 ### 7.3 单个 PN 的计算链路
 
 核心计算逻辑在 `backend/engine/core/pricing_engine.py`：
 
 1. 先按原始 PN 精确匹配 France 和 Sys
-2. 如果精确匹配失败，再尝试 base PN fallback
+2. 如果精确匹配失败，再尝试 base PN fallback；点分数字 PN 会去掉 `-003`、`-9001` 等国际化/区域后缀后按主体 PN 查找
 3. 根据 France / Sys 行和 mapping 识别：
    - `category`
    - `price_group`
@@ -478,12 +484,17 @@ Runtime
 
 ### 8.1 更新 France / Sys 数据表
 
-替换下面两个文件：
+可以直接替换下面两个标准文件：
 
 - `/data/dahua_pricing_runtime/data/FrancePrice.xlsx`
 - `/data/dahua_pricing_runtime/data/SysPrice.xlsx`
 
-然后重启后端：
+也可以直接把 GSP 导出的原始文件丢进 `/data/dahua_pricing_runtime/data/`：
+
+- `reportPrice_*.xlsx` 会自动转换为 `FrancePrice.xlsx`
+- `(timestamp) PriceList.xls[x]` 会自动转换为 `SysPrice.xlsx`
+
+然后重启后端；`restart_backend.sh` 会在重启服务前自动执行价格数据预处理：
 
 ```bash
 cd /data/Dahua_Pricing_Auto
@@ -536,6 +547,8 @@ cd /data/Dahua_Pricing_Auto
 bash script/restart_backend.sh
 ```
 
+该脚本会先执行 `script/prepare_price_data.sh`，自动消费 data 目录下新的 `reportPrice_*.xlsx` 和 `*PriceList.xls[x]`。
+
 前端：
 
 ```bash
@@ -549,6 +562,8 @@ bash script/restart_frontend.sh
 cd /data/Dahua_Pricing_Auto
 bash script/restart_all.sh
 ```
+
+`restart_all.sh` 会调用 `restart_backend.sh`，因此也会自动执行同一套价格数据预处理。
 
 ### 8.5 持久化部署
 

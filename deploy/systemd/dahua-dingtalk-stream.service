@@ -1,0 +1,17 @@
+[Unit]
+Description=Dahua Pricing DingTalk Stream Worker
+After=network-online.target dahua-pricing-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/data/Dahua_Pricing_Auto
+Environment=PYTHONUNBUFFERED=1
+Environment=DAHUA_PRICING_RUNTIME_DIR=/data/dahua_pricing_runtime
+ExecStart=/data/Dahua_Pricing_Auto/.venv/bin/python -m backend.app.dingtalk_stream_worker --config /data/dahua_pricing_runtime/agent/dingtalk_stream.local.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

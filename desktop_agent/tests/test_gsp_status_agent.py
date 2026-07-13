@@ -36,6 +36,24 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg["dry_run"])
         self.assertEqual(cfg["gsp_query_mode"], "api")
         self.assertEqual(cfg["gsp_country_codes"], ["FR"])
+        self.assertEqual(cfg["sheet"], "")
+
+    def test_load_config_normalizes_sheet_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config.json"
+            cfg_path.write_text(
+                """
+                {
+                  "server_url": "http://localhost:8000/",
+                  "agent_token": "token",
+                  "sheet": "2026.7"
+                }
+                """,
+                encoding="utf-8",
+            )
+            cfg = agent.load_config(cfg_path)
+
+        self.assertEqual(cfg["sheet"], "2026.07")
 
     def test_load_config_rejects_placeholder_token(self) -> None:
         with tempfile.TemporaryDirectory() as td:

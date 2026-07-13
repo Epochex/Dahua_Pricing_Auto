@@ -2470,9 +2470,9 @@ function cleanPnLines(text) {
 function AgentConsole() {
   const [cfg, setCfg] = useState(null);
   const [state, setState] = useState(null);
-  const [webhookUrl, setWebhookUrl] = useState("");
-  const [webhookSecret, setWebhookSecret] = useState("");
-  const [message, setMessage] = useState("测试消息：自动化系统已接入当前服务器");
+  const [workflows, setWorkflows] = useState([]);
+  const [pricingPns, setPricingPns] = useState("");
+  const [idempotencyKey, setIdempotencyKey] = useState("");
   const [probeResult, setProbeResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -2483,12 +2483,14 @@ function AgentConsole() {
     setErr("");
     setLoading(true);
     try {
-      const [c, s] = await Promise.all([
+      const [c, s, w] = await Promise.all([
         apiGetJson("/api/agent/config"),
         apiGetJson("/api/agent/state"),
+        apiGetJson("/api/agent/pricing-workflows?limit=20"),
       ]);
       setCfg(c);
       setState(s);
+      setWorkflows(w.tasks || []);
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
@@ -2514,37 +2516,23 @@ function AgentConsole() {
         enabled: Boolean(cfg.enabled),
         mode: cfg.mode || "pricing_ops",
         notification_keyword: cfg.notification_keyword || "定价Agent",
-        webhook_url: webhookUrl.trim() ? webhookUrl.trim() : null,
-        webhook_secret: webhookSecret.trim() ? webhookSecret.trim() : null,
-        notify_on_task_done: Boolean(cfg.notify_on_task_done),
-        notify_on_task_failed: Boolean(cfg.notify_on_task_failed),
         poller_enabled: Boolean(cfg.poller_enabled),
         poll_interval_seconds: Number(cfg.poll_interval_seconds || 60),
         sheet_source_type: cfg.sheet_source_type || "file",
         sheet_source_path: cfg.sheet_source_path || "",
         apply_black_markup: Boolean(cfg.apply_black_markup),
         dry_run: Boolean(cfg.dry_run),
+        group_reply_enabled: Boolean(cfg.group_reply_enabled),
+        reply_to_mentions_only: Boolean(cfg.reply_to_mentions_only),
+        group_reply_allowed_sender_ids: cfg.group_reply_allowed_sender_ids || [],
       });
       setCfg(saved);
-      setWebhookUrl("");
-      setWebhookSecret("");
       setInfo("AGENT CONFIG SAVED");
       await loadAgent();
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const testNotify = async () => {
-    setErr("");
-    setInfo("");
-    try {
-      const r = await apiPostJson("/api/agent/notify/test", { message });
-      setInfo(JSON.stringify(r, null, 2));
-    } catch (e) {
-      setErr(String(e.message || e));
     }
   };
 
@@ -2573,6 +2561,34 @@ function AgentConsole() {
       await loadAgent();
     } catch (e) {
       setErr(String(e.message || e));
+    }
+  };
+
+  const createPricingWorkflow = async () => {
+    const pns = cleanPnLines(pricingPns);
+    if (!pns.length) {
+      setErr("Enter at least one PN.");
+      return;
+    }
+    const requestKey = idempotencyKey.trim() || `ui-${Date.now()}`;
+    setIdempotencyKey(requestKey);
+    setErr("");
+    setInfo("");
+    setSaving(true);
+    try {
+      const task = await apiPostJson("/api/agent/pricing-task", {
+        pns,
+        source: "agent-console",
+        notify: false,
+        apply_black_markup: Boolean(cfg?.apply_black_markup),
+        idempotency_key: requestKey,
+      });
+      setInfo(JSON.stringify(task, null, 2));
+      await loadAgent();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -2617,10 +2633,18 @@ function AgentConsole() {
               <label className="batchCheck">
                 <input
                   type="checkbox"
-                  checked={Boolean(cfg.notify_on_task_done)}
-                  onChange={(e) => updateCfg({ notify_on_task_done: e.target.checked })}
+                  checked={Boolean(cfg.group_reply_enabled)}
+                  onChange={(e) => updateCfg({ group_reply_enabled: e.target.checked })}
                 />
-                NOTIFY DONE
+                STREAM REPLY
+              </label>
+              <label className="batchCheck">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfg.reply_to_mentions_only)}
+                  onChange={(e) => updateCfg({ reply_to_mentions_only: e.target.checked })}
+                />
+                @ ONLY
               </label>
               <label className="batchCheck">
                 <input
@@ -2653,21 +2677,19 @@ function AgentConsole() {
                 />
               </div>
               <div>
-                <div className="sectionTitle">NEW WEBHOOK URL</div>
+                <div className="sectionTitle">ALLOWED STREAM SENDERS</div>
                 <input
                   className="input mono"
-                  value={webhookUrl}
-                  placeholder={cfg.has_webhook_url ? cfg.webhook_url || "configured" : "https://..."}
-                  onChange={(e) => setWebhookUrl(e.target.value)}
-                />
-              </div>
-              <div>
-                <div className="sectionTitle">NEW WEBHOOK SECRET</div>
-                <input
-                  className="input mono"
-                  value={webhookSecret}
-                  placeholder={cfg.has_webhook_secret ? "configured" : "optional DingTalk sign secret"}
-                  onChange={(e) => setWebhookSecret(e.target.value)}
+                  value={(cfg.group_reply_allowed_sender_ids || []).join(",")}
+                  placeholder="senderStaffId list, optional"
+                  onChange={(e) =>
+                    updateCfg({
+                      group_reply_allowed_sender_ids: e.target.value
+                        .split(",")
+                        .map((x) => x.trim())
+                        .filter(Boolean),
+                    })
+                  }
                 />
               </div>
             </div>
@@ -2694,18 +2716,63 @@ function AgentConsole() {
       </Card>
 
       <Card
-        title="NOTIFICATION TEST"
+        title="PRICING WORKFLOW · DURABLE STATE MACHINE"
         right={
-          <button className="btn primary" onClick={testNotify} disabled={!cfg?.has_webhook_url}>
-            SEND TEST
+          <button className="btn primary" onClick={createPricingWorkflow} disabled={saving}>
+            CREATE TASK
           </button>
         }
       >
-        <textarea
-          className="textarea mono short"
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-        />
+        <div className="small">
+          Pricing and validation run on Linux. GSP submission is a separately leased Windows action;
+          submission remains unavailable while the Windows write switch is off.
+        </div>
+        <Hr />
+        <div className="agentGrid two">
+          <div>
+            <div className="sectionTitle">PN LIST</div>
+            <textarea
+              className="textarea mono"
+              rows="6"
+              value={pricingPns}
+              placeholder={"1.0.01...\n1.0.02..."}
+              onChange={(e) => setPricingPns(e.target.value)}
+            />
+          </div>
+          <div>
+            <div className="sectionTitle">IDEMPOTENCY KEY</div>
+            <input
+              className="input mono"
+              value={idempotencyKey}
+              placeholder="Same key = same task; blank generates one"
+              onChange={(e) => setIdempotencyKey(e.target.value)}
+            />
+            <div className="small" style={{ marginTop: 10 }}>
+              submitting timeout → verifying → found / confirmed absent / manual review
+            </div>
+          </div>
+        </div>
+        <Hr />
+        {workflows.length ? (
+          <div className="stack">
+            {workflows.map((task) => (
+              <div className="resultItem" key={task.task_id}>
+                <div className="row wrap">
+                  <Badge status={task.state} />
+                  <span className="mono">{task.task_id}</span>
+                  <span className="small">v{task.version}</span>
+                  {task.submission?.pla_no ? <span className="pill">{task.submission.pla_no}</span> : null}
+                </div>
+                <div className="small mono">
+                  effect={task.effect_key} · submit attempts={task.submission?.attempts || 0} · verify
+                  attempts={task.verification?.attempts || 0}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="small">No pricing workflows yet.</div>
+        )}
       </Card>
 
       <Card
@@ -2722,8 +2789,8 @@ function AgentConsole() {
         }
       >
         <div className="small">
-          This phase only checks whether the configured online/local sheet can be fetched and previewed.
-          It does not run pricing, export templates, or operate GSP.
+          This card only probes the configured online/local sheet. Pricing workflows are created in the
+          dedicated state-machine card above.
         </div>
         <Hr />
         {probeResult ? <pre className="codebox">{JSON.stringify(probeResult, null, 2)}</pre> : null}

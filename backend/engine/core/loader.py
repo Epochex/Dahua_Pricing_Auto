@@ -9,6 +9,14 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 
+REPORT_PRICE_GLOB = "reportPrice_*.xlsx"
+FRANCE_PRICE_XLSX = "FrancePrice.xlsx"
+FRANCE_REPORT_PRODUCT_SHEET_INDEX = 1
+FRANCE_REPORT_HEADER_ROW = 1
+PRICE_LIST_GLOBS = ("*PriceList.xls", "*PriceList.xlsx")
+SYS_PRICE_XLSX = "SysPrice.xlsx"
+
+
 def safe_upper(v) -> str:
     if v is None:
         return ""
@@ -29,7 +37,7 @@ def normalize_pn_raw(pn: str) -> str:
     return safe_upper(pn)
 
 
-_BASE_SUFFIX_RE = re.compile(r"^(.*?)-\d{4}$")  # 末尾形如 -0006 / -0048
+_DAHUA_DOTTED_PN_SUFFIX_RE = re.compile(r"^([0-9.]+)-(.+)$")
 
 
 def normalize_pn_base(pn: str) -> str:
@@ -37,17 +45,32 @@ def normalize_pn_base(pn: str) -> str:
     base key：用于“同基底”匹配（你当前 server 逻辑强依赖这个）
     - strip + upper
     - 去空格
-    - 若末尾带 -xxxx（四位数字）则截断
+    - 若点分数字 PN 带国际化/区域后缀，则截断
       例：1.0.01.04.42701-0026 -> 1.0.01.04.42701
+      例：1.0.99.12.10604-003  -> 1.0.99.12.10604
     """
     s = safe_upper(pn)
     s = s.replace(" ", "")
     if not s:
         return ""
-    m = _BASE_SUFFIX_RE.match(s)
-    if m:
+    m = _DAHUA_DOTTED_PN_SUFFIX_RE.match(s)
+    if m and "." in m.group(1):
         return m.group(1)
     return s
+
+
+def _base_index_priority(raw_key: str, base_key: str) -> int:
+    """
+    Prefer the canonical PN for a base key, then the common -9001
+    internationalized row, then keep the first remaining row.
+    """
+    raw = str(raw_key or "").strip().upper()
+    base = str(base_key or "").strip().upper()
+    if raw == base:
+        return 0
+    if raw == f"{base}-9001":
+        return 1
+    return 2
 
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
@@ -100,6 +123,179 @@ def _pick_existing(*paths: Path) -> Path:
     )
 
 
+def _latest_report_price_path(data_dir: Path) -> Optional[Path]:
+    candidates = [p for p in Path(data_dir).glob(REPORT_PRICE_GLOB) if p.is_file()]
+    if not candidates:
+        return None
+
+    def _sort_key(path: Path) -> Tuple[float, str]:
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        return mtime, path.name
+
+    return max(candidates, key=_sort_key)
+
+
+def _latest_file_by_globs(data_dir: Path, patterns: Tuple[str, ...]) -> Optional[Path]:
+    candidates: List[Path] = []
+    for pattern in patterns:
+        candidates.extend(p for p in Path(data_dir).glob(pattern) if p.is_file())
+    if not candidates:
+        return None
+
+    def _sort_key(path: Path) -> Tuple[float, str]:
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            mtime = 0.0
+        return mtime, path.name
+
+    return max(candidates, key=_sort_key)
+
+
+def _is_ooxml_excel(path: Path) -> bool:
+    try:
+        with Path(path).open("rb") as f:
+            return f.read(4).startswith(b"PK")
+    except OSError:
+        return False
+
+
+def _normalize_report_price_file(report_path: Path, target_path: Path) -> Path:
+    """
+    Convert a GSP reportPrice_*.xlsx export into the runtime FrancePrice.xlsx.
+
+    GSP country exports currently contain:
+      - sheet 1: navigation
+      - sheet 2: products
+      - products row 1: Back to Navigation helper row
+      - products row 2: real header
+
+    The pricing engine expects a normal one-sheet table, so we keep only the
+    products sheet and read it with row 2 as the header.
+    """
+    report_path = Path(report_path)
+    target_path = Path(target_path)
+
+    with pd.ExcelFile(report_path, engine="openpyxl") as xls:
+        if len(xls.sheet_names) <= FRANCE_REPORT_PRODUCT_SHEET_INDEX:
+            raise ValueError(
+                f"{report_path.name} must contain a products sheet at index "
+                f"{FRANCE_REPORT_PRODUCT_SHEET_INDEX + 1}; sheets={xls.sheet_names!r}"
+            )
+
+        df = pd.read_excel(
+            xls,
+            sheet_name=FRANCE_REPORT_PRODUCT_SHEET_INDEX,
+            header=FRANCE_REPORT_HEADER_ROW,
+        )
+    df = df.dropna(how="all")
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed:")]
+
+    # Fail early if the normalized file would not be usable as FrancePrice.
+    _pick_pn_column(df)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f".{target_path.stem}.tmp{target_path.suffix}")
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="products", index=False)
+        tmp_path.replace(target_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    try:
+        report_path.unlink()
+    except OSError:
+        # Normalization succeeded; a leftover source file should not block
+        # startup/data reload.
+        pass
+
+    return target_path
+
+
+def _normalize_price_list_file(price_list_path: Path, target_path: Path) -> Path:
+    """
+    Consume a Sys PriceList export and replace runtime SysPrice.xlsx.
+
+    Most GSP exports named "(timestamp) PriceList.xls" are actually OOXML/xlsx
+    files with an .xls suffix. For those, a validated atomic rename preserves the
+    original workbook. If a true legacy .xls appears, convert it into xlsx.
+    """
+    price_list_path = Path(price_list_path)
+    target_path = Path(target_path)
+
+    df = _read_excel_any(price_list_path)
+    _pick_pn_column(df)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_ooxml_excel(price_list_path):
+        price_list_path.replace(target_path)
+        return target_path
+
+    tmp_path = target_path.with_name(f".{target_path.stem}.tmp{target_path.suffix}")
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Sheet1", index=False)
+        tmp_path.replace(target_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    try:
+        price_list_path.unlink()
+    except OSError:
+        pass
+
+    return target_path
+
+
+def _prepare_france_price_file(data_dir: Path) -> Path:
+    """
+    If a fresh GSP reportPrice_*.xlsx was dropped into runtime/data, consume it
+    and turn it into the canonical FrancePrice.xlsx before loading data.
+    """
+    data_dir = Path(data_dir)
+    report_path = _latest_report_price_path(data_dir)
+    if report_path is not None:
+        return _normalize_report_price_file(report_path, data_dir / FRANCE_PRICE_XLSX)
+
+    return _pick_existing(
+        data_dir / FRANCE_PRICE_XLSX,
+        data_dir / "FrancePrice.xls",
+    )
+
+
+def _prepare_sys_price_file(data_dir: Path) -> Path:
+    """
+    If a fresh "(timestamp) PriceList.xls[x]" was dropped into runtime/data,
+    consume it and turn it into the canonical SysPrice.xlsx before loading data.
+    """
+    data_dir = Path(data_dir)
+    price_list_path = _latest_file_by_globs(data_dir, PRICE_LIST_GLOBS)
+    if price_list_path is not None:
+        return _normalize_price_list_file(price_list_path, data_dir / SYS_PRICE_XLSX)
+
+    return _pick_existing(
+        data_dir / "SysPrice.xls",
+        data_dir / SYS_PRICE_XLSX,
+    )
+
+
+def prepare_price_data_files(data_dir: Path) -> Tuple[Path, Path]:
+    """
+    Normalize fresh France/Sys exports in runtime/data and return canonical paths.
+    This is used by both loader startup and restart scripts.
+    """
+    data_dir = Path(data_dir)
+    france_path = _prepare_france_price_file(data_dir)
+    sys_path = _prepare_sys_price_file(data_dir)
+    return france_path, sys_path
+
+
 def _pick_pn_column(df: pd.DataFrame) -> str:
     """
     在不同表结构里找到 PN 列名。
@@ -149,6 +345,7 @@ def _build_index(df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[str, int]]:
     pn_col = _pick_pn_column(df)
     raw_map: Dict[str, int] = {}
     base_map: Dict[str, int] = {}
+    base_priority: Dict[str, int] = {}
 
     for i, v in enumerate(df[pn_col].tolist()):
         r = normalize_pn_raw(v)
@@ -156,8 +353,15 @@ def _build_index(df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[str, int]]:
         # 保留第一次出现的位置（避免重复 PN 乱跳）
         if r and r not in raw_map:
             raw_map[r] = i
-        if b and b not in base_map:
+        if not b:
+            continue
+        pri = _base_index_priority(r, b)
+        if b not in base_map:
             base_map[b] = i
+            base_priority[b] = pri
+        elif pri < base_priority.get(b, 999):
+            base_map[b] = i
+            base_priority[b] = pri
 
     return raw_map, base_map
 
@@ -192,15 +396,7 @@ def load_all_data(data_dir: Path) -> DataBundle:
     runtime_dir = data_dir.parent
     mapping_dir = runtime_dir / "mapping"
 
-    france_path = _pick_existing(
-        data_dir / "FrancePrice.xlsx",
-        data_dir / "FrancePrice.xls",
-    )
-
-    sys_path = _pick_existing(
-        data_dir / "SysPrice.xls",
-        data_dir / "SysPrice.xlsx",
-    )
+    france_path, sys_path = prepare_price_data_files(data_dir)
 
     map_fr_path = mapping_dir / "productline_map_france_full.csv"
     map_sys_path = mapping_dir / "productline_map_sys_full.csv"

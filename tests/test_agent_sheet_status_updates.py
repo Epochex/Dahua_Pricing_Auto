@@ -86,6 +86,71 @@ class AgentSheetStatusUpdateTests(unittest.TestCase):
             self.assertFalse(saved["sheet_update"]["queued"])
             self.assertEqual(agent.sheet_status_updates(AgentSheetStatusUpdatesReq(token="token"))["count"], 0)
 
+    def test_approved_gsp_result_only_writes_back_in_progress_sheet_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._agent(td)
+            saved = agent.save_gsp_status_result(
+                AgentGspStatusResultReq(
+                    token="token",
+                    pla_no="PLA20260605143508433",
+                    status="Approved",
+                    sheet="2026.06",
+                    row_index=23,
+                    sheet_status="待决策",
+                    approval_current_step="End",
+                )
+            )
+
+            self.assertFalse(saved["sheet_update"]["queued"])
+            self.assertEqual(saved["sheet_update"]["reason"], "sheet row is not in progress")
+            self.assertEqual(agent.sheet_status_updates(AgentSheetStatusUpdatesReq(token="token"))["count"], 0)
+
+    def test_approved_gsp_result_writes_back_all_running_rows_for_same_pla(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._agent(td)
+            latest = agent._read_json(agent.sheet_parsed_dir / "latest.json", {})
+            latest["tasks"].extend(
+                [
+                    {
+                        "sheet": "2026.06",
+                        "row_index": 24,
+                        "pla_no": "PLA20260605143508433",
+                        "pla_numbers": ["PLA20260605143508433"],
+                        "status": "进行中",
+                        "pn": "DH-PN-2",
+                        "requester": "Li",
+                    },
+                    {
+                        "sheet": "2026.06",
+                        "row_index": 25,
+                        "pla_no": "PLA20260605143508433",
+                        "pla_numbers": ["PLA20260605143508433"],
+                        "status": "已完成",
+                        "pn": "DH-PN-DONE",
+                        "requester": "Li",
+                    },
+                ]
+            )
+            agent._write_json(agent.sheet_parsed_dir / "latest.json", latest)
+
+            saved = agent.save_gsp_status_result(
+                AgentGspStatusResultReq(
+                    token="token",
+                    pla_no="PLA20260605143508433",
+                    status="Approved",
+                    sheet="2026.06",
+                    row_index=23,
+                    sheet_status="进行中",
+                    approval_current_step="End",
+                )
+            )
+
+            self.assertTrue(saved["sheet_update"]["queued"])
+            self.assertEqual(saved["sheet_update"]["queued_count"], 2)
+            pending = agent.sheet_status_updates(AgentSheetStatusUpdatesReq(token="token"))
+            self.assertEqual(pending["count"], 2)
+            self.assertEqual([u["cell"] for u in pending["updates"]], ["L23", "L24"])
+
 
 if __name__ == "__main__":
     unittest.main()

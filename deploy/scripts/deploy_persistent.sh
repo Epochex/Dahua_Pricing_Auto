@@ -5,6 +5,7 @@ REPO_DIR="${REPO_DIR:-/data/Dahua_Pricing_Auto}"
 RUNTIME_DIR="${RUNTIME_DIR:-/data/dahua_pricing_runtime}"
 DOMAIN="${DOMAIN:-www.dahuafrance-auto-pricing.com}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
+TAILSCALE_IP="${TAILSCALE_IP:-100.96.202.40}"
 
 log() {
   printf '[deploy] %s\n' "$*"
@@ -97,10 +98,16 @@ build_frontend() {
 install_systemd_service() {
   log "Installing systemd service"
   cp -f "${REPO_DIR}/deploy/systemd/dahua-pricing-backend.service" /etc/systemd/system/dahua-pricing-backend.service
+  cp -f "${REPO_DIR}/deploy/systemd/dahua-dingtalk-stream.service" /etc/systemd/system/dahua-dingtalk-stream.service
   sed -i -E "s|^Environment=DAHUA_PRICING_RUNTIME_DIR=.*$|Environment=DAHUA_PRICING_RUNTIME_DIR=${RUNTIME_DIR}|g" /etc/systemd/system/dahua-pricing-backend.service
   sed -i "s|--port 8000|--port ${BACKEND_PORT}|g" /etc/systemd/system/dahua-pricing-backend.service
   systemctl daemon-reload
   systemctl enable --now dahua-pricing-backend
+  if [[ -f "${RUNTIME_DIR}/agent/dingtalk_stream.local.json" ]]; then
+    systemctl enable --now dahua-dingtalk-stream
+  else
+    log "Skipping dahua-dingtalk-stream start; missing ${RUNTIME_DIR}/agent/dingtalk_stream.local.json"
+  fi
 }
 
 install_nginx_site() {
@@ -109,6 +116,12 @@ install_nginx_site() {
   cp -f "${REPO_DIR}/deploy/nginx/dahua-auto-pricing.conf" /etc/nginx/sites-available/dahua-auto-pricing
   sed -i -E "s|^[[:space:]]*server_name[[:space:]].*;|    server_name ${DOMAIN} ${bare_domain};|g" /etc/nginx/sites-available/dahua-auto-pricing
   sed -i "s|http://127.0.0.1:8000|http://127.0.0.1:${BACKEND_PORT}|g" /etc/nginx/sites-available/dahua-auto-pricing
+
+  if [[ -n "${TAILSCALE_IP}" ]]; then
+    cp -f "${REPO_DIR}/deploy/nginx/dahua-agent-tailscale.conf" /etc/nginx/conf.d/dahua-agent-tailscale.conf
+    sed -i -E "s|listen[[:space:]]+[0-9.]+:18081;|listen ${TAILSCALE_IP}:18081;|g" /etc/nginx/conf.d/dahua-agent-tailscale.conf
+    sed -i "s|http://127.0.0.1:8000|http://127.0.0.1:${BACKEND_PORT}|g" /etc/nginx/conf.d/dahua-agent-tailscale.conf
+  fi
 
   ln -sfn /etc/nginx/sites-available/dahua-auto-pricing /etc/nginx/sites-enabled/dahua-auto-pricing
   rm -f /etc/nginx/sites-enabled/default

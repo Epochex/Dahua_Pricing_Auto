@@ -1,10 +1,16 @@
 # Dahua GSP Desktop Agent
 
-This agent runs on a Windows machine that can access GSP. It only checks PLA status and posts the result back to the Linux backend. It does not run pricing and does not send DingTalk/Huachat messages.
+This directory now contains two Windows workers:
+
+- `gsp_status_agent.py` keeps the original, read-only PLA status-check flow.
+- `pricing_workflow_agent.py` consumes durable pricing-workflow actions from the Linux backend. It can verify an uncertain submission and monitor approval. It advertises the GSP write capability only when `gsp_submission_enabled` is explicitly set to `true`.
+
+Neither worker sends DingTalk/Huachat messages. The pricing engine still runs on Linux; Windows owns only the GSP-facing side effects.
 
 Default mode is `gsp_query_mode: "api"`: the agent logs in through the same GSP frontend OAuth endpoint and reads the PLA list API. This avoids browser DevTools automation, which GSP may block.
 
 The fixed GSP API contract is documented in `GSP_API_PLAYBOOK.md`.
+The state machine, idempotency rules, and guarded submission contract are documented in `PRICING_WORKFLOW.md`.
 
 ## Why This Does Not Steal Your Mouse Or Keyboard
 
@@ -33,6 +39,8 @@ Edit `config.json`:
 - `gsp_country_code`: country code used to query PLA status, for example `FR`.
 - `headless`: keep `true` after the login profile is prepared.
 - `max_tasks`: number of PLA rows to test per run.
+- `workflow_enabled`: enables the workflow worker process; it does not by itself enable GSP writes.
+- `gsp_submission_enabled`: separately enables claiming `submit_gsp`; keep it `false` until all four captured GSP payload templates are present.
 
 ## First Login
 
@@ -100,3 +108,11 @@ powershell.exe -ExecutionPolicy Bypass -File C:\path\to\desktop_agent\run_once.p
 ```
 
 Schedule it every 5-10 minutes. If you need continuous looping instead, set `poll_interval_seconds` in `config.json` and run `gsp_status_agent.py` without `--once`.
+
+Run the workflow worker separately after its guarded rollout checklist is complete:
+
+```powershell
+..venv\Scripts\python.exe .\pricing_workflow_agent.py --config .\config.json --once
+```
+
+For continuous polling, omit `--once`. Keep `gsp_submission_enabled=false` during verification-only rollout.
