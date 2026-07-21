@@ -12,7 +12,7 @@ from backend.app.agent_ops import (  # noqa: E402
     AgentGspStatusResultReq,
     AgentToolBackendHeartbeatReq,
 )
-from backend.app.dingtalk_stream_worker import build_reply  # noqa: E402
+from backend.app.dingtalk_stream_worker import build_reply, can_reply_to_group  # noqa: E402
 
 
 class AgentGroupReplyPolicyTests(unittest.TestCase):
@@ -21,6 +21,11 @@ class AgentGroupReplyPolicyTests(unittest.TestCase):
         agent.ensure_dirs()
         (agent.agent_dir / "sheet_push_token.txt").write_text("token", encoding="utf-8")
         return agent
+
+    def test_stream_outbound_gate_requires_explicit_backend_permission(self) -> None:
+        self.assertFalse(can_reply_to_group({}))
+        self.assertFalse(can_reply_to_group({"event": {"reply_policy": {"can_reply_to_group": False}}}))
+        self.assertTrue(can_reply_to_group({"event": {"reply_policy": {"can_reply_to_group": True}}}))
 
     def test_incoming_without_mention_cannot_reply_to_group(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -456,7 +461,7 @@ class AgentGroupReplyPolicyTests(unittest.TestCase):
             self.assertEqual(gsp["approval_current_step"], "Country Product Manager")
             self.assertEqual(gsp["approval_taskers"], "LEON HOU(30195)")
 
-    def test_under_approval_intent_does_not_query_sheet_queue(self) -> None:
+    def test_under_approval_intent_uses_dedicated_scan_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             agent = self._agent(td)
             result = agent.handle_dingtalk_event(
@@ -470,8 +475,9 @@ class AgentGroupReplyPolicyTests(unittest.TestCase):
 
             self.assertTrue(result["matched"])
             self.assertEqual(result["command"]["intent"], "scan_gsp_under_approval")
-            self.assertEqual(result["queue"]["count"], 0)
-            self.assertIn("pending_integration", result)
+            self.assertEqual(result["queue"]["count"], 1)
+            self.assertEqual(result["queue"]["tasks"][0]["operation"], "scan_under_approval")
+            self.assertNotIn("pending_integration", result)
 
     def test_stuck_owner_summary_intent(self) -> None:
         with tempfile.TemporaryDirectory() as td:

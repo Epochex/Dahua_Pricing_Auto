@@ -110,6 +110,7 @@ code_description_server.txt
 desktop_agent/config.json
 desktop_agent/gsp_auth.local.json
 desktop_agent/pricing_workflow_ledger.local.json
+desktop_agent/under_approval_reports.local.json
 desktop_agent/edge-profile/
 desktop_agent/screenshots/
 desktop_agent/artifacts/

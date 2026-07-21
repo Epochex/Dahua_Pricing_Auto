@@ -3,6 +3,7 @@
 This directory now contains two Windows workers:
 
 - `gsp_status_agent.py` keeps the original, read-only PLA status-check flow.
+- The same status worker can scan all currently visible `Under Approval` applications, enrich their approval step/taskers, and return one idempotent report to Linux.
 - `pricing_workflow_agent.py` consumes durable pricing-workflow actions from the Linux backend. It can verify an uncertain submission and monitor approval. It advertises the GSP write capability only when `gsp_submission_enabled` is explicitly set to `true`.
 
 Neither worker sends DingTalk/Huachat messages. The pricing engine still runs on Linux; Windows owns only the GSP-facing side effects.
@@ -39,6 +40,8 @@ Edit `config.json`:
 - `gsp_country_code`: country code used to query PLA status, for example `FR`.
 - `headless`: keep `true` after the login profile is prepared.
 - `max_tasks`: number of PLA rows to test per run.
+- `under_approval_page_size` / `under_approval_max_pages`: bounded list pagination for the read-only Under Approval scan.
+- `under_approval_report_path`: local durable outbox for scan callbacks. It contains scan evidence only, never GSP/backend credentials.
 - `workflow_enabled`: enables the workflow worker process; it does not by itself enable GSP writes.
 - `gsp_submission_enabled`: separately enables claiming `submit_gsp`; keep it `false` until all four captured GSP payload templates are present.
 
@@ -67,7 +70,41 @@ To test in safer stages:
 
 # Query one PLA directly, including approval current step/taskers when available.
 .\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --pla PLA20260602141029254
+
+# Read-only scan without any Linux callback. This is the required first production smoke test.
+.\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --scan-under-approval --no-push --max-tasks 20 --country FR
 ```
+
+## Under Approval Scan Contract
+
+Linux triggers the existing authenticated control endpoint with:
+
+```json
+{
+  "operation": "scan_under_approval",
+  "scan_id": "scan-...",
+  "run_id": "run-...",
+  "session_id": "session-...",
+  "limit": 200,
+  "country": "FR"
+}
+```
+
+Windows reads only the verified GSP list/detail endpoints and POSTs the result to:
+
+```text
+POST /api/agent/gsp/under-approval-result
+```
+
+The callback carries `scan_id`, deterministic `report_id`, trace/session ids, `items[]`, `total`, `checked_at`, `ok`, and an optional error. Before the POST, it is saved to `under_approval_reports.local.json`. If the HTTP result is lost, the next execution reuses the exact payload and `report_id` without scanning GSP again; Linux deduplicates `scan_id + report_id`.
+
+Safety properties:
+
+- The scan client has a hard allowlist containing only `pageByEntity` and `getApplicationDetailAndCategory`.
+- It filters every returned record locally, even if GSP ignores the submitted status filter.
+- `dry_run=true` or `--no-push` suppresses the Linux callback and does not leave a pending outbox record.
+- No DingTalk/Huachat API is present in the Windows worker.
+- `gsp_submission_enabled` is unrelated and remains `false` during this rollout.
 
 The flow is:
 

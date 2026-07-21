@@ -98,12 +98,20 @@ def build_reply(result: Dict[str, Any]) -> str:
     return ""
 
 
+def can_reply_to_group(result: Dict[str, Any]) -> bool:
+    """Treat the backend reply policy as the final outbound safety gate."""
+    event = result.get("event") if isinstance(result, dict) else None
+    policy = event.get("reply_policy") if isinstance(event, dict) else None
+    return bool(isinstance(policy, dict) and policy.get("can_reply_to_group"))
+
+
 class DahuaPricingStreamHandler(dingtalk_stream.ChatbotHandler):
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         self.cfg = cfg
         self.backend_event_url = safe_text(cfg.get("backend_event_url")) or "http://127.0.0.1:8000/api/agent/dingtalk/event"
         self.reply_enabled = bool(cfg.get("reply_enabled", True))
+        self.reply_on_backend_error = bool(cfg.get("reply_on_backend_error", False))
         self.mention_only = bool(cfg.get("mention_only", True))
 
     async def process(self, callback_message: dingtalk_stream.CallbackMessage):
@@ -124,14 +132,19 @@ class DahuaPricingStreamHandler(dingtalk_stream.ChatbotHandler):
             result = post_json(self.backend_event_url, payload)
         except Exception as e:
             self.logger.exception("backend event failed")
-            if self.reply_enabled:
+            if self.reply_enabled and self.reply_on_backend_error:
                 self.reply_text(f"后端处理失败：{type(e).__name__}", incoming_message)
             return dingtalk_stream.AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
 
-        if self.reply_enabled:
+        if self.reply_enabled and can_reply_to_group(result):
             reply = build_reply(result)
             if reply:
                 self.reply_text(reply, incoming_message)
+        elif self.reply_enabled:
+            self.logger.info(
+                "suppress group reply msgId=%s backend_policy=false",
+                incoming_message.message_id,
+            )
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
 

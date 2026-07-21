@@ -23,6 +23,8 @@ from backend.app.agent_ops import (
     AgentConfigReq,
     AgentGspQueueReq,
     AgentGspStatusResultReq,
+    AgentGspUnderApprovalQueueReq,
+    AgentGspUnderApprovalResultReq,
     AgentReplayEvalReq,
     AgentSheetStatusUpdateAckReq,
     AgentSheetStatusUpdatesReq,
@@ -41,6 +43,7 @@ from backend.app.pricing_workflow import (
     WorkflowNotFound,
     WorkflowValidationError,
 )
+from backend.app.sheet_workflow_ingest import SheetWorkflowIngestCoordinator
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
 from backend.engine.core import pricing_rules as pricing_rules_mod
@@ -1028,6 +1031,7 @@ app = FastAPI(title="Dahua Pricing Auto (Deploy Server)", version="0.2.0")
 _engine: Optional[PricingEngine] = None
 _agent: Optional[AgentAutomation] = None
 _pricing_workflows: Optional[PricingWorkflowStore] = None
+_sheet_workflow_ingest: Optional[SheetWorkflowIngestCoordinator] = None
 
 
 @app.on_event("startup")
@@ -1045,6 +1049,10 @@ def _startup() -> None:
     global _pricing_workflows
     _pricing_workflows = PricingWorkflowStore(RUNTIME_DIR)
     _pricing_workflows.ensure_dirs()
+    global _sheet_workflow_ingest
+    _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
+        RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
+    )
 
 
 def _require_agent() -> AgentAutomation:
@@ -1058,6 +1066,15 @@ def _require_pricing_workflows() -> PricingWorkflowStore:
         _pricing_workflows = PricingWorkflowStore(RUNTIME_DIR)
         _pricing_workflows.ensure_dirs()
     return _pricing_workflows
+
+
+def _require_sheet_workflow_ingest() -> SheetWorkflowIngestCoordinator:
+    global _sheet_workflow_ingest
+    if _sheet_workflow_ingest is None:
+        _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
+            RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
+        )
+    return _sheet_workflow_ingest
 
 
 def _workflow_http_error(exc: WorkflowError) -> HTTPException:
@@ -1349,6 +1366,16 @@ def agent_gsp_status_result(req: AgentGspStatusResultReq) -> Dict[str, Any]:
     return _require_agent().save_gsp_status_result(req)
 
 
+@app.post("/api/agent/gsp/under-approval-queue")
+def agent_gsp_under_approval_queue(req: AgentGspUnderApprovalQueueReq) -> Dict[str, Any]:
+    return _require_agent().gsp_under_approval_queue(req)
+
+
+@app.post("/api/agent/gsp/under-approval-result")
+def agent_gsp_under_approval_result(req: AgentGspUnderApprovalResultReq) -> Dict[str, Any]:
+    return _require_agent().save_gsp_under_approval_result(req)
+
+
 @app.options("/api/agent/sheet/status-updates/pending")
 def agent_sheet_status_updates_pending_options(request: Request, response: Response) -> Dict[str, Any]:
     _agent_sheet_push_cors(request, response)
@@ -1412,7 +1439,29 @@ def agent_sheet_push_options(request: Request, response: Response) -> Dict[str, 
 @app.post("/api/agent/sheet/push")
 def agent_sheet_push(req: AgentSheetPushReq, request: Request, response: Response) -> Dict[str, Any]:
     _agent_sheet_push_cors(request, response)
-    return _require_agent().receive_sheet_push(req)
+    agent = _require_agent()
+    received = agent.receive_sheet_push(req)
+    raw_payload = req.payload if isinstance(req.payload, dict) else {}
+    spreadsheet_id = str(raw_payload.get("spreadsheetId") or "").strip()
+    if not spreadsheet_id:
+        return {**received, "workflow_ingest": {"ok": True, "skipped": "spreadsheetId missing"}}
+    parsed = agent.read_parsed_sheet_push(str(received.get("push_id") or "latest"))
+    cfg = agent.read_config(redacted=False)
+
+    def create_safe_workflow(workflow_req: PricingWorkflowCreateReq) -> Dict[str, Any]:
+        return _require_pricing_workflows().create(
+            workflow_req,
+            _agent_compute_rows,
+            default_apply_black_markup=bool(cfg.get("apply_black_markup", True)),
+        )
+
+    workflow_ingest = _require_sheet_workflow_ingest().process(
+        parsed,
+        spreadsheet_id=spreadsheet_id,
+        allow_new_rows=bool(cfg.get("sheet_workflow_auto_create_enabled", False)),
+        create_workflow=create_safe_workflow,
+    )
+    return {**received, "workflow_ingest": workflow_ingest}
 
 
 @app.post("/api/agent/poller/run-once")

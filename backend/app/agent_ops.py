@@ -31,6 +31,7 @@ class AgentConfigReq(BaseModel):
     poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
     sheet_source_type: str = Field(default="file")
     sheet_source_path: str = Field(default="")
+    sheet_workflow_auto_create_enabled: bool = Field(default=False)
     apply_black_markup: bool = Field(default=True)
     dry_run: bool = Field(default=False)
     group_reply_enabled: bool = Field(default=False)
@@ -63,6 +64,7 @@ class AgentGspQueueReq(BaseModel):
 
 class AgentGspStatusResultReq(BaseModel):
     token: Optional[str] = Field(default=None)
+    report_id: Optional[str] = Field(default=None)
     run_id: Optional[str] = Field(default=None)
     queue_id: Optional[str] = Field(default=None)
     session_id: Optional[str] = Field(default=None)
@@ -84,6 +86,26 @@ class AgentGspStatusResultReq(BaseModel):
     checked_at: Optional[str] = Field(default=None)
     source: str = Field(default="windows-desktop-agent")
     detail: Optional[str] = Field(default=None)
+    error: Optional[str] = Field(default=None)
+    raw: Any = Field(default=None)
+
+
+class AgentGspUnderApprovalQueueReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class AgentGspUnderApprovalResultReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    scan_id: str = Field(default="")
+    run_id: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(default=None)
+    report_id: str = Field(default="")
+    ok: bool = Field(default=True)
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    total: Optional[int] = Field(default=None, ge=0)
+    checked_at: Optional[str] = Field(default=None)
+    source: str = Field(default="windows-desktop-agent")
     error: Optional[str] = Field(default=None)
     raw: Any = Field(default=None)
 
@@ -128,9 +150,13 @@ class AgentAutomation:
         self.tasks_dir = self.agent_dir / "tasks"
         self.sheet_cache_dir = self.agent_dir / "sheet_cache"
         self.sheet_push_dir = self.agent_dir / "sheet_push"
+        self.sheet_push_idempotency_dir = self.sheet_push_dir / "idempotency"
         self.sheet_parsed_dir = self.agent_dir / "sheet_parsed"
         self.gsp_status_dir = self.agent_dir / "gsp_status"
         self.gsp_pending_queue_path = self.gsp_status_dir / "pending_queue.json"
+        self.gsp_under_approval_dir = self.agent_dir / "gsp_under_approval"
+        self.gsp_under_approval_job_dir = self.gsp_under_approval_dir / "jobs"
+        self.gsp_under_approval_result_dir = self.gsp_under_approval_dir / "results"
         self.sheet_update_dir = self.agent_dir / "sheet_updates"
         self.trace_dir = self.agent_dir / "traces"
         self.event_dir = self.agent_dir / "events"
@@ -157,8 +183,11 @@ class AgentAutomation:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_cache_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_push_dir.mkdir(parents=True, exist_ok=True)
+        self.sheet_push_idempotency_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_parsed_dir.mkdir(parents=True, exist_ok=True)
         self.gsp_status_dir.mkdir(parents=True, exist_ok=True)
+        self.gsp_under_approval_job_dir.mkdir(parents=True, exist_ok=True)
+        self.gsp_under_approval_result_dir.mkdir(parents=True, exist_ok=True)
         self.sheet_update_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.event_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +230,7 @@ class AgentAutomation:
             "poll_interval_seconds": 60,
             "sheet_source_type": "file",
             "sheet_source_path": "",
+            "sheet_workflow_auto_create_enabled": False,
             "apply_black_markup": True,
             "dry_run": False,
             "group_reply_enabled": False,
@@ -1463,6 +1493,20 @@ class AgentAutomation:
 
         if intent == "scan_gsp_under_approval":
             reply_cfg = self.read_config(redacted=False)
+            reply_policy = {
+                "can_reply_to_group": bool(mentioned_bot)
+                and bool(reply_cfg.get("group_reply_enabled"))
+                and not bool(reply_cfg.get("dry_run"))
+                and self._sender_allowed_for_group_reply(payload, reply_cfg),
+                "dry_run": bool(reply_cfg.get("dry_run")),
+                "requires_mention": bool(reply_cfg.get("reply_to_mentions_only", True)),
+            }
+            scan = self._create_under_approval_scan(
+                event=event,
+                payload=payload,
+                command=command,
+                reply_policy=reply_policy,
+            )
             event_record = {
                 "source": source,
                 "received_at": utc_now_iso(),
@@ -1470,17 +1514,12 @@ class AgentAutomation:
                 "command_match": command,
                 "mentioned_bot": mentioned_bot,
                 "sender_id": self._event_sender_id(payload),
-                "triggered_tasks": 0,
+                "triggered_tasks": 1,
                 "sheet": command.get("sheet"),
                 "limit": int(command.get("limit") or 20),
-                "reply_policy": {
-                    "can_reply_to_group": bool(mentioned_bot)
-                    and bool(reply_cfg.get("group_reply_enabled"))
-                    and not bool(reply_cfg.get("dry_run"))
-                    and self._sender_allowed_for_group_reply(payload, reply_cfg),
-                    "dry_run": bool(reply_cfg.get("dry_run")),
-                    "requires_mention": bool(reply_cfg.get("reply_to_mentions_only", True)),
-                },
+                "reply_policy": reply_policy,
+                "scan_id": scan.get("scan_id"),
+                "responsive_trigger": scan.get("responsive_trigger"),
             }
             self._update_state({"last_inbound_event": event_record})
             return {
@@ -1489,9 +1528,15 @@ class AgentAutomation:
                 "source": source,
                 "event_id": event.get("event_id"),
                 "command": command,
-                "queue": {"ok": True, "count": 0, "tasks": []},
+                "queue": {
+                    "ok": True,
+                    "count": 1,
+                    "tasks": [scan.get("job")],
+                    "run_id": scan.get("run_id"),
+                    "session_id": scan.get("session_id"),
+                },
                 "event": event_record,
-                "pending_integration": "windows under-approval scanner result callback is not wired yet",
+                "scan": scan,
             }
 
         token = self._sheet_push_token()
@@ -1704,6 +1749,10 @@ class AgentAutomation:
         self._update_trace_metadata(run_id, {"async_reply_session_id": session_id})
 
     def _post_dingtalk_session_text(self, session_webhook: str, text: str, *, at_user_id: str = "") -> Dict[str, Any]:
+        parsed_url = urllib.parse.urlparse(self._safe_text(session_webhook))
+        host = (parsed_url.hostname or "").lower()
+        if parsed_url.scheme != "https" or not (host == "dingtalk.com" or host.endswith(".dingtalk.com")):
+            return {"ok": False, "blocked": True, "error": "session webhook host is not an allowed DingTalk HTTPS host"}
         values: Dict[str, Any] = {
             "msgtype": "text",
             "text": {"content": text},
@@ -1726,6 +1775,16 @@ class AgentAutomation:
             return {"ok": False, "status": int(e.code), "error": body[:1000]}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _async_reply_currently_allowed(self, async_reply: Dict[str, Any]) -> bool:
+        cfg = self.read_config(redacted=False)
+        original_policy = async_reply.get("reply_policy") if isinstance(async_reply.get("reply_policy"), dict) else {}
+        return (
+            bool(async_reply.get("enabled"))
+            and bool(original_policy.get("can_reply_to_group"))
+            and bool(cfg.get("group_reply_enabled"))
+            and not bool(cfg.get("dry_run"))
+        )
 
     def _post_agent_control_run_once(self, control_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         token = self._sheet_push_token()
@@ -1798,6 +1857,133 @@ class AgentAutomation:
         )
         self._update_trace_metadata(run_id, {"responsive_trigger": out})
         return out
+
+    def _under_approval_job_path(self, scan_id: str) -> Path:
+        return self.gsp_under_approval_job_dir / f"{self._safe_id(scan_id)}.json"
+
+    def _create_under_approval_scan(
+        self,
+        *,
+        event: Dict[str, Any],
+        payload: Dict[str, Any],
+        command: Dict[str, Any],
+        reply_policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_dirs()
+        event_id = self._safe_text(event.get("event_id"))
+        scan_id = self._make_id(
+            "scan",
+            event_id,
+            self._safe_text(command.get("country")) or "FR",
+            int(command.get("limit") or 20),
+        )
+        job_path = self._under_approval_job_path(scan_id)
+        existing = self._read_json(job_path, {})
+        if isinstance(existing, dict) and existing:
+            return {
+                "ok": True,
+                "replayed": True,
+                "scan_id": scan_id,
+                "run_id": existing.get("run_id"),
+                "session_id": existing.get("session_id"),
+                "job": existing,
+                "responsive_trigger": existing.get("responsive_trigger") or {},
+            }
+
+        selected_backend = self._select_tool_backend("gsp.under_approval_scan")
+        run_id = self._start_trace(
+            source="dingtalk-under-approval-scan",
+            intent="scan_gsp_under_approval",
+            metadata={
+                "event_id": event_id,
+                "scan_id": scan_id,
+                "country": self._safe_text(command.get("country")) or "FR",
+                "limit": int(command.get("limit") or 20),
+                "selected_tool_backend": selected_backend,
+            },
+        )
+        session = self._start_agent_session(
+            event=event,
+            session_type="under_approval_scan",
+            intent="scan_gsp_under_approval",
+            run_id=run_id,
+            metadata={"scan_id": scan_id, "limit": int(command.get("limit") or 20)},
+        )
+        job = {
+            "scan_id": scan_id,
+            "run_id": run_id,
+            "session_id": session.get("session_id"),
+            "event_id": event_id,
+            "state": "pending",
+            "operation": "scan_under_approval",
+            "country": self._safe_text(command.get("country")) or "FR",
+            "limit": min(max(1, int(command.get("limit") or 20)), CHAT_GSP_QUEUE_LIMIT),
+            "source": "dingtalk",
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+            "selected_tool_backend": {k: v for k, v in selected_backend.items() if k != "candidates"},
+        }
+        self._write_json(job_path, job)
+        self._attach_async_reply_context(
+            {"run_id": run_id, "session_id": session.get("session_id"), "count": 1},
+            payload,
+            reply_policy,
+        )
+        responsive_trigger = self._trigger_under_approval_scan_backend(job)
+        job["responsive_trigger"] = responsive_trigger
+        job["state"] = "dispatched" if bool(responsive_trigger.get("triggered")) else "pending"
+        job["updated_at"] = utc_now_iso()
+        self._write_json(job_path, job)
+        self._patch_agent_session(
+            session.get("session_id"),
+            status=job["state"],
+            patch={"scan_id": scan_id, "responsive_trigger": responsive_trigger},
+        )
+        self._add_trace_span(
+            run_id,
+            "under_approval_scan_dispatch",
+            status="ok" if bool(responsive_trigger.get("triggered")) else "pending",
+            metadata={"scan_id": scan_id, "responsive_trigger": responsive_trigger},
+        )
+        return {
+            "ok": True,
+            "replayed": False,
+            "scan_id": scan_id,
+            "run_id": run_id,
+            "session_id": session.get("session_id"),
+            "job": job,
+            "responsive_trigger": responsive_trigger,
+        }
+
+    def _trigger_under_approval_scan_backend(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        backend = job.get("selected_tool_backend") if isinstance(job.get("selected_tool_backend"), dict) else {}
+        backend_id = self._safe_text(backend.get("backend_id"))
+        if backend_id:
+            current = self._read_json(self.tool_backend_dir / f"{self._safe_id(backend_id)}.json", {})
+            if isinstance(current, dict) and current:
+                backend = {**current, **backend, "metadata": current.get("metadata") or backend.get("metadata") or {}}
+        metadata = backend.get("metadata") if isinstance(backend.get("metadata"), dict) else {}
+        control_url = self._safe_text(metadata.get("control_url") or metadata.get("responsive_url"))
+        if not control_url:
+            return {"triggered": False, "reason": "selected backend has no control_url", "backend_id": backend_id}
+        request_payload = {
+            "operation": "scan_under_approval",
+            "scan_id": self._safe_text(job.get("scan_id")),
+            "run_id": self._safe_text(job.get("run_id")),
+            "session_id": self._safe_text(job.get("session_id")),
+            "country": self._safe_text(job.get("country")) or "FR",
+            "limit": int(job.get("limit") or 20),
+            "no_push": False,
+            "source": "linux-backend-responsive-trigger",
+        }
+        result = self._post_agent_control_run_once(control_url, request_payload)
+        return {
+            "triggered": bool(result.get("ok")),
+            "backend_id": backend_id,
+            "control_url": control_url,
+            "payload": request_payload,
+            "result": result,
+        }
 
     def _record_unsupported_request(
         self,
@@ -2583,6 +2769,8 @@ class AgentAutomation:
         async_reply = meta.get("async_reply") if isinstance(meta.get("async_reply"), dict) else {}
         if not bool(async_reply.get("enabled")):
             return {"sent": False, "reason": "async reply disabled"}
+        if not self._async_reply_currently_allowed(async_reply):
+            return {"sent": False, "reason": "outbound reply is blocked by current policy"}
         if self._safe_text(async_reply.get("sent_at")):
             return {"sent": False, "reason": "async reply already sent"}
         expected = int(async_reply.get("queued_count") or meta.get("queued_count") or 0)
@@ -2617,6 +2805,246 @@ class AgentAutomation:
             metadata={"session_id": session_id, "result_count": len(results), "post_result": post_result},
         )
         return {"sent": bool(post_result.get("ok")), "result_count": len(results), "post_result": post_result}
+
+    def gsp_under_approval_queue(self, req: AgentGspUnderApprovalQueueReq) -> Dict[str, Any]:
+        self._check_desktop_agent_token(req.token)
+        self.ensure_dirs()
+        jobs = self._list_json_records(self.gsp_under_approval_job_dir, limit=5000)
+        pending = [j for j in jobs if self._safe_text(j.get("state")) in {"pending", "dispatched"}]
+        pending.sort(key=lambda j: self._safe_text(j.get("created_at")))
+        selected = pending[: int(req.limit)]
+        now = utc_now_iso()
+        with self._lock:
+            for job in selected:
+                job["last_delivered_at"] = now
+                job["delivery_count"] = int(job.get("delivery_count") or 0) + 1
+                job["updated_at"] = now
+                self._write_json(self._under_approval_job_path(self._safe_text(job.get("scan_id"))), job)
+        return {"ok": True, "generated_at": now, "count": len(selected), "jobs": selected}
+
+    def _normalize_under_approval_items(self, items: List[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        if len(items) > 5000:
+            raise HTTPException(status_code=400, detail="items exceeds 5000")
+        out: list[Dict[str, Any]] = []
+        for idx, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail=f"items[{idx}] must be object")
+            item = {
+                "pla_no": self._safe_text(raw.get("pla_no") or raw.get("plaNo") or raw.get("application_no")),
+                "status": self._safe_text(raw.get("status") or raw.get("approval_status") or "Under Approval"),
+                "approval_current_step": self._safe_text(
+                    raw.get("approval_current_step") or raw.get("current_step") or raw.get("approvalStep")
+                ),
+                "approval_taskers": self._safe_text(
+                    raw.get("approval_taskers") or raw.get("taskers") or raw.get("approvers")
+                ),
+                "requester": self._safe_text(raw.get("requester") or raw.get("applicant") or raw.get("created_by")),
+                "pn": self._safe_text(raw.get("pn") or raw.get("part_number")),
+                "internal_model": self._safe_text(raw.get("internal_model") or raw.get("model")),
+                "country": self._safe_text(raw.get("country") or raw.get("country_code")),
+                "created_at": self._safe_text(raw.get("created_at") or raw.get("submitted_at") or raw.get("create_time")),
+                "updated_at": self._safe_text(raw.get("updated_at") or raw.get("modified_at") or raw.get("update_time")),
+                "detail": self._safe_text(raw.get("detail") or raw.get("description"))[:1000],
+                "ok": bool(raw.get("ok", True)),
+            }
+            age_days = raw.get("age_days")
+            try:
+                item["age_days"] = max(0.0, round(float(age_days), 2)) if age_days not in (None, "") else None
+            except Exception:
+                item["age_days"] = None
+            out.append(item)
+        return out
+
+    def _under_approval_summary(self, items: list[Dict[str, Any]], *, reported_total: Optional[int] = None) -> Dict[str, Any]:
+        by_status: Dict[str, int] = {}
+        by_step: Dict[str, int] = {}
+        by_approver: Dict[str, int] = {}
+        for item in items:
+            status = self._safe_text(item.get("status")) or "Unknown"
+            step = self._safe_text(item.get("approval_current_step")) or "Unknown"
+            by_status[status] = by_status.get(status, 0) + 1
+            by_step[step] = by_step.get(step, 0) + 1
+            taskers = self._safe_text(item.get("approval_taskers"))
+            for approver in [x.strip() for x in re.split(r"[;,；，\n]+", taskers) if x.strip()]:
+                by_approver[approver] = by_approver.get(approver, 0) + 1
+
+        def _rank(values: Dict[str, int]) -> list[Dict[str, Any]]:
+            return [
+                {"name": name, "count": count}
+                for name, count in sorted(values.items(), key=lambda pair: (-pair[1], pair[0].lower()))
+            ]
+
+        oldest = sorted(
+            [x for x in items if x.get("age_days") is not None],
+            key=lambda x: (-float(x.get("age_days") or 0), self._safe_text(x.get("pla_no"))),
+        )[:10]
+        return {
+            "item_count": len(items),
+            "reported_total": int(reported_total) if reported_total is not None else len(items),
+            "failed_item_count": sum(1 for x in items if not bool(x.get("ok", True))),
+            "by_status": _rank(by_status),
+            "by_current_step": _rank(by_step),
+            "by_approver": _rank(by_approver),
+            "oldest": [
+                {
+                    "pla_no": x.get("pla_no"),
+                    "age_days": x.get("age_days"),
+                    "approval_current_step": x.get("approval_current_step"),
+                    "approval_taskers": x.get("approval_taskers"),
+                    "requester": x.get("requester"),
+                }
+                for x in oldest
+            ],
+        }
+
+    def _build_under_approval_reply_text(self, result: Dict[str, Any]) -> str:
+        summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        items = result.get("items") if isinstance(result.get("items"), list) else []
+        if not bool(result.get("ok")):
+            return f"GSP Under Approval 扫描失败：{self._safe_text(result.get('error')) or '未返回错误详情'}"
+        lines = [f"GSP Under Approval 扫描完成：{int(summary.get('reported_total') or len(items))} 条。"]
+        approvers = summary.get("by_approver") if isinstance(summary.get("by_approver"), list) else []
+        if approvers:
+            lines.append("当前待办最多：" + "，".join(f"{x.get('name')} {x.get('count')}条" for x in approvers[:5]))
+        steps = summary.get("by_current_step") if isinstance(summary.get("by_current_step"), list) else []
+        if steps:
+            lines.append("审批环节：" + "，".join(f"{x.get('name')} {x.get('count')}条" for x in steps[:5]))
+        for idx, item in enumerate(items[:10], start=1):
+            lines.append(
+                f"{idx}. {self._safe_text(item.get('pla_no')) or '-'} | "
+                f"{self._safe_text(item.get('approval_current_step')) or '-'} | "
+                f"{self._safe_text(item.get('approval_taskers')) or '-'}"
+            )
+        if len(items) > 10:
+            lines.append(f"... 还有 {len(items) - 10} 条未展开。")
+        return "\n".join(lines)
+
+    def _maybe_send_under_approval_reply(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        session_id = self._safe_text(result.get("session_id"))
+        if not session_id:
+            return {"sent": False, "reason": "session_id missing"}
+        session_path = self.session_dir / f"{self._safe_id(session_id)}.json"
+        session = self._read_json(session_path, {})
+        meta = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+        async_reply = meta.get("async_reply") if isinstance(meta.get("async_reply"), dict) else {}
+        if not self._async_reply_currently_allowed(async_reply):
+            return {"sent": False, "reason": "outbound reply is blocked by current policy"}
+        if self._safe_text(async_reply.get("sent_at")):
+            return {"sent": False, "reason": "async reply already sent"}
+        webhook = self._safe_text(async_reply.get("session_webhook"))
+        if not webhook:
+            return {"sent": False, "reason": "session webhook missing"}
+        text = self._build_under_approval_reply_text(result)
+        post_result = self._post_dingtalk_session_text(
+            webhook,
+            text,
+            at_user_id=self._safe_text(async_reply.get("sender_staff_id")),
+        )
+        async_reply.update(
+            {
+                "sent_at": utc_now_iso() if post_result.get("ok") else "",
+                "last_attempt_at": utc_now_iso(),
+                "last_result": post_result,
+                "scan_id": result.get("scan_id"),
+            }
+        )
+        self._patch_agent_session(session_id, patch={"async_reply": async_reply})
+        return {"sent": bool(post_result.get("ok")), "post_result": post_result}
+
+    def save_gsp_under_approval_result(self, req: AgentGspUnderApprovalResultReq) -> Dict[str, Any]:
+        self._check_desktop_agent_token(req.token)
+        self.ensure_dirs()
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        scan_id = self._safe_text(payload.get("scan_id"))
+        if not scan_id:
+            raise HTTPException(status_code=400, detail="scan_id is empty")
+        job = self._read_json(self._under_approval_job_path(scan_id), {})
+        if not isinstance(job, dict) or not job:
+            raise HTTPException(status_code=404, detail="under-approval scan job not found")
+        for field in ("run_id", "session_id"):
+            supplied = self._safe_text(payload.get(field))
+            expected = self._safe_text(job.get(field))
+            if supplied and expected and supplied != expected:
+                raise HTTPException(status_code=409, detail=f"{field} does not match scan job")
+            payload[field] = supplied or expected
+        items = self._normalize_under_approval_items(payload.get("items") or [])
+        canonical = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        report_id = self._safe_text(payload.get("report_id")) or self._make_id(
+            "report", scan_id, bool(payload.get("ok")), canonical, payload.get("error")
+        )
+        result_id = self._make_id("scanresult", scan_id, report_id)
+        result_path = self.gsp_under_approval_result_dir / f"{self._safe_id(result_id)}.json"
+        existing = self._read_json(result_path, {})
+        if isinstance(existing, dict) and existing:
+            reply = self._maybe_send_under_approval_reply(existing)
+            return {"ok": True, "replayed": True, "result_id": result_id, "summary": existing.get("summary"), "reply": reply}
+        checked_at = self._safe_text(payload.get("checked_at")) or utc_now_iso()
+        summary = self._under_approval_summary(items, reported_total=payload.get("total"))
+        result = {
+            "result_id": result_id,
+            "report_id": report_id,
+            "scan_id": scan_id,
+            "run_id": payload.get("run_id"),
+            "session_id": payload.get("session_id"),
+            "ok": bool(payload.get("ok")),
+            "items": items,
+            "summary": summary,
+            "checked_at": checked_at,
+            "received_at": utc_now_iso(),
+            "source": self._safe_text(payload.get("source")) or "windows-desktop-agent",
+            "error": self._safe_text(payload.get("error"))[:2000],
+        }
+        self._write_json(result_path, result)
+        job.update(
+            {
+                "state": "completed" if result["ok"] else "failed",
+                "result_id": result_id,
+                "report_id": report_id,
+                "summary": summary,
+                "completed_at": result["received_at"],
+                "updated_at": result["received_at"],
+                "error": result["error"],
+            }
+        )
+        self._write_json(self._under_approval_job_path(scan_id), job)
+        self._finish_agent_session(
+            payload.get("session_id"),
+            status="completed" if result["ok"] else "failed",
+            summary=summary,
+        )
+        self._add_trace_span(
+            payload.get("run_id"),
+            "under_approval_scan_result",
+            status="ok" if result["ok"] else "failed",
+            metadata={"scan_id": scan_id, "result_id": result_id, "summary": summary},
+        )
+        self._finish_trace(
+            payload.get("run_id"),
+            status="completed" if result["ok"] else "failed",
+            scores={"under_approval_count": summary["reported_total"], "scan_success": result["ok"]},
+        )
+        reply_preview = self._build_under_approval_reply_text(result)
+        reply = self._maybe_send_under_approval_reply(result)
+        self._update_state(
+            {
+                "last_under_approval_scan": {
+                    "scan_id": scan_id,
+                    "result_id": result_id,
+                    "ok": result["ok"],
+                    "summary": summary,
+                    "reply": reply,
+                    "received_at": result["received_at"],
+                }
+            }
+        )
+        return {
+            "ok": True,
+            "replayed": False,
+            "result_id": result_id,
+            "summary": summary,
+            "reply_preview": reply_preview,
+            "reply": reply,
+        }
 
     def save_gsp_status_result(self, req: AgentGspStatusResultReq) -> Dict[str, Any]:
         self._check_desktop_agent_token(req.token)
@@ -2667,11 +3095,35 @@ class AgentAutomation:
                 if not self._safe_text(payload.get("requester")):
                     payload["requester"] = self._safe_text(latest_task.get("requester"))
 
-        result_id_src = f"{payload['pla_no']}|{payload.get('sheet') or ''}|{payload.get('row_index') or ''}|{payload['received_at']}"
+        result_id_src = self._safe_text(payload.get("report_id")) or "|".join(
+            [
+                payload["pla_no"],
+                self._safe_text(payload.get("queue_id")),
+                self._safe_text(payload.get("sheet")),
+                str(int(payload.get("row_index") or 0)),
+                self._safe_text(payload.get("checked_at")),
+                self._safe_text(payload.get("status")),
+                "1" if bool(payload.get("ok")) else "0",
+                self._safe_text(payload.get("approval_current_step")),
+                self._safe_text(payload.get("approval_taskers")),
+            ]
+        )
         result_id = hashlib.sha1(result_id_src.encode("utf-8")).hexdigest()[:16]
         payload["result_id"] = result_id
 
         result_file = self.gsp_status_dir / f"{result_id}.json"
+        existing = self._read_json(result_file, {})
+        if isinstance(existing, dict) and existing:
+            async_reply = self._maybe_send_async_gsp_run_reply(existing)
+            return {
+                "ok": True,
+                "replayed": True,
+                "run_id": existing.get("run_id"),
+                "session_id": existing.get("session_id"),
+                "result_id": result_id,
+                "path": str(result_file),
+                "async_reply": async_reply,
+            }
         latest_file = self.gsp_status_dir / "latest.json"
         self._write_json(result_file, payload)
         self._write_json(latest_file, payload)
@@ -3173,6 +3625,35 @@ class AgentAutomation:
         if expected_token and str(req.token or "") != expected_token:
             raise HTTPException(status_code=403, detail="invalid sheet push token")
 
+        self.ensure_dirs()
+        raw_payload = req.payload if isinstance(req.payload, dict) else {}
+        idempotency_key = self._safe_text(raw_payload.get("idempotencyKey") or raw_payload.get("idempotency_key"))
+        if not idempotency_key:
+            spreadsheet_id = self._safe_text(raw_payload.get("spreadsheetId"))
+            snapshot_hash = self._safe_text(raw_payload.get("snapshotHash"))
+            if spreadsheet_id and snapshot_hash:
+                idempotency_key = f"{spreadsheet_id}:{snapshot_hash}"
+        idempotency_path: Optional[Path] = None
+        if idempotency_key:
+            key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+            idempotency_path = self.sheet_push_idempotency_dir / f"{key_hash}.json"
+            with self._lock:
+                previous = self._read_json(idempotency_path, {})
+                previous_response = previous.get("response") if isinstance(previous, dict) else None
+                if isinstance(previous_response, dict) and bool(previous.get("completed")):
+                    return {**previous_response, "replayed": True, "idempotency_key_hash": key_hash}
+                if isinstance(previous, dict) and previous:
+                    raise HTTPException(status_code=409, detail="sheet push with this idempotency key is processing")
+                self._write_json(
+                    idempotency_path,
+                    {
+                        "idempotency_key_hash": key_hash,
+                        "idempotency_key_preview": idempotency_key[:120],
+                        "completed": False,
+                        "started_at": utc_now_iso(),
+                    },
+                )
+
         received_at = utc_now_iso()
         push_id = uuid.uuid4().hex[:16]
         payload = {
@@ -3282,7 +3763,19 @@ class AgentAutomation:
             "parsed_summary": parsed.get("summary"),
         }
         self._update_state({"last_sheet_push": state_payload, "last_error": None})
-        return {"ok": True, **state_payload}
+        response = {"ok": True, **state_payload, "replayed": False}
+        if idempotency_path is not None:
+            self._write_json(
+                idempotency_path,
+                {
+                    "idempotency_key_hash": idempotency_path.stem,
+                    "idempotency_key_preview": idempotency_key[:120],
+                    "completed": True,
+                    "completed_at": utc_now_iso(),
+                    "response": response,
+                },
+            )
+        return response
 
     def _sheet_push_token(self) -> str:
         env_token = str(os.getenv("DAHUA_AGENT_SHEET_PUSH_TOKEN") or "").strip()
@@ -3600,7 +4093,6 @@ class AgentAutomation:
             values.get("description"),
             values.get("internal_model"),
             values.get("pn"),
-            values.get("price_level"),
             values.get("pla_no"),
             values.get("status"),
         ]

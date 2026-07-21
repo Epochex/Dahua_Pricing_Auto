@@ -99,6 +99,19 @@ currentStep: Country Product Manager
 taskers: LEON HOU(30195)
 ```
 
+## Read-Only Under Approval Scan
+
+The worker paginates the same `pageByEntity` endpoint with `status: "Under Approval"`, then validates the status locally and reads `getApplicationDetailAndCategory` for ownership. The server-side status filter still needs a real-account smoke test because only the PLA-number filter was previously captured and verified. Local filtering is mandatory and prevents unrelated records from being reported if that filter is ignored.
+
+The scan implementation hard-rejects every GSP business path except:
+
+```text
+/dahua-b-pricing/priceListApplication/pageByEntity
+/dahua-b-pricing/priceListApplication/getApplicationDetailAndCategory
+```
+
+It never calls insert, save, create-workflow, start-workflow, approve, reject, or edit endpoints.
+
 ## Local Commands
 
 Query one PLA directly:
@@ -111,6 +124,12 @@ Queue dry run:
 
 ```powershell
 .\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --once --no-push --max-tasks 5
+```
+
+Under Approval dry run (GSP read only, no Linux callback):
+
+```powershell
+.\.venv\Scripts\python.exe .\gsp_status_agent.py --config .\config.json --scan-under-approval --no-push --max-tasks 20 --country FR
 ```
 
 Production queue run:

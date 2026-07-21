@@ -39,6 +39,33 @@ class AgentSheetStatusUpdateTests(unittest.TestCase):
         )
         return agent
 
+    def test_sheet_parser_ignores_rows_with_only_dropdown_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._agent(td)
+            parsed = agent.parse_sheet_payload(
+                {
+                    "file": "pricing.xlsx",
+                    "sheets": [
+                        {
+                            "name": "2026.07",
+                            "rows": [
+                                ["说明"],
+                                [],
+                                [],
+                                ["请求发起人", "请求任务描述", "PN码(Part Number)", "价格应用层级", "状态"],
+                                ["", "", "", "Unknown", ""],
+                                ["Li", "定价", "1.0.01.01.10000", "Country", "进行中"],
+                            ],
+                        }
+                    ],
+                },
+                push_id="push-placeholder",
+                received_at="2026-07-16T00:00:00+00:00",
+            )
+
+            self.assertEqual(parsed["summary"]["task_count"], 1)
+            self.assertEqual(parsed["tasks"][0]["requester"], "Li")
+
     def test_approved_gsp_result_queues_l_column_completion_update(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             agent = self._agent(td)

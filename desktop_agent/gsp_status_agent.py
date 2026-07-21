@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import re
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -77,6 +80,12 @@ def load_config(path: Path) -> dict[str, Any]:
     data["slow_mo_ms"] = max(0, int(data.get("slow_mo_ms") or 0))
     data["page_timeout_ms"] = max(10000, int(data.get("page_timeout_ms") or 45000))
     data["dry_run"] = bool(data.get("dry_run", False))
+    data["under_approval_page_size"] = max(1, min(200, int(data.get("under_approval_page_size") or 100)))
+    data["under_approval_max_pages"] = max(1, min(100, int(data.get("under_approval_max_pages") or 20)))
+    report_path = Path(str(data.get("under_approval_report_path") or "under_approval_reports.local.json"))
+    if not report_path.is_absolute():
+        report_path = base_dir / report_path
+    data["under_approval_report_path"] = str(report_path.resolve())
     if not data["server_url"]:
         raise ValueError("server_url is empty")
     if not data["agent_token"] or "PASTE_" in data["agent_token"]:
@@ -97,16 +106,19 @@ def api_post(cfg: dict[str, Any], path: str, payload: dict[str, Any]) -> dict[st
 
 
 def send_heartbeat(cfg: dict[str, Any], *, status: str = "online", load: float = 0.0) -> dict[str, Any]:
+    capabilities = [
+        "gsp.status_check",
+        "gsp.status_api" if cfg.get("gsp_query_mode") == "api" else "gsp.browser_status_checker",
+    ]
+    if cfg.get("gsp_query_mode") == "api":
+        capabilities.append("gsp.under_approval_scan")
     payload = {
         "token": cfg["agent_token"],
         "backend_id": cfg["backend_id"],
         "display_name": cfg["backend_display_name"],
         "status": status,
         "load": max(0.0, min(1.0, float(load))),
-        "capabilities": [
-            "gsp.status_check",
-            "gsp.status_api" if cfg.get("gsp_query_mode") == "api" else "gsp.browser_status_checker",
-        ],
+        "capabilities": capabilities,
         "metadata": {
             "query_mode": cfg.get("gsp_query_mode"),
             "headless": bool(cfg.get("headless")),
@@ -161,6 +173,82 @@ def push_result(cfg: dict[str, Any], task: dict[str, Any], result: dict[str, Any
         "raw": result.get("raw"),
     }
     return api_post(cfg, "/api/agent/gsp/status-result", payload)
+
+
+UNDER_APPROVAL_RESULT_PATH = "/api/agent/gsp/under-approval-result"
+GSP_LIST_PATH = "/dahua-b-pricing/priceListApplication/pageByEntity"
+GSP_DETAIL_PATH = "/dahua-b-pricing/priceListApplication/getApplicationDetailAndCategory"
+UNDER_APPROVAL_STATUSES = {"under approval", "underapproval", "under_approval", "审批中", "待审批"}
+
+
+def normalize_under_approval_status(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def under_approval_report_id(scan_id: str) -> str:
+    """Return a stable opaque id for every replay of the same scan request."""
+    normalized = str(scan_id or "").strip()
+    if not normalized:
+        raise ValueError("scan_id is required")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"gsp-under-approval:{digest}"
+
+
+class UnderApprovalReportLedger:
+    """Small durable outbox; it stores scan evidence, never auth material."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            if isinstance(value, dict):
+                value.setdefault("schema_version", 1)
+                value.setdefault("reports", {})
+                return value
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        return {"schema_version": 1, "reports": {}}
+
+    def _write(self, value: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+        tmp.replace(self.path)
+
+    def get(self, report_id: str) -> dict[str, Any] | None:
+        report = (self._read().get("reports") or {}).get(report_id)
+        return copy.deepcopy(report) if isinstance(report, dict) else None
+
+    def put_pending(self, report_id: str, payload: dict[str, Any]) -> None:
+        data = self._read()
+        reports = data.setdefault("reports", {})
+        prior = reports.get(report_id) if isinstance(reports.get(report_id), dict) else {}
+        reports[report_id] = {
+            "status": "pending",
+            "created_at": prior.get("created_at") or utc_now_iso(),
+            "updated_at": utc_now_iso(),
+            "payload": copy.deepcopy(payload),
+        }
+        self._write(data)
+
+    def mark_acked(self, report_id: str, response: dict[str, Any]) -> None:
+        data = self._read()
+        report = (data.setdefault("reports", {})).get(report_id)
+        if not isinstance(report, dict):
+            raise KeyError(report_id)
+        report.update(
+            {
+                "status": "acked",
+                "updated_at": utc_now_iso(),
+                "acked_at": utc_now_iso(),
+                "response": copy.deepcopy(response),
+            }
+        )
+        self._write(data)
 
 
 class GspStatusChecker:
@@ -487,11 +575,7 @@ class GspApiStatusChecker:
                 "countryCode": country_code,
                 "priceListApplicationId": pla_no,
             }
-            resp = self.session.post(
-                self.cfg["gsp_base_url"] + "/dahua-b-pricing/priceListApplication/pageByEntity",
-                json=payload,
-                timeout=30,
-            )
+            resp = self._post_readonly_authed(GSP_LIST_PATH, payload)
             body = self._json_response(resp)
             last_body = body
             if resp.status_code == 401:
@@ -555,17 +639,114 @@ class GspApiStatusChecker:
         self.login()
 
     def _fetch_application_detail(self, pla_no: str) -> dict[str, Any]:
-        resp = self.session.post(
-            self.cfg["gsp_base_url"] + "/dahua-b-pricing/priceListApplication/getApplicationDetailAndCategory",
-            json={"priceListApplicationId": pla_no},
-            timeout=30,
-        )
+        resp = self._post_readonly_authed(GSP_DETAIL_PATH, {"priceListApplicationId": pla_no})
         body = self._json_response(resp)
         if resp.status_code == 401:
             raise RuntimeError(f"GSP detail query failed HTTP 401: {body}")
         if resp.status_code >= 400:
             return {"http_status": resp.status_code, "body": body}
         return body
+
+    def _post_readonly(self, path: str, payload: dict[str, Any]) -> requests.Response:
+        """Hard gate for status operations: no GSP create/save/workflow endpoint is callable here."""
+        if path not in {GSP_LIST_PATH, GSP_DETAIL_PATH}:
+            raise PermissionError(f"GSP write/non-status endpoint is forbidden: {path}")
+        return self.session.post(self.cfg["gsp_base_url"] + path, json=payload, timeout=30)
+
+    def _post_readonly_authed(self, path: str, payload: dict[str, Any]) -> requests.Response:
+        response = self._post_readonly(path, payload)
+        if response.status_code == 401:
+            self.login()
+            response = self._post_readonly(path, payload)
+        return response
+
+    def scan_under_approval(self, *, limit: int = 200, country_code: str = "") -> dict[str, Any]:
+        """Read current Under Approval applications and enrich approval ownership.
+
+        The list API filter is sent as an optimization, but every returned row is
+        filtered again locally. This prevents a server that ignores ``status``
+        from leaking unrelated applications into a scan report.
+        """
+        limit = max(1, min(500, int(limit or 200)))
+        page_size = max(1, min(limit, int(self.cfg.get("under_approval_page_size") or 100)))
+        max_pages = max(1, min(100, int(self.cfg.get("under_approval_max_pages") or 20)))
+        countries = [str(country_code).strip()] if str(country_code or "").strip() else list(self.cfg["gsp_country_codes"])
+        items_by_pla: dict[str, dict[str, Any]] = {}
+        pages_scanned = 0
+        checked_at = utc_now_iso()
+
+        for country in countries:
+            country_records_seen = 0
+            for page_num in range(1, max_pages + 1):
+                payload = {
+                    "pageNum": page_num,
+                    "pageSize": page_size,
+                    "countryCode": country,
+                    "status": "Under Approval",
+                }
+                resp = self._post_readonly_authed(GSP_LIST_PATH, payload)
+                body = self._json_response(resp)
+                if resp.status_code == 401:
+                    raise RuntimeError(f"GSP under-approval scan failed HTTP 401: {body}")
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"GSP under-approval scan failed HTTP {resp.status_code}: {body}")
+                pages_scanned += 1
+                records = self._records_from_body(body)
+                country_records_seen += len(records)
+                total_records = self._total_from_body(body)
+                for row in records:
+                    if normalize_under_approval_status(row.get("status")) not in UNDER_APPROVAL_STATUSES:
+                        continue
+                    pla_no = str(row.get("priceListApplicationId") or "").strip()
+                    if not pla_no or pla_no in items_by_pla:
+                        continue
+                    detail_body = self._fetch_application_detail(pla_no)
+                    detail = self._application_from_detail(detail_body) or {}
+                    merged = dict(row)
+                    merged.update({key: value for key, value in detail.items() if value not in (None, "")})
+                    # Detail is authoritative; refuse a row that changed state during the scan.
+                    if normalize_under_approval_status(merged.get("status")) not in UNDER_APPROVAL_STATUSES:
+                        continue
+                    items_by_pla[pla_no] = self._under_approval_item(merged, country, checked_at)
+                    if len(items_by_pla) >= limit:
+                        break
+                if len(items_by_pla) >= limit:
+                    break
+                if not records:
+                    break
+                if total_records is not None and country_records_seen >= total_records:
+                    break
+                if total_records is None and len(records) < page_size:
+                    break
+            if len(items_by_pla) >= limit:
+                break
+
+        items = sorted(items_by_pla.values(), key=lambda item: str(item.get("pla_no") or ""))
+        return {
+            "ok": True,
+            "items": items,
+            "total": len(items),
+            "checked_at": checked_at,
+            "raw": {"countries": countries, "pages_scanned": pages_scanned, "limit": limit},
+        }
+
+    def _under_approval_item(self, record: dict[str, Any], country: str, checked_at: str) -> dict[str, Any]:
+        return {
+            "pla_no": str(record.get("priceListApplicationId") or "").strip(),
+            "status": str(record.get("status") or "Under Approval").strip(),
+            "approval_current_step": str(record.get("currentStep") or "").strip(),
+            "approval_taskers": str(record.get("taskers") or "").strip(),
+            "requester": str(
+                record.get("requester")
+                or record.get("applicantName")
+                or record.get("creatorName")
+                or ""
+            ).strip(),
+            "pn": str(record.get("partNum") or record.get("pn") or "").strip(),
+            "created_at": str(record.get("createTime") or record.get("createdAt") or "").strip(),
+            "country": str(record.get("countryCode") or record.get("countryName") or country).strip(),
+            "checked_at": checked_at,
+        }
 
     def _application_from_detail(self, body: dict[str, Any]) -> dict[str, Any] | None:
         data = body.get("data")
@@ -596,6 +777,108 @@ class GspApiStatusChecker:
         else:
             records = []
         return [x for x in records if isinstance(x, dict)]
+
+    def _total_from_body(self, body: dict[str, Any]) -> int | None:
+        data = body.get("data")
+        if not isinstance(data, dict):
+            return None
+        for key in ("total", "totalCount", "count"):
+            value = data.get(key)
+            try:
+                return max(0, int(value)) if value is not None else None
+            except (TypeError, ValueError):
+                continue
+        return None
+
+
+def push_under_approval_report(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    transport = copy.deepcopy(payload)
+    transport["token"] = cfg["agent_token"]
+    return api_post(cfg, UNDER_APPROVAL_RESULT_PATH, transport)
+
+
+def _build_under_approval_report(
+    request_payload: dict[str, Any],
+    scan_result: dict[str, Any],
+) -> dict[str, Any]:
+    scan_id = str(request_payload.get("scan_id") or "").strip()
+    report_id = under_approval_report_id(scan_id)
+    items = list(scan_result.get("items") or [])
+    return {
+        "scan_id": scan_id,
+        "run_id": str(request_payload.get("run_id") or "").strip() or None,
+        "session_id": str(request_payload.get("session_id") or "").strip() or None,
+        "report_id": report_id,
+        "ok": bool(scan_result.get("ok")),
+        "items": items,
+        "total": len(items),
+        "checked_at": scan_result.get("checked_at") or utc_now_iso(),
+        "source": "windows-desktop-agent",
+        "error": scan_result.get("error"),
+        "raw": scan_result.get("raw") or {},
+    }
+
+
+def run_under_approval_scan(
+    cfg: dict[str, Any],
+    request_payload: dict[str, Any],
+    *,
+    no_push: bool = False,
+    checker_factory: Any = GspApiStatusChecker,
+) -> dict[str, Any]:
+    """Run or replay one server-issued scan using a durable idempotent outbox."""
+    scan_id = str(request_payload.get("scan_id") or "").strip()
+    if not scan_id:
+        raise ValueError("scan_id is required for scan_under_approval")
+    report_id = under_approval_report_id(scan_id)
+    ledger = UnderApprovalReportLedger(Path(cfg["under_approval_report_path"]))
+    prior = ledger.get(report_id)
+    if prior and isinstance(prior.get("payload"), dict):
+        report = copy.deepcopy(prior["payload"])
+        if prior.get("status") == "acked":
+            return {
+                "ok": bool(report.get("ok")),
+                "replayed": True,
+                "already_acked": True,
+                "report": report,
+                "callback": prior.get("response") or {},
+            }
+    else:
+        limit = max(1, min(500, int(request_payload.get("limit") or cfg.get("max_tasks") or 200)))
+        country = str(request_payload.get("country") or "").strip()
+        if cfg.get("gsp_query_mode") != "api":
+            raise ValueError("scan_under_approval requires gsp_query_mode=api")
+        try:
+            with checker_factory(cfg) as checker:
+                scan_result = checker.scan_under_approval(limit=limit, country_code=country)
+        except Exception as exc:
+            scan_result = {
+                "ok": False,
+                "items": [],
+                "checked_at": utc_now_iso(),
+                "error": f"{type(exc).__name__}: {str(exc)[:1000]}",
+                "raw": {"country": country, "limit": limit},
+            }
+        report = _build_under_approval_report(request_payload, scan_result)
+
+    if no_push or cfg.get("dry_run"):
+        # A dry-run must never leave an outbox entry that a later process could send.
+        return {
+            "ok": bool(report.get("ok")),
+            "report": report,
+            "callback": {"ok": True, "skipped": True, "reason": "dry_run/no_push"},
+        }
+
+    if not prior:
+        ledger.put_pending(report_id, report)
+    response = push_under_approval_report(cfg, report)
+    ledger.mark_acked(report_id, response)
+    return {
+        "ok": bool(report.get("ok")),
+        "replayed": bool(prior),
+        "report": report,
+        "callback": response,
+    }
 
 
 def print_queue(tasks: list[dict[str, Any]]) -> None:
@@ -695,6 +978,9 @@ def serve_control(cfg: dict[str, Any]) -> None:
         "started_at": "",
         "finished_at": "",
         "last_request": {},
+        "last_operation": "",
+        "last_report_id": "",
+        "last_result_count": 0,
         "last_error": "",
     }
     lock = threading.Lock()
@@ -716,6 +1002,7 @@ def serve_control(cfg: dict[str, Any]) -> None:
                 pass
         sheet = normalize_sheet_filter(request_payload.get("sheet"))
         no_push = bool(request_payload.get("no_push", False))
+        operation = str(request_payload.get("operation") or "check_sheet_pla").strip().lower()
         with lock:
             state.update(
                 {
@@ -723,6 +1010,9 @@ def serve_control(cfg: dict[str, Any]) -> None:
                     "started_at": utc_now_iso(),
                     "finished_at": "",
                     "last_request": request_payload,
+                    "last_operation": operation,
+                    "last_report_id": "",
+                    "last_result_count": 0,
                     "last_error": "",
                 }
             )
@@ -731,7 +1021,30 @@ def serve_control(cfg: dict[str, Any]) -> None:
                 send_heartbeat(run_cfg, load=1.0)
             except Exception as err:
                 print(json.dumps({"event": "control_heartbeat_failed", "error": f"{type(err).__name__}: {err}"}, ensure_ascii=False))
-            run_once(run_cfg, no_push=no_push, sheet=sheet)
+            if operation == "scan_under_approval":
+                result = run_under_approval_scan(run_cfg, request_payload, no_push=no_push)
+                report = result.get("report") if isinstance(result, dict) else {}
+                with lock:
+                    state["last_report_id"] = str((report or {}).get("report_id") or "")
+                    state["last_result_count"] = int((report or {}).get("total") or 0)
+                print(
+                    json.dumps(
+                        {
+                            "event": "under_approval_scan_completed",
+                            "scan_id": request_payload.get("scan_id"),
+                            "report_id": (report or {}).get("report_id"),
+                            "ok": result.get("ok"),
+                            "total": (report or {}).get("total"),
+                            "replayed": bool(result.get("replayed")),
+                            "callback": result.get("callback"),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            elif operation == "check_sheet_pla":
+                run_once(run_cfg, no_push=no_push, sheet=sheet)
+            else:
+                raise ValueError(f"unsupported operation: {operation}")
         except Exception as err:
             with lock:
                 state["last_error"] = f"{type(err).__name__}: {err}"
@@ -814,6 +1127,9 @@ def main() -> int:
     parser.add_argument("--max-tasks", type=int, default=None, help="override config max_tasks for this run")
     parser.add_argument("--sheet", default=None, help="only fetch pending PLA rows from this sheet, e.g. 2026.07")
     parser.add_argument("--pla", default="", help="query one PLA directly without reading backend queue")
+    parser.add_argument("--scan-under-approval", action="store_true", help="read current GSP Under Approval rows")
+    parser.add_argument("--scan-id", default="", help="stable server scan id; generated locally when omitted")
+    parser.add_argument("--country", default="", help="optional GSP country code for an Under Approval scan")
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -846,6 +1162,33 @@ def main() -> int:
             pass
         query_one_pla(cfg, args.pla)
         return 0
+    if args.scan_under_approval:
+        result = run_under_approval_scan(
+            cfg,
+            {
+                "operation": "scan_under_approval",
+                "scan_id": args.scan_id or f"manual-{uuid.uuid4().hex}",
+                "limit": cfg["max_tasks"],
+                "country": args.country,
+            },
+            no_push=bool(args.no_push),
+        )
+        report = result.get("report") or {}
+        print(
+            json.dumps(
+                {
+                    "event": "under_approval_scan_completed",
+                    "scan_id": report.get("scan_id"),
+                    "report_id": report.get("report_id"),
+                    "ok": report.get("ok"),
+                    "total": report.get("total"),
+                    "error": report.get("error"),
+                    "callback": result.get("callback"),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if report.get("ok") else 1
 
     while True:
         run_once(cfg, no_push=bool(args.no_push), sheet=cfg.get("sheet"))
