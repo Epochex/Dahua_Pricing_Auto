@@ -39,3 +39,14 @@
 `observed_rows` 是观测结果，不是自动确认动作。协调器把快照原子写入 runtime 的
 `agent/sheet_workflow_ingest/state.json`；不要把它放到 Google Sheet 单元格或
 Apps Script 日志中。
+
+## 存量 pending 行 backfill
+
+接入前已经存在的 pending 行不能通过打开自动创建开关绕过首次快照保护。调用
+`POST /api/agent/sheet/workflow-backfill`，先用 `apply=false` 生成候选清单和
+`manifest_hash`；人工核对后，再以完全相同的 source、push、limit 和
+`expected_manifest_hash` 执行 `apply=true`。
+
+backfill 只在 `dry_run=true` 且 `group_reply_enabled=false` 时工作。生成请求继续固定
+为 `submission_authorized=false`、`notify=false`、`gsp_payload={}`，最多运行定价并停在
+`manual_review`，不会调用 Windows Agent。

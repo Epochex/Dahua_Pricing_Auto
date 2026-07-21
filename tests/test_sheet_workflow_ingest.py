@@ -11,7 +11,9 @@ sys.path.insert(0, str(ROOT))
 
 from backend.app.sheet_workflow_ingest import (  # noqa: E402
     SheetWorkflowIngestCoordinator,
+    plan_sheet_workflow_backfill,
     plan_sheet_workflow_ingest,
+    sheet_backfill_manifest_hash,
     sheet_row_business_hash,
     sheet_row_idempotency_key,
     sheet_row_locator,
@@ -310,6 +312,61 @@ class SheetWorkflowIngestTests(unittest.TestCase):
             )
             self.assertFalse(blocked["ok"])
             self.assertEqual(blocked["blocked"], "spreadsheet_identity_changed")
+
+    def test_existing_pending_rows_require_preview_hash_before_safe_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = SheetWorkflowIngestCoordinator(Path(tmp) / "state.json")
+            parsed = {
+                "tasks": [
+                    task(row_index=10, pn="PN-PENDING"),
+                    task(row_index=11, pn="PN-DONE", status="已完成", normalized_status="completed"),
+                ]
+            }
+            plan = plan_sheet_workflow_backfill(parsed, spreadsheet_id=SPREADSHEET_ID)
+            manifest = sheet_backfill_manifest_hash(plan)
+            calls: list[object] = []
+
+            preview = coordinator.backfill(
+                parsed,
+                spreadsheet_id=SPREADSHEET_ID,
+                expected_manifest_hash=None,
+                apply=False,
+                limit=100,
+                create_workflow=lambda request: calls.append(request),
+            )
+            self.assertEqual(preview["manifest_hash"], manifest)
+            self.assertEqual(preview["candidate_count"], 1)
+            self.assertEqual(calls, [])
+
+            blocked = coordinator.backfill(
+                parsed,
+                spreadsheet_id=SPREADSHEET_ID,
+                expected_manifest_hash="sha256:" + "0" * 64,
+                apply=True,
+                limit=100,
+                create_workflow=lambda request: calls.append(request),
+            )
+            self.assertEqual(blocked["blocked"], "manifest_hash_mismatch")
+            self.assertEqual(calls, [])
+
+            def create(request: object) -> dict:
+                calls.append(request)
+                self.assertFalse(request.submission_authorized)
+                self.assertFalse(request.notify)
+                self.assertEqual(request.gsp_payload, {})
+                return {"task_id": "backfill-1", "state": "manual_review"}
+
+            applied = coordinator.backfill(
+                parsed,
+                spreadsheet_id=SPREADSHEET_ID,
+                expected_manifest_hash=manifest,
+                apply=True,
+                limit=100,
+                create_workflow=create,
+            )
+            self.assertTrue(applied["ok"])
+            self.assertEqual(applied["created"][0]["task_id"], "backfill-1")
+            self.assertFalse(applied["windows_agent_called"])
 
 
 if __name__ == "__main__":

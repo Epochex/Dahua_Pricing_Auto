@@ -191,6 +191,79 @@ class SheetWorkflowIngestCoordinator:
                 self._write_state(latest)
         return self._result(plan, created=created, failed=failed)
 
+    def backfill(
+        self,
+        parsed: Mapping[str, Any],
+        *,
+        spreadsheet_id: str,
+        expected_manifest_hash: Optional[str],
+        apply: bool,
+        limit: int,
+        create_workflow: Any,
+    ) -> Dict[str, Any]:
+        """Preview or idempotently materialize existing safe pending rows.
+
+        Normal ingest never acts on an initial snapshot.  Backfill is the
+        explicit two-step escape hatch: callers first obtain a manifest hash,
+        then submit that exact hash to create pricing-only/manual-review tasks.
+        Generated requests still carry no GSP payload, notification intent, or
+        submission authorization.
+        """
+
+        plan = plan_sheet_workflow_backfill(parsed, spreadsheet_id=spreadsheet_id, limit=limit)
+        manifest_hash = sheet_backfill_manifest_hash(plan)
+        candidates = [item for item in plan.decisions if item.request is not None]
+        preview = {
+            "ok": True,
+            "apply": bool(apply),
+            "manifest_hash": manifest_hash,
+            "candidate_count": len(candidates),
+            "candidates": [
+                {
+                    "locator": item.locator,
+                    "sheet": item.sheet,
+                    "row_index": item.row_index,
+                    "business_hash": item.business_hash,
+                    "reason": item.reason,
+                }
+                for item in candidates
+            ],
+            "submission_authorized": False,
+            "notifications_allowed": False,
+            "windows_agent_called": False,
+        }
+        if not apply:
+            return preview
+        if not expected_manifest_hash or expected_manifest_hash != manifest_hash:
+            return {
+                **preview,
+                "ok": False,
+                "blocked": "manifest_hash_mismatch",
+                "created": [],
+                "failed": [],
+            }
+
+        created: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for decision in candidates:
+            try:
+                task = create_workflow(decision.request)
+                created.append(
+                    {
+                        "locator": decision.locator,
+                        "task_id": _clean_text(task.get("task_id")) if isinstance(task, Mapping) else "",
+                        "state": _clean_text(task.get("state")) if isinstance(task, Mapping) else "",
+                    }
+                )
+            except Exception as exc:
+                failed.append(
+                    {
+                        "locator": decision.locator,
+                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                    }
+                )
+        return {**preview, "ok": not failed, "created": created, "failed": failed}
+
     def _read_state(self) -> Dict[str, Any]:
         try:
             value = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -391,6 +464,60 @@ def plan_sheet_workflow_ingest(
         )
 
     return SheetWorkflowIngestPlan(decisions=decisions)
+
+
+def plan_sheet_workflow_backfill(
+    parsed: Mapping[str, Any],
+    *,
+    spreadsheet_id: str,
+    limit: int = 500,
+) -> SheetWorkflowIngestPlan:
+    """Select a bounded, deterministic set of safe rows from an existing snapshot."""
+
+    bounded = max(1, min(int(limit), 500))
+    regular = plan_sheet_workflow_ingest(
+        parsed,
+        spreadsheet_id=spreadsheet_id,
+        previous_rows={},
+        allow_new_rows=True,
+    )
+    selected: List[SheetWorkflowDecision] = []
+    for decision in regular.decisions:
+        if decision.action != "create" or decision.request is None:
+            continue
+        request_data = (
+            decision.request.model_copy(update={"source": "sheet_backfill", "notify": False, "submission_authorized": False, "gsp_payload": {}})
+            if hasattr(decision.request, "model_copy")
+            else decision.request.copy(update={"source": "sheet_backfill", "notify": False, "submission_authorized": False, "gsp_payload": {}})
+        )
+        selected.append(
+            SheetWorkflowDecision(
+                locator=decision.locator,
+                spreadsheet_id=decision.spreadsheet_id,
+                sheet=decision.sheet,
+                row_index=decision.row_index,
+                business_hash=decision.business_hash,
+                action="create",
+                reason="explicit_safe_backfill",
+                request=request_data,
+            )
+        )
+        if len(selected) >= bounded:
+            break
+    return SheetWorkflowIngestPlan(decisions=selected)
+
+
+def sheet_backfill_manifest_hash(plan: SheetWorkflowIngestPlan) -> str:
+    manifest = [
+        {
+            "locator": item.locator,
+            "business_hash": item.business_hash,
+            "idempotency_key": item.request.idempotency_key if item.request is not None else None,
+        }
+        for item in plan.decisions
+    ]
+    encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def normalize_pns(value: Any) -> List[str]:

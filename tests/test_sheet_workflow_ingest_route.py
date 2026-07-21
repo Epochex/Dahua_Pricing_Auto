@@ -9,6 +9,7 @@ from backend.app import main
 from backend.app.agent_ops import AgentAutomation, AgentSheetPushReq
 from backend.app.pricing_workflow import PricingWorkflowStore
 from backend.app.sheet_workflow_ingest import SheetWorkflowIngestCoordinator
+from backend.app.evolution.control_plane import EvolutionControlPlane
 
 
 def _request() -> Request:
@@ -80,3 +81,65 @@ def test_sheet_push_route_baselines_then_creates_a_safe_manual_review_task(tmp_p
     assert tasks[0]["submission"]["authorized"] is False
     assert workflows.claim(worker_id="windows", capabilities=["submit_gsp"], lease_seconds=120)["claimed"] is False
 
+
+def test_existing_sheet_backfill_is_preview_bound_and_never_calls_windows(tmp_path: Path, monkeypatch) -> None:
+    agent = AgentAutomation(tmp_path)
+    agent.ensure_dirs()
+    (agent.agent_dir / "sheet_push_token.txt").write_text("token", encoding="utf-8")
+    cfg = agent._default_config()
+    cfg.update({"dry_run": True, "group_reply_enabled": False, "poller_enabled": False})
+    agent._write_json(agent.config_path, cfg)
+    workflows = PricingWorkflowStore(tmp_path)
+    coordinator = SheetWorkflowIngestCoordinator(tmp_path / "agent" / "sheet_workflow_ingest" / "state.json")
+    evolution = EvolutionControlPlane(tmp_path)
+    evolution.ensure_baseline()
+    parsed = {
+        "tasks": [
+            {
+                "sheet": "2026.07",
+                "row_index": 8,
+                "requester": "Li",
+                "description": "定价",
+                "pn": "PN-BACKFILL",
+                "price_level": "Country",
+                "status": "待处理",
+                "normalized_status": "pending",
+                "pla_no": "",
+                "pla_numbers": [],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(main, "_agent", agent)
+    monkeypatch.setattr(main, "_pricing_workflows", workflows)
+    monkeypatch.setattr(main, "_sheet_workflow_ingest", coordinator)
+    monkeypatch.setattr(main, "_evolution", evolution)
+    monkeypatch.setattr(agent, "read_parsed_sheet_push", lambda _push_id: parsed)
+    monkeypatch.setattr(
+        main,
+        "_agent_compute_rows",
+        lambda pns, _apply: {
+            "rows": [{"pn": pn, "status": "ok"} for pn in pns],
+            "report": {"not_found": []},
+        },
+    )
+
+    preview = main.agent_sheet_workflow_backfill(
+        main.SheetWorkflowBackfillReq(token="token", source_id="sheet-production", apply=False)
+    )
+    assert preview["candidate_count"] == 1
+    assert "created" not in preview
+
+    applied = main.agent_sheet_workflow_backfill(
+        main.SheetWorkflowBackfillReq(
+            token="token",
+            source_id="sheet-production",
+            apply=True,
+            expected_manifest_hash=preview["manifest_hash"],
+        )
+    )
+    assert applied["ok"] is True
+    assert applied["windows_agent_called"] is False
+    task = workflows.list()["tasks"][0]
+    assert task["state"] == "manual_review"
+    assert task["submission"]["authorized"] is False

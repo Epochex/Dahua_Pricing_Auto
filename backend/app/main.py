@@ -44,6 +44,11 @@ from backend.app.pricing_workflow import (
     WorkflowValidationError,
 )
 from backend.app.sheet_workflow_ingest import SheetWorkflowIngestCoordinator
+from backend.app.evolution.control_plane import EvolutionControlPlane
+from backend.app.evolution.evaluation import EvaluationError
+from backend.app.evolution.event_store import EventStoreError
+from backend.app.evolution.registry import RegistryError
+from backend.app.evolution.release import ReleaseError
 from backend.engine.engine import EngineConfig, PricingEngine
 from backend.engine.core import pricing_engine as pricing_engine_mod
 from backend.engine.core import pricing_rules as pricing_rules_mod
@@ -353,6 +358,84 @@ class KeywordUpliftPreviewReq(BaseModel):
     keyword: str = Field(..., description="match keyword in Internal Model / External Model")
     pct: float = Field(..., description="preview uplift pct for the keyword")
     enabled: bool = Field(default=True, description="if false, preview returns empty impact")
+
+
+class EvolutionArtifactReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    kind: str
+    name: str
+    version: str
+    content: Any
+    parent_version: Optional[str] = None
+    source: Any = "manual"
+    created_by: str = "developer"
+    json_schema: Dict[str, Any] = Field(default_factory=dict)
+    business_constraints: Any = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EvolutionArtifactTransitionReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    to_status: str
+    actor: str
+    reason: str
+
+
+class EvolutionEvaluationReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EvolutionReleaseProposalReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    evaluation_id: str
+    candidate_pins: Dict[str, str]
+    baseline_pins: Dict[str, str]
+    environment: str = "production"
+    actor: str = "release-api"
+    release_key: Optional[str] = None
+
+
+class EvolutionActorReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    actor: str = "release-api"
+
+
+class EvolutionCanaryReq(EvolutionActorReq):
+    fraction: float = Field(gt=0, le=0.10)
+    approved_by: str
+
+
+class EvolutionPromoteReq(EvolutionActorReq):
+    approved_by: str
+
+
+class EvolutionWindowReq(EvolutionActorReq):
+    window_id: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EvolutionRollbackReq(EvolutionActorReq):
+    reason: str
+
+
+class SheetWorkflowBackfillReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    push_id: str = "latest"
+    source_id: str = Field(min_length=1, max_length=500)
+    apply: bool = False
+    expected_manifest_hash: Optional[str] = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class EvolutionCaseReviewReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    disposition: str
+    reviewer: str
+    rationale: str
+    expected_terminal_state: Optional[str] = None
+    expected_action: Optional[str] = None
+    strata: Dict[str, str] = Field(default_factory=dict)
 
 
 def _norm_optional_text(v: Any) -> Optional[str]:
@@ -1032,6 +1115,7 @@ _engine: Optional[PricingEngine] = None
 _agent: Optional[AgentAutomation] = None
 _pricing_workflows: Optional[PricingWorkflowStore] = None
 _sheet_workflow_ingest: Optional[SheetWorkflowIngestCoordinator] = None
+_evolution: Optional[EvolutionControlPlane] = None
 
 
 @app.on_event("startup")
@@ -1053,6 +1137,12 @@ def _startup() -> None:
     _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
         RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
     )
+    global _evolution
+    _evolution = EvolutionControlPlane(
+        RUNTIME_DIR,
+        execution_enabled=os.getenv("DAHUA_EVOLUTION_EXECUTION_ENABLED", "false").lower() == "true",
+    )
+    _evolution.ensure_baseline()
 
 
 def _require_agent() -> AgentAutomation:
@@ -1075,6 +1165,51 @@ def _require_sheet_workflow_ingest() -> SheetWorkflowIngestCoordinator:
             RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
         )
     return _sheet_workflow_ingest
+
+
+def _require_evolution() -> EvolutionControlPlane:
+    global _evolution
+    if _evolution is None:
+        _evolution = EvolutionControlPlane(RUNTIME_DIR, execution_enabled=False)
+        _evolution.ensure_baseline()
+    return _evolution
+
+
+def _workflow_execution_context(session_id: Optional[str] = None) -> Dict[str, Any]:
+    if _evolution is None:  # Direct unit tests do not run FastAPI startup.
+        return {
+            "run_id": f"run-{uuid.uuid4().hex}",
+            "session_id": str(session_id or f"session-{uuid.uuid4().hex}"),
+            "environment": "test-unpinned",
+            "bundle_hash": "uninitialized",
+            "pins": {},
+        }
+    return _evolution.resolve_execution_context(session_id=session_id)
+
+
+def _capture_workflow(task: Dict[str, Any]) -> Dict[str, Any]:
+    if _evolution is None:
+        return {"ok": True, "skipped": "control_plane_not_started"}
+    try:
+        return _evolution.capture_workflow(task)
+    except Exception as exc:
+        # The durable task trace remains available for later reconciliation;
+        # an observability outage must not repeat or undo a business action.
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+
+
+def _with_observability(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {**task, "observability": _capture_workflow(task)}
+
+
+def _evolution_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (ValueError, EvaluationError)):
+        return HTTPException(status_code=400, detail=str(exc))
+    if "not found" in str(exc).lower() or isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, (RegistryError, ReleaseError, EventStoreError)):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
 
 
 def _workflow_http_error(exc: WorkflowError) -> HTTPException:
@@ -1279,10 +1414,14 @@ def agent_create_pricing_task(req: PricingWorkflowCreateReq) -> Dict[str, Any]:
             req,
             _agent_compute_rows,
             default_apply_black_markup=bool(cfg.get("apply_black_markup", True)),
+            execution_context=_workflow_execution_context(req.session_id),
         )
-        return task if req.submission_authorized else PricingWorkflowStore.redact(task)
+        visible = task if req.submission_authorized else PricingWorkflowStore.redact(task)
+        return {**visible, "observability": _capture_workflow(task)}
     except WorkflowError as exc:
         raise _workflow_http_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/agent/pricing-workflows")
@@ -1297,11 +1436,12 @@ def agent_pricing_workflows(limit: int = 50, state: Optional[str] = None) -> Dic
 def agent_claim_pricing_workflow(req: PricingWorkflowClaimReq) -> Dict[str, Any]:
     _require_agent()._check_desktop_agent_token(req.token)
     try:
-        return _require_pricing_workflows().claim(
+        task = _require_pricing_workflows().claim(
             worker_id=req.worker_id,
             capabilities=req.capabilities,
             lease_seconds=req.lease_seconds,
         )
+        return _with_observability(task) if task.get("claimed") else task
     except WorkflowError as exc:
         raise _workflow_http_error(exc) from exc
 
@@ -1310,7 +1450,7 @@ def agent_claim_pricing_workflow(req: PricingWorkflowClaimReq) -> Dict[str, Any]
 def agent_report_pricing_workflow(task_id: str, req: PricingWorkflowReportReq) -> Dict[str, Any]:
     _require_agent()._check_desktop_agent_token(req.token)
     try:
-        return _require_pricing_workflows().report(
+        task = _require_pricing_workflows().report(
             task_id,
             worker_id=req.worker_id,
             lease_id=req.lease_id,
@@ -1320,6 +1460,7 @@ def agent_report_pricing_workflow(task_id: str, req: PricingWorkflowReportReq) -
             detail=req.detail,
             evidence=req.evidence,
         )
+        return _with_observability(task)
     except WorkflowError as exc:
         raise _workflow_http_error(exc) from exc
 
@@ -1328,12 +1469,13 @@ def agent_report_pricing_workflow(task_id: str, req: PricingWorkflowReportReq) -
 def agent_retry_pricing_workflow(task_id: str, req: PricingWorkflowRetryReq) -> Dict[str, Any]:
     _require_agent()._check_desktop_agent_token(req.token)
     try:
-        return _require_pricing_workflows().retry(
+        task = _require_pricing_workflows().retry(
             task_id,
             reason=req.reason,
             target_state=req.target_state,
             expected_version=req.expected_version,
         )
+        return _with_observability(task)
     except WorkflowError as exc:
         raise _workflow_http_error(exc) from exc
 
@@ -1449,11 +1591,14 @@ def agent_sheet_push(req: AgentSheetPushReq, request: Request, response: Respons
     cfg = agent.read_config(redacted=False)
 
     def create_safe_workflow(workflow_req: PricingWorkflowCreateReq) -> Dict[str, Any]:
-        return _require_pricing_workflows().create(
+        task = _require_pricing_workflows().create(
             workflow_req,
             _agent_compute_rows,
             default_apply_black_markup=bool(cfg.get("apply_black_markup", True)),
+            execution_context=_workflow_execution_context(workflow_req.session_id),
         )
+        _capture_workflow(task)
+        return task
 
     workflow_ingest = _require_sheet_workflow_ingest().process(
         parsed,
@@ -1464,9 +1609,302 @@ def agent_sheet_push(req: AgentSheetPushReq, request: Request, response: Respons
     return {**received, "workflow_ingest": workflow_ingest}
 
 
+@app.post("/api/agent/sheet/workflow-backfill")
+def agent_sheet_workflow_backfill(req: SheetWorkflowBackfillReq) -> Dict[str, Any]:
+    """Two-step preview/apply for already-existing pending Sheet rows.
+
+    Applying is allowed only while the whole agent is in dry-run mode with
+    group replies disabled.  It creates pricing/manual-review tasks but cannot
+    authorize GSP, notify a group, or lease work to the Windows agent.
+    """
+
+    agent = _require_agent()
+    agent._check_desktop_agent_token(req.token)
+    cfg = agent.read_config(redacted=False)
+    if not bool(cfg.get("dry_run")) or bool(cfg.get("group_reply_enabled")):
+        raise HTTPException(status_code=409, detail="backfill requires dry_run=true and group_reply_enabled=false")
+    parsed = agent.read_parsed_sheet_push(req.push_id)
+
+    def create_safe_workflow(workflow_req: PricingWorkflowCreateReq) -> Dict[str, Any]:
+        if workflow_req.submission_authorized or workflow_req.notify or workflow_req.gsp_payload:
+            raise WorkflowValidationError("backfill request attempted an external side effect")
+        task = _require_pricing_workflows().create(
+            workflow_req,
+            _agent_compute_rows,
+            default_apply_black_markup=bool(cfg.get("apply_black_markup", True)),
+            execution_context=_workflow_execution_context(workflow_req.session_id),
+        )
+        _capture_workflow(task)
+        return task
+
+    return _require_sheet_workflow_ingest().backfill(
+        parsed,
+        spreadsheet_id=req.source_id,
+        expected_manifest_hash=req.expected_manifest_hash,
+        apply=req.apply,
+        limit=req.limit,
+        create_workflow=create_safe_workflow,
+    )
+
+
 @app.post("/api/agent/poller/run-once")
 def agent_poller_run_once() -> Dict[str, Any]:
     return _require_agent().run_poll_once()
+
+
+# =========================
+# Evolution control-plane APIs (no external side effects)
+# =========================
+
+@app.get("/api/evolution/status")
+def evolution_status() -> Dict[str, Any]:
+    control = _require_evolution()
+    bundle = control.registry.resolve_bundle("production")
+    releases = control.releases.list(environment="production")
+    return {
+        "ok": True,
+        "mode": "shadow_only" if not control.releases.execution_enabled else "execution_eligible",
+        "active_bundle": {"bundle_hash": bundle["bundle_hash"], "pins": bundle["pins"]},
+        "event_count": len(control.events.query()),
+        "release_count": releases["count"],
+        "windows_agent_allowed": False,
+        "notifications_allowed": False,
+    }
+
+
+@app.get("/api/evolution/events")
+def evolution_events(
+    task_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    try:
+        events = _require_evolution().events.query(
+            task_id=task_id,
+            run_id=run_id,
+            session_id=session_id,
+            limit=max(1, min(limit, 1000)),
+        )
+        return {"count": len(events), "events": events}
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/replay/{task_id}")
+def evolution_replay(task_id: str) -> Dict[str, Any]:
+    try:
+        return _require_evolution().events.export_replay_bundle(task_id)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/artifacts")
+def evolution_artifacts(
+    kind: Optional[str] = None,
+    name: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        rows = _require_evolution().registry.list(kind=kind, name=name, status=status)
+        return {"count": len(rows), "artifacts": rows}
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/cases")
+def evolution_cases(status: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        return _require_evolution().cases.list(status=status)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/cases/evaluation-dataset")
+def evolution_case_dataset() -> Dict[str, Any]:
+    try:
+        return _require_evolution().cases.evaluation_cases()
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/cases/suggestions")
+def evolution_case_suggestions(minimum_occurrences: int = 3) -> Dict[str, Any]:
+    try:
+        return _require_evolution().cases.suggestions(minimum_occurrences=minimum_occurrences)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/cases/{case_id}/review")
+def evolution_review_case(case_id: str, req: EvolutionCaseReviewReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().cases.review(
+            case_id,
+            disposition=req.disposition,
+            reviewer=req.reviewer,
+            rationale=req.rationale,
+            expected_terminal_state=req.expected_terminal_state,
+            expected_action=req.expected_action,
+            strata=req.strata,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/artifacts")
+def evolution_register_artifact(req: EvolutionArtifactReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().registry.register(
+            req.kind,
+            req.name,
+            req.version,
+            req.content,
+            parent_version=req.parent_version,
+            source=req.source,
+            created_by=req.created_by,
+            json_schema=req.json_schema,
+            business_constraints=req.business_constraints,
+            metadata=req.metadata,
+            status="draft",
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/artifacts/{kind}/{name}/{version}/transition")
+def evolution_transition_artifact(
+    kind: str,
+    name: str,
+    version: str,
+    req: EvolutionArtifactTransitionReq,
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().registry.transition(
+            kind,
+            name,
+            version,
+            req.to_status,
+            actor=req.actor,
+            reason=req.reason,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/bundles/{environment}")
+def evolution_bundle(environment: str = "production") -> Dict[str, Any]:
+    try:
+        return _require_evolution().registry.resolve_bundle(environment)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/evaluations")
+def evolution_run_evaluation(req: EvolutionEvaluationReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().run_precomputed_evaluation(req.payload)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/evaluations/{evaluation_id}")
+def evolution_evaluation(evaluation_id: str) -> Dict[str, Any]:
+    try:
+        return _require_evolution().read_evaluation(evaluation_id)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/evolution/releases")
+def evolution_releases(environment: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        return _require_evolution().releases.list(environment=environment)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases")
+def evolution_propose_release(req: EvolutionReleaseProposalReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().propose_release(
+            evaluation_id=req.evaluation_id,
+            candidate_pins=req.candidate_pins,
+            baseline_pins=req.baseline_pins,
+            environment=req.environment,
+            actor=req.actor,
+            release_key=req.release_key,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases/{release_id}/shadow")
+def evolution_start_shadow(release_id: str, req: EvolutionActorReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().releases.start_shadow(release_id, actor=req.actor)
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases/{release_id}/metric-windows")
+def evolution_record_window(release_id: str, req: EvolutionWindowReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().record_release_window(
+            release_id,
+            window_id=req.window_id,
+            metrics=req.metrics,
+            actor=req.actor,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases/{release_id}/canary")
+def evolution_start_canary(release_id: str, req: EvolutionCanaryReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().releases.start_canary(
+            release_id,
+            fraction=req.fraction,
+            actor=req.actor,
+            approved_by=req.approved_by,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases/{release_id}/promote")
+def evolution_promote(release_id: str, req: EvolutionPromoteReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().promote_release(
+            release_id,
+            actor=req.actor,
+            approved_by=req.approved_by,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
+
+
+@app.post("/api/evolution/releases/{release_id}/rollback")
+def evolution_rollback(release_id: str, req: EvolutionRollbackReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_evolution().rollback_release(
+            release_id,
+            reason=req.reason,
+            actor=req.actor,
+        )
+    except Exception as exc:
+        raise _evolution_http_error(exc) from exc
 
 
 @app.post("/api/query")

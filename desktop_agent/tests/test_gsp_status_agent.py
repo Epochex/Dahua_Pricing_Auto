@@ -289,12 +289,18 @@ class StatusExtractionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._playwright = sync_playwright().start()
-        cls._browser = cls._playwright.chromium.launch()
+        try:
+            cls._browser = cls._playwright.chromium.launch()
+        except Exception as exc:  # browser binary is optional on Linux CI/server nodes
+            cls._playwright.stop()
+            raise unittest.SkipTest(f"playwright browser is unavailable: {type(exc).__name__}") from exc
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls._browser.close()
-        cls._playwright.stop()
+        if getattr(cls, "_browser", None) is not None:
+            cls._browser.close()
+        if getattr(cls, "_playwright", None) is not None:
+            cls._playwright.stop()
 
     def _extract(self, html: str, pla_no: str = "PLA20260605143508433") -> dict:
         page = self._browser.new_page()

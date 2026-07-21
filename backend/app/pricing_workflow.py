@@ -73,6 +73,7 @@ class PricingWorkflowCreateReq(BaseModel):
     max_verification_attempts: int = Field(default=3, ge=1, le=10)
     gsp_payload: Dict[str, Any] = Field(default_factory=dict)
     submission_authorized: bool = Field(default=False)
+    session_id: Optional[str] = Field(default=None, max_length=200)
     token: Optional[str] = Field(default=None)
 
 
@@ -252,6 +253,7 @@ class PricingWorkflowStore:
         compute_rows: Callable[[List[str], bool], Dict[str, Any]],
         *,
         default_apply_black_markup: bool = True,
+        execution_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         data = self._request_dict(req)
         pns = self._normalize_pns(list(data.get("pns") or []))
@@ -280,6 +282,7 @@ class PricingWorkflowStore:
                 "version": 1,
                 "created_at": now,
                 "updated_at": now,
+                "execution_context": dict(execution_context or {}),
                 "input": {
                     "pns": pns,
                     "source": str(data.get("source") or "manual").strip() or "manual",
