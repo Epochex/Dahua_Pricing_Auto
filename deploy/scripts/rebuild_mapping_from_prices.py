@@ -186,6 +186,19 @@ def build_mapping(
 
     # Sys 侧经验规则：Auto Terminal 默认归车载后端，XVR 由上面的 Internal Model contains XVR 抢先命中。
     if side == "sys":
+        for product_line in ("Matrix", "AVoIP", "Keyboard", "Decoder"):
+            add_rule(
+                rows,
+                first_col,
+                "equals",
+                product_line,
+                "",
+                "",
+                "",
+                "键盘/解码器",
+                "键盘/解码器",
+                f"manual central-control alias: {product_line} -> 键盘/解码器",
+            )
         add_rule(
             rows,
             first_col,

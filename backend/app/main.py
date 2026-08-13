@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hmac
 import json
 import math
 import os
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -44,6 +45,12 @@ from backend.app.pricing_workflow import (
     WorkflowValidationError,
 )
 from backend.app.sheet_workflow_ingest import SheetWorkflowIngestCoordinator
+from backend.app.price_data_store import (
+    PriceDataConflict,
+    PriceDataError,
+    PriceDataNotFound,
+    PriceDataStore,
+)
 from backend.app.evolution.control_plane import EvolutionControlPlane
 from backend.app.evolution.evaluation import EvaluationError
 from backend.app.evolution.event_store import EventStoreError
@@ -74,6 +81,7 @@ UPLIFT_CFG = ADMIN_DIR / "uplift.json"
 KEYWORD_UPLIFT_CFG = ADMIN_DIR / "keyword_uplift.json"
 DDP_RULES_CFG = ADMIN_DIR / "ddp_rules.json"
 PRICE_RULES_CFG = ADMIN_DIR / "price_rules.json"
+PRICE_DATA_UPLOAD_MAX_BYTES = int(os.getenv("DAHUA_PRICE_DATA_UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
 
 
 def _utc_now_iso() -> str:
@@ -83,6 +91,20 @@ def _utc_now_iso() -> str:
 def _ensure_dirs() -> None:
     for d in (UPLOADS_DIR, OUTPUTS_DIR, DATA_DIR, ADMIN_DIR, MAPPING_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _copy_upload_limited(upload: UploadFile, target: Path, *, limit: int = PRICE_DATA_UPLOAD_MAX_BYTES) -> int:
+    total = 0
+    with target.open("wb") as stream:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(status_code=413, detail="price data file exceeds upload size limit")
+            stream.write(chunk)
+    return total
 
 
 def _job_dirs(job_id: str) -> Tuple[Path, Path, Path]:
@@ -191,17 +213,22 @@ def _normalize_keyword_uplift_payload(payload: Any) -> list[Dict[str, Any]]:
     return out
 
 
-def _normalize_ddp_rules_payload(payload: Any) -> Dict[str, tuple[float, float, float, float]]:
+def _normalize_ddp_rules_payload(payload: Any) -> Dict[str, tuple[float, float, float, float, float, float]]:
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="payload must be object: {category: [p1,p2,p3,p4]}")
-    out: Dict[str, tuple[float, float, float, float]] = {}
+        raise HTTPException(
+            status_code=400,
+            detail="payload must be object: {category: [p1,p2,p3,p4,ddp_adjust,fob_adjust]}",
+        )
+    out: Dict[str, tuple[float, float, float, float, float, float]] = {}
     for k, v in payload.items():
         kk = str(k).strip()
         if not kk:
             continue
-        if not isinstance(v, (list, tuple)) or len(v) != 4:
-            raise HTTPException(status_code=400, detail=f"ddp_rules[{kk}] must be array length=4")
-        vals = tuple(_normalize_number(x, f"ddp_rules[{kk}]") for x in v)
+        if not isinstance(v, (list, tuple)) or len(v) not in {4, 5, 6}:
+            raise HTTPException(status_code=400, detail=f"ddp_rules[{kk}] must be array length=4, 5 or 6")
+        # 兼容旧配置：第五项是 DDP Adjust，第六项是该产品线 FOB Adjust。
+        raw_vals = list(v) + [0.0] * (6 - len(v))
+        vals = tuple(_normalize_number(x, f"ddp_rules[{kk}]") for x in raw_vals)
         out[kk] = vals
     return out
 
@@ -262,7 +289,7 @@ def _sorted_keyword_uplift_rows() -> list[Dict[str, Any]]:
 
 def _sorted_ddp_rules_dict() -> Dict[str, list[float]]:
     return {
-        k: [float(x) for x in v]
+        k: [float(x) for x in (list(v) + [0.0] * (6 - len(v)))]
         for k, v in sorted(pricing_rules_mod.DDP_RULES.items(), key=lambda kv: kv[0])
     }
 
@@ -295,7 +322,7 @@ def _apply_rule_overrides_if_exist() -> None:
 
 class QueryReq(BaseModel):
     pn: str = Field(..., description="Part No.")
-    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (Black policy, ATC Sys delta)")
 
 
 class QueryRecomputeReq(BaseModel):
@@ -316,7 +343,11 @@ class QueryRecomputeReq(BaseModel):
         default=None,
         description="manual price value for manual_price_field",
     )
-    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
+    manual_final_values: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="direct final price-tier overrides applied after calculation",
+    )
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (Black policy, ATC Sys delta)")
 
 
 class QueryExportReq(BaseModel):
@@ -338,7 +369,11 @@ class QueryExportReq(BaseModel):
         default=None,
         description="manual price value for manual_price_field",
     )
-    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (black +2, ATC Sys delta)")
+    manual_final_values: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="direct final price-tier overrides applied after calculation",
+    )
+    apply_black_markup: bool = Field(default=False, description="apply detected variant markups (Black policy, ATC Sys delta)")
 
 
 class ExternalModelReq(BaseModel):
@@ -799,19 +834,25 @@ def _search_models(req: ModelSearchReq) -> Dict[str, Any]:
     }
 
 
-def _pick_france_anchor_prices(external_model: str) -> tuple[Optional[str], Optional[Dict[str, float]]]:
+def _pick_france_anchor_prices(
+    external_model: str,
+    *,
+    lens_signature: Optional[List[str]] = None,
+    data_bundle: Optional[Any] = None,
+) -> Dict[str, Any]:
     assert _engine is not None and _engine.data is not None
-    df = _engine.data.france_df
+    df = (data_bundle or _engine.data).france_df
     pn_col = _pick_col(
         df,
         ("Part No.", "Part No", "Part Num", "PN", "P/N", "Part Number", "PartNumber"),
     )
     ext_col = _pick_col(df, ("External Model", "ExternalModel"))
     if not pn_col or not ext_col:
-        return None, None
+        return {"pn": None, "prices": None, "lens_signature": [], "rejection_reason": "columns_missing"}
 
     ext_up = str(external_model).strip().upper()
     price_cols = list(pricing_engine_mod.PRICE_COLS)
+    candidates: List[tuple[Any, Dict[str, float], List[str]]] = []
     for _, row in df.iterrows():
         em = _norm_optional_text(row.get(ext_col))
         if not em or em.upper() != ext_up:
@@ -825,15 +866,46 @@ def _pick_france_anchor_prices(external_model: str) -> tuple[Optional[str], Opti
                 break
             prices[c] = f
         if ok:
-            return _norm_optional_text(row.get(pn_col)), prices
-    return None, None
+            candidate_lens = pricing_engine_mod._extract_optical_signature(
+                row.get("Internal Model"), row.get(ext_col)
+            )
+            candidates.append((row, prices, candidate_lens))
+
+    target_lens = sorted(list(lens_signature or []))
+    compatible = candidates
+    if target_lens:
+        compatible = [item for item in candidates if item[2] == target_lens]
+    if not compatible:
+        reason = "lens_mismatch" if target_lens and candidates else "anchor_not_found_or_incomplete"
+        return {"pn": None, "prices": None, "lens_signature": [], "rejection_reason": reason}
+
+    distinct_internal = {
+        _normalize_model_match_text(item[0].get("Internal Model")) for item in compatible
+    }
+    distinct_internal.discard("")
+    if len(distinct_internal) > 1:
+        return {
+            "pn": None,
+            "prices": None,
+            "lens_signature": [],
+            "rejection_reason": "ambiguous_external_model_after_lens_filter",
+        }
+
+    row, prices, anchor_lens = compatible[0]
+    return {
+        "pn": _norm_optional_text(row.get(pn_col)),
+        "prices": prices,
+        "lens_signature": anchor_lens,
+        "rejection_reason": None,
+    }
 
 
 def _apply_external_model_anchor_to_row(
     row: Dict[str, Any],
     *,
     apply_france_anchor: bool,
-    anchor_cache: Optional[Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]]] = None,
+    anchor_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    data_bundle: Optional[Any] = None,
 ) -> bool:
     status = str(row.get("status", "")).lower()
     meta = dict(row.get("meta") or {})
@@ -848,28 +920,48 @@ def _apply_external_model_anchor_to_row(
     fv = dict(row.get("final_values") or {})
     row["final_values"] = fv
     ext_model = _norm_optional_text(fv.get("External Model"))
+    row_lens = pricing_engine_mod._extract_optical_signature(
+        fv.get("Internal Model"), fv.get("External Model")
+    )
     if not apply_france_anchor or not ext_model:
         meta["external_model_anchor_applied"] = False
         meta["external_model_anchor_pn"] = None
         meta["external_model_anchor"] = ext_model
         meta["external_model_anchor_changed"] = False
+        meta["external_model_row_lens_signature"] = row_lens
         return False
 
-    key = ext_model.upper()
-    anchor: tuple[Optional[str], Optional[Dict[str, float]]]
+    key = f"{ext_model.upper()}|{'/'.join(row_lens)}"
+    anchor: Dict[str, Any]
     if anchor_cache is not None and key in anchor_cache:
         anchor = anchor_cache[key]
     else:
-        anchor = _pick_france_anchor_prices(ext_model)
+        anchor = _pick_france_anchor_prices(
+            ext_model,
+            lens_signature=row_lens,
+            data_bundle=data_bundle,
+        )
         if anchor_cache is not None:
             anchor_cache[key] = anchor
-    anchor_pn, anchor_prices = anchor
+    anchor_pn = _norm_optional_text(anchor.get("pn"))
+    anchor_prices = anchor.get("prices")
+    anchor_lens = list(anchor.get("lens_signature") or [])
+    rejection_reason = _norm_optional_text(anchor.get("rejection_reason"))
 
     if not anchor_prices:
         meta["external_model_anchor_applied"] = False
         meta["external_model_anchor_pn"] = None
         meta["external_model_anchor"] = ext_model
         meta["external_model_anchor_changed"] = False
+        meta["external_model_row_lens_signature"] = row_lens
+        meta["external_model_anchor_lens_signature"] = []
+        meta["external_model_anchor_rejection_reason"] = rejection_reason
+        if rejection_reason:
+            ws = list(row.get("warnings") or [])
+            warning = f"external_model_anchor_rejected_{rejection_reason}"
+            if warning not in ws:
+                ws.append(warning)
+            row["warnings"] = ws
         return False
 
     cf = set(row.get("calculated_fields") or [])
@@ -884,6 +976,9 @@ def _apply_external_model_anchor_to_row(
     meta["external_model_anchor_pn"] = anchor_pn
     meta["external_model_anchor"] = ext_model
     meta["external_model_anchor_changed"] = row_changed
+    meta["external_model_row_lens_signature"] = row_lens
+    meta["external_model_anchor_lens_signature"] = anchor_lens
+    meta["external_model_anchor_rejection_reason"] = None
     ws = list(row.get("warnings") or [])
     w = f"external_model_anchor_price_from_fr={anchor_pn or 'UNKNOWN'}"
     if w not in ws:
@@ -902,10 +997,11 @@ def _query_cluster_by_external_model(
     if not pns:
         raise HTTPException(status_code=404, detail=f"no rows found for external model: {external_model}")
 
-    anchor_cache: Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]] = {}
+    anchor_cache: Dict[str, Dict[str, Any]] = {}
     rows: list[Dict[str, Any]] = []
     changed_pns: list[str] = []
     anchor_pn: Optional[str] = None
+    anchor_pns: set[str] = set()
     anchor_applied = False
     for item_pn in pns:
         r = _engine.query_one(item_pn)
@@ -918,6 +1014,8 @@ def _query_cluster_by_external_model(
         if r_meta.get("external_model_anchor_applied"):
             anchor_applied = True
             anchor_pn = _norm_optional_text(r_meta.get("external_model_anchor_pn")) or anchor_pn
+            if anchor_pn:
+                anchor_pns.add(anchor_pn)
         if row_changed:
             changed_pns.append(item_pn)
         rows.append(r)
@@ -929,6 +1027,7 @@ def _query_cluster_by_external_model(
         "count": len(rows),
         "anchor_applied": bool(anchor_applied),
         "anchor_pn": anchor_pn,
+        "anchor_pns": sorted(anchor_pns),
         "anchor_changed_count": len(changed_pns),
         "anchor_changed_pns": changed_pns,
         "rows": rows,
@@ -1116,6 +1215,7 @@ _agent: Optional[AgentAutomation] = None
 _pricing_workflows: Optional[PricingWorkflowStore] = None
 _sheet_workflow_ingest: Optional[SheetWorkflowIngestCoordinator] = None
 _evolution: Optional[EvolutionControlPlane] = None
+_price_data_store: Optional[PriceDataStore] = None
 
 
 @app.on_event("startup")
@@ -1125,7 +1225,10 @@ def _startup() -> None:
     global _engine
     cfg = EngineConfig(runtime_dir=RUNTIME_DIR)
     _engine = PricingEngine(cfg)
-    _engine.load()
+    global _price_data_store
+    _price_data_store = PriceDataStore(RUNTIME_DIR)
+    active_bundle, active_version = _price_data_store.bootstrap()
+    _engine.install_data(active_bundle, version=active_version)
     global _agent
     _agent = AgentAutomation(RUNTIME_DIR)
     _agent.ensure_dirs()
@@ -1173,6 +1276,33 @@ def _require_evolution() -> EvolutionControlPlane:
         _evolution = EvolutionControlPlane(RUNTIME_DIR, execution_enabled=False)
         _evolution.ensure_baseline()
     return _evolution
+
+
+def _require_price_data_store() -> PriceDataStore:
+    global _price_data_store
+    if _price_data_store is None:
+        _price_data_store = PriceDataStore(RUNTIME_DIR)
+    return _price_data_store
+
+
+def _require_price_data_admin_token(
+    token: Optional[str] = Header(default=None, alias="X-Price-Data-Admin-Token"),
+) -> None:
+    configured = os.getenv("DAHUA_PRICE_DATA_ADMIN_TOKEN", "")
+    # Missing configuration is deliberately fail-closed. Keep the response generic
+    # so neither configuration state nor the expected token is disclosed.
+    if not configured or not token or not hmac.compare_digest(token, configured):
+        raise HTTPException(status_code=403, detail="administrator authorization required")
+
+
+def _price_data_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, PriceDataNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, PriceDataConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, PriceDataError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail="price data operation failed")
 
 
 def _workflow_execution_context(session_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1224,6 +1354,7 @@ def _workflow_http_error(exc: WorkflowError) -> HTTPException:
 
 def _agent_compute_rows(pns: List[str], apply_black_markup: bool) -> Dict[str, Any]:
     assert _engine is not None and _engine.data is not None
+    data_snapshot, data_version = _engine.snapshot()
     rows: list[Dict[str, Any]] = []
     items: list[Dict[str, Any]] = []
     not_found: list[str] = []
@@ -1232,17 +1363,18 @@ def _agent_compute_rows(pns: List[str], apply_black_markup: bool) -> Dict[str, A
     anchor_changed_count = 0
     black_markup_applied_count = 0
     atc_markup_applied_count = 0
-    anchor_cache: Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]] = {}
+    anchor_cache: Dict[str, Dict[str, Any]] = {}
 
     for i, pn in enumerate(pns, start=1):
-        row = _engine.query_one(pn, apply_black_markup=False)
+        row = pricing_engine_mod.compute_one(data_snapshot, pn, apply_black_markup=False)
         _apply_external_model_anchor_to_row(
             row,
             apply_france_anchor=True,
             anchor_cache=anchor_cache,
+            data_bundle=data_snapshot,
         )
         pricing_engine_mod.apply_variant_markups(
-            _engine.data,
+            data_snapshot,
             row,
             apply=apply_black_markup,
         )
@@ -1267,6 +1399,7 @@ def _agent_compute_rows(pns: List[str], apply_black_markup: bool) -> Dict[str, A
 
     return {
         "rows": rows,
+        "price_data_version": data_version,
         "report": {
             "count_total": len(rows),
             "count_not_found": len(not_found),
@@ -1941,11 +2074,17 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
     force_category = _norm_optional_text(req.force_category)
     force_price_group = _norm_optional_text(req.force_price_group)
     force_series_key = _norm_optional_text(req.force_series_key)
+    try:
+        manual_final_values = pricing_engine_mod.normalize_manual_final_price_overrides(
+            req.manual_final_values
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     _validate_query_overrides(
         force_category,
         force_price_group,
         force_series_key,
-        require_any=True,
+        require_any=not bool(manual_final_values),
     )
     manual_sys_basis_price_used = _normalize_manual_price_override(
         req.manual_sys_basis_price_used,
@@ -1967,11 +2106,18 @@ def query_recompute(req: QueryRecomputeReq) -> Dict[str, Any]:
             force_category=force_category,
             force_price_group=force_price_group,
             force_series_key=force_series_key,
-            force_full_recalc=True,
+            force_full_recalc=bool(
+                force_category
+                or force_price_group
+                or manual_sys_basis_price_used is not None
+                or manual_fob is not None
+                or manual_price_value is not None
+            ),
             manual_sys_basis_price_used=manual_sys_basis_price_used,
             manual_fob=manual_fob,
             manual_price_field=manual_price_field,
             manual_price_value=manual_price_value,
+            manual_final_values=manual_final_values,
             apply_black_markup=bool(req.apply_black_markup),
         )
     except ValueError as e:
@@ -1988,6 +2134,12 @@ def query_export(req: QueryExportReq) -> FileResponse:
     force_category = _norm_optional_text(req.force_category)
     force_price_group = _norm_optional_text(req.force_price_group)
     force_series_key = _norm_optional_text(req.force_series_key)
+    try:
+        manual_final_values = pricing_engine_mod.normalize_manual_final_price_overrides(
+            req.manual_final_values
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     _validate_query_overrides(
         force_category,
         force_price_group,
@@ -2019,6 +2171,7 @@ def query_export(req: QueryExportReq) -> FileResponse:
             manual_fob=manual_fob,
             manual_price_field=manual_price_field,
             manual_price_value=manual_price_value,
+            manual_final_values=manual_final_values,
             apply_black_markup=bool(req.apply_black_markup),
         )
     except ValueError as e:
@@ -2093,12 +2246,18 @@ def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
     atc_variant = meta.get("atc_variant") or {}
     anchor_applied = bool(meta.get("external_model_anchor_applied"))
     anchor_pn = _norm_optional_text(meta.get("external_model_anchor_pn"))
-    price_source = "FR_ANCHOR" if anchor_applied else "NORMAL"
+    used_sys = bool(meta.get("used_sys"))
+    sys_basis_field = _norm_optional_text(meta.get("sys_basis_field"))
+    price_source = "SYS_FLOOR" if used_sys else ("FR_ANCHOR" if anchor_applied else "COUNTRY")
+    if used_sys and sys_basis_field:
+        price_source = f"SYS_FLOOR({sys_basis_field})"
     if anchor_applied and anchor_pn:
         price_source = f"FR_ANCHOR({anchor_pn})"
     if black_variant.get("applied"):
         white_pn = _norm_optional_text(black_variant.get("white_pn"))
-        price_source = f"BLACK+2({white_pn})" if white_pn else "BLACK+2"
+        markup = black_variant.get("markup_eur")
+        markup_text = f"{markup:g}" if isinstance(markup, (int, float)) else "?"
+        price_source = f"BLACK+{markup_text}({white_pn})" if white_pn else f"BLACK+{markup_text}"
     elif black_variant.get("eligible"):
         white_pn = _norm_optional_text(black_variant.get("white_pn"))
         price_source = f"BLACK WHITE FOUND({white_pn})" if white_pn else "BLACK WHITE FOUND"
@@ -2120,6 +2279,7 @@ def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
         "series_display": meta.get("series_display"),
         "series_key": meta.get("series_key"),
         "pricing_rule_name": meta.get("pricing_rule_name"),
+        "price_priority": meta.get("price_priority"),
         "fr_match_mode": meta.get("fr_match_mode"),
         "fr_matched_pn": meta.get("fr_matched_pn"),
         "sys_match_mode": meta.get("sys_match_mode"),
@@ -2134,7 +2294,7 @@ def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
         "atc_base_pn": atc_variant.get("base_pn"),
         "atc_base_internal_model": atc_variant.get("base_internal_model"),
         "anchor_changed": bool(meta.get("external_model_anchor_changed")),
-        "used_sys": bool(meta.get("used_sys")),
+        "used_sys": used_sys,
         "fob": fv.get("FOB C(EUR)"),
         "ddp": fv.get("DDP A(EUR)"),
         "reseller": fv.get("Suggested Reseller(EUR)"),
@@ -2148,15 +2308,18 @@ def _build_batch_review_item(idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_batch_job(job_id: str) -> None:
     assert _engine is not None
+    data_snapshot, data_version = _engine.snapshot()
     state = _read_state(job_id)
     input_path = Path(state.get("input_path") or "")
     level_norm = str(state.get("level") or "country").strip().lower() or "country"
     apply_black_markup = bool(state.get("apply_black_markup"))
+    price_priority = pricing_engine_mod.normalize_price_priority(state.get("price_priority"))
     out_dir = OUTPUTS_DIR / job_id
 
     try:
         state["status"] = "running"
         state["started_at"] = _utc_now_iso()
+        state["price_data_version"] = data_version
         _write_state(job_id, state)
 
         pns_raw = parse_pn_list_file(input_path)
@@ -2181,17 +2344,27 @@ def _run_batch_job(job_id: str) -> None:
         anchor_changed_count = 0
         black_markup_applied_count = 0
         atc_markup_applied_count = 0
-        anchor_cache: Dict[str, tuple[Optional[str], Optional[Dict[str, float]]]] = {}
+        anchor_cache: Dict[str, Dict[str, Any]] = {}
 
         for i, pn in enumerate(pns, start=1):
-            row = _engine.query_one(pn, apply_black_markup=False)
+            row = pricing_engine_mod.compute_one(
+                data_snapshot,
+                pn,
+                apply_black_markup=False,
+                price_priority=price_priority,
+            )
+            use_country_anchor = bool(
+                price_priority == pricing_engine_mod.PRICE_PRIORITY_COUNTRY_FIRST
+                or not (row.get("meta") or {}).get("used_sys")
+            )
             _apply_external_model_anchor_to_row(
                 row,
-                apply_france_anchor=True,
+                apply_france_anchor=use_country_anchor,
                 anchor_cache=anchor_cache,
+                data_bundle=data_snapshot,
             )
             pricing_engine_mod.apply_variant_markups(
-                _engine.data,
+                data_snapshot,
                 row,
                 apply=apply_black_markup,
             )
@@ -2263,7 +2436,11 @@ def _run_batch_job(job_id: str) -> None:
 @app.post("/api/batch")
 def batch(
     level: str = Form(..., description="country | country_customer"),
-    apply_black_markup: bool = Form(False, description="apply detected variant markups (black +2, ATC Sys delta)"),
+    apply_black_markup: bool = Form(False, description="apply detected variant markups (Black policy, ATC Sys delta)"),
+    price_priority: str = Form(
+        pricing_engine_mod.PRICE_PRIORITY_COUNTRY_FIRST,
+        description="country_first | system_first",
+    ),
     file: UploadFile = File(...),
 ) -> Dict[str, Any]:
     """
@@ -2275,6 +2452,10 @@ def batch(
     level_input = (level or "").strip().lower()
     if level_input not in ("country", "country_customer"):
         raise HTTPException(status_code=400, detail="level must be country or country_customer")
+    try:
+        price_priority_norm = pricing_engine_mod.normalize_price_priority(price_priority)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # 统一导出结构（兼容前端旧值）
     level_norm = "country"
@@ -2303,6 +2484,7 @@ def batch(
         "level_input": level_input,       # 保留原始请求
         "export_layout": "country",
         "apply_black_markup": bool(apply_black_markup),
+        "price_priority": price_priority_norm,
         "input_name": file.filename,
         "input_path": str(input_path),
         "output_files": [],
@@ -2332,6 +2514,7 @@ def batch(
         "status": "queued",
         "export_layout": "country",
         "apply_black_markup": bool(apply_black_markup),
+        "price_priority": price_priority_norm,
     }
 
 
@@ -2364,6 +2547,93 @@ def download(job_id: str) -> FileResponse:
 
 
 # =========================
+# Price data release APIs
+# =========================
+
+@app.get("/api/admin/price-data")
+def price_data_metadata() -> Dict[str, Any]:
+    return _require_price_data_store().metadata()
+
+
+@app.get("/api/admin/price-data/versions")
+def price_data_versions() -> Dict[str, Any]:
+    return _require_price_data_store().list_versions()
+
+
+@app.post(
+    "/api/admin/price-data/stage",
+    dependencies=[Depends(_require_price_data_admin_token)],
+)
+def price_data_upload_candidate(
+    france_file: UploadFile = File(...),
+    sys_file: UploadFile = File(...),
+    actor: Optional[str] = Header(default=None, alias="X-Price-Data-Actor"),
+) -> Dict[str, Any]:
+    for label, upload in (("FrancePrice.xlsx", france_file), ("SysPrice.xlsx", sys_file)):
+        if not upload.filename or Path(upload.filename).suffix.lower() != ".xlsx":
+            raise HTTPException(status_code=400, detail=f"{label} must be an .xlsx file")
+
+    upload_dir = _require_price_data_store().root / "upload-tmp" / uuid.uuid4().hex
+    france_path = upload_dir / "FrancePrice.xlsx"
+    sys_path = upload_dir / "SysPrice.xlsx"
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        france_size = _copy_upload_limited(france_file, france_path)
+        sys_size = _copy_upload_limited(sys_file, sys_path)
+        if france_size == 0 or sys_size == 0:
+            raise HTTPException(status_code=400, detail="price data files must not be empty")
+        assert _engine is not None
+        current, _version = _engine.snapshot()
+        candidate = _require_price_data_store().create_candidate(
+            france_path,
+            sys_path,
+            actor=actor or "api-admin",
+            current=current,
+        )
+        return {"ok": True, "candidate": candidate}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _price_data_http_error(exc) from exc
+    finally:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+@app.post(
+    "/api/admin/price-data/{version_id}/publish",
+    dependencies=[Depends(_require_price_data_admin_token)],
+)
+def price_data_publish_candidate(
+    version_id: str,
+    actor: Optional[str] = Header(default=None, alias="X-Price-Data-Actor"),
+) -> Dict[str, Any]:
+    try:
+        bundle, manifest = _require_price_data_store().publish(version_id, actor=actor or "api-admin")
+        assert _engine is not None
+        _engine.install_data(bundle, version=version_id)
+        return {"ok": True, "active_version_id": version_id, "version": manifest}
+    except Exception as exc:
+        raise _price_data_http_error(exc) from exc
+
+
+@app.post(
+    "/api/admin/price-data/{version_id}/rollback",
+    dependencies=[Depends(_require_price_data_admin_token)],
+)
+def price_data_rollback(
+    version_id: str,
+    actor: Optional[str] = Header(default=None, alias="X-Price-Data-Actor"),
+) -> Dict[str, Any]:
+    try:
+        bundle, manifest = _require_price_data_store().rollback(version_id, actor=actor or "api-admin")
+        assert _engine is not None
+        _engine.install_data(bundle, version=version_id)
+        return {"ok": True, "active_version_id": version_id, "version": manifest}
+    except Exception as exc:
+        raise _price_data_http_error(exc) from exc
+
+
+# =========================
 # Admin APIs
 # =========================
 
@@ -2377,7 +2647,7 @@ def admin_get_keyword_uplift() -> list[Dict[str, Any]]:
     return _sorted_keyword_uplift_rows()
 
 
-@app.put("/api/admin/keyword-uplift")
+@app.put("/api/admin/keyword-uplift", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_put_keyword_uplift(payload: Any = Body(...)) -> Dict[str, Any]:
     data = _normalize_keyword_uplift_payload(payload)
     pricing_engine_mod.KEYWORD_UPLIFT_RULES.clear()
@@ -2386,14 +2656,14 @@ def admin_put_keyword_uplift(payload: Any = Body(...)) -> Dict[str, Any]:
     return {"ok": True, "count": len(pricing_engine_mod.KEYWORD_UPLIFT_RULES)}
 
 
-@app.post("/api/admin/keyword-uplift/preview")
+@app.post("/api/admin/keyword-uplift/preview", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_preview_keyword_uplift(req: KeywordUpliftPreviewReq) -> Dict[str, Any]:
     keyword = (req.keyword or "").strip()
     pct = _normalize_number(req.pct, "pct")
     return _keyword_preview_all_sources(keyword, pct, bool(req.enabled))
 
 
-@app.put("/api/admin/uplift")
+@app.put("/api/admin/uplift", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_put_uplift(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = _normalize_uplift_payload(payload)
     pricing_engine_mod.UPLIFT_PCT_BY_LINE.clear()
@@ -2407,7 +2677,7 @@ def admin_get_ddp_rules() -> Dict[str, list[float]]:
     return _sorted_ddp_rules_dict()
 
 
-@app.put("/api/admin/ddp-rules")
+@app.put("/api/admin/ddp-rules", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_put_ddp_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = _normalize_ddp_rules_payload(payload)
     pricing_rules_mod.DDP_RULES.clear()
@@ -2421,7 +2691,7 @@ def admin_get_price_rules() -> Dict[str, Any]:
     return _sorted_price_rules_dict()
 
 
-@app.put("/api/admin/pricing-rules")
+@app.put("/api/admin/pricing-rules", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_put_price_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = _normalize_price_rules_payload(payload)
     pricing_rules_mod.PRICE_RULES.clear()
@@ -2430,7 +2700,7 @@ def admin_put_price_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "count_groups": len(pricing_rules_mod.PRICE_RULES)}
 
 
-@app.post("/api/admin/reload-rules")
+@app.post("/api/admin/reload-rules", dependencies=[Depends(_require_price_data_admin_token)])
 def admin_reload_rules() -> Dict[str, Any]:
     _apply_rule_overrides_if_exist()
     return {

@@ -1,6 +1,34 @@
+from pathlib import Path
+
 import pandas as pd
+import pytest
 
 from backend.engine.core.classifier import classify_category_and_price_group, detect_series
+
+
+@pytest.mark.parametrize("product_line", ["Matrix", "AVoIP", "Keyboard", "Decoder"])
+def test_sys_central_control_alias_maps_to_keyboard_decoder(product_line):
+    sys_row = pd.Series(
+        {
+            "First Product Line": product_line,
+            "Second Product Line": product_line,
+            "Catelog Name": product_line,
+            "Internal Model": "N70-04H12H",
+            "External Model": "N70-04H12H",
+        }
+    )
+    mapping_path = (
+        Path(__file__).resolve().parents[1]
+        / "mapping"
+        / "productline_map_sys_full.csv"
+    )
+    sys_map = pd.read_csv(mapping_path)
+
+    category, price_group = classify_category_and_price_group(
+        None, sys_row, pd.DataFrame(), sys_map
+    )
+
+    assert (category, price_group) == ("键盘/解码器", "键盘/解码器")
 
 
 def test_overseas_project_ptz_is_not_accessory():
