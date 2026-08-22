@@ -12,13 +12,17 @@ export async function apiGetJson(url) {
   return await r.json();
 }
 
-export async function apiPostJson(url, body) {
+export async function apiPostJson(url, body, extraHeaders) {
   const r = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
     body: JSON.stringify(body)
   });
-  if (!r.ok) throw new Error(`POST ${url} -> ${r.status} ${await readTextSafe(r)}`);
+  if (!r.ok) {
+    const err = new Error(`POST ${url} -> ${r.status} ${await readTextSafe(r)}`);
+    err.status = r.status;
+    throw err;
+  }
   return await r.json();
 }
 
