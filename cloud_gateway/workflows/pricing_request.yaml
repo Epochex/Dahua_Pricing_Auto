@@ -1,0 +1,105 @@
+main:
+  params: [args]
+  steps:
+    - validate_event:
+        switch:
+          - condition: '${not("message_id" in args)}'
+            next: invalid_event
+          - condition: '${not("row" in args)}'
+            next: invalid_event
+          - condition: '${len(args.row) != 14}'
+            next: invalid_event
+        next: prepare_task
+    - invalid_event:
+        raise: "A message_id and one 14-column A:N task row are required"
+    - prepare_task:
+        assign:
+          - spreadsheet_id: "1g96wjgMSGMhXrzLGwCAIQic_mYkS8xsThxJryfFHJ2A"
+          - sheet_name: "2026.07"
+          - row: '${args.row}'
+          - message_id: '${string(args.message_id)}'
+          - event_marker: '${"[HUACHAT:" + string(args.message_id) + "]"}'
+          - duplicate: false
+          - sheets_scope: "https://www.googleapis.com/auth/spreadsheets"
+    - validate_safety_boundary:
+        switch:
+          - condition: '${row[11] != "尚未开始"}'
+            next: unsafe_task
+          - condition: '${row[12] != "收集需求"}'
+            next: unsafe_task
+          - condition: '${len(text.find_all(string(row[13]), event_marker)) == 0}'
+            next: unsafe_task
+        next: scan_message_id
+    - unsafe_task:
+        raise: "Cloud-created tasks must start at collection and remain outside automatic submission"
+    - scan_message_id:
+        call: http.get
+        args:
+          url: 'https://sheets.googleapis.com/v4/spreadsheets/1g96wjgMSGMhXrzLGwCAIQic_mYkS8xsThxJryfFHJ2A/values/%272026.07%27%21N5%3AN1000'
+          query:
+            majorDimension: "COLUMNS"
+            valueRenderOption: "UNFORMATTED_VALUE"
+          auth:
+            type: OAuth2
+            scopes: '${sheets_scope}'
+        result: existing_notes_response
+    - prepare_duplicate_scan:
+        assign:
+          - existing_note_columns: '${default(map.get(existing_notes_response.body, "values"), [])}'
+    - inspect_existing_notes:
+        for:
+          value: note_column
+          in: '${existing_note_columns}'
+          steps:
+            - inspect_note_cells:
+                for:
+                  value: note_cell
+                  in: '${note_column}'
+                  steps:
+                    - detect_duplicate:
+                        switch:
+                          - condition: '${len(text.find_all(string(note_cell), event_marker)) > 0}'
+                            steps:
+                              - mark_duplicate:
+                                  assign:
+                                    - duplicate: true
+    - decide_idempotency:
+        switch:
+          - condition: '${duplicate}'
+            next: return_duplicate
+        next: append_task_row
+    - return_duplicate:
+        return:
+          accepted: false
+          duplicate: true
+          message_id: '${message_id}'
+          stage: "收集需求"
+          submission_authorized: false
+    - append_task_row:
+        call: http.post
+        args:
+          url: 'https://sheets.googleapis.com/v4/spreadsheets/1g96wjgMSGMhXrzLGwCAIQic_mYkS8xsThxJryfFHJ2A/values/%272026.07%27%21A%3AN:append'
+          query:
+            valueInputOption: "RAW"
+            insertDataOption: "INSERT_ROWS"
+            includeValuesInResponse: false
+          auth:
+            type: OAuth2
+            scopes: '${sheets_scope}'
+          body:
+            range: "'2026.07'!A:N"
+            majorDimension: "ROWS"
+            values:
+              - '${row}'
+        result: append_response
+    - mark_manual_review_boundary:
+        assign:
+          - updated_range: '${append_response.body.updates.updatedRange}'
+    - return_result:
+        return:
+          accepted: true
+          duplicate: false
+          message_id: '${message_id}'
+          stage: "收集需求"
+          updated_range: '${updated_range}'
+          submission_authorized: false

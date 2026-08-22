@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { apiGetJson, apiPostForm, apiPostJson, apiPutJson } from "./api.js";
 import { formatPricePiecewise, safeStr } from "./format.js";
+import DemoPipeline from "./DemoPipeline.jsx";
 
 /* =========================
  * Common UI helpers
@@ -2467,338 +2468,6 @@ function cleanPnLines(text) {
   return out;
 }
 
-function AgentConsole() {
-  const [cfg, setCfg] = useState(null);
-  const [state, setState] = useState(null);
-  const [workflows, setWorkflows] = useState([]);
-  const [pricingPns, setPricingPns] = useState("");
-  const [idempotencyKey, setIdempotencyKey] = useState("");
-  const [probeResult, setProbeResult] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState("");
-  const [info, setInfo] = useState("");
-
-  const loadAgent = async () => {
-    setErr("");
-    setLoading(true);
-    try {
-      const [c, s, w] = await Promise.all([
-        apiGetJson("/api/agent/config"),
-        apiGetJson("/api/agent/state"),
-        apiGetJson("/api/agent/pricing-workflows?limit=20"),
-      ]);
-      setCfg(c);
-      setState(s);
-      setWorkflows(w.tasks || []);
-    } catch (e) {
-      setErr(String(e.message || e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void loadAgent();
-  }, []);
-
-  const updateCfg = (patch) => {
-    setCfg((c) => ({ ...(c || {}), ...patch }));
-  };
-
-  const saveConfig = async () => {
-    if (!cfg) return;
-    setErr("");
-    setInfo("");
-    setSaving(true);
-    try {
-      const saved = await apiPutJson("/api/agent/config", {
-        enabled: Boolean(cfg.enabled),
-        mode: cfg.mode || "pricing_ops",
-        notification_keyword: cfg.notification_keyword || "定价Agent",
-        poller_enabled: Boolean(cfg.poller_enabled),
-        poll_interval_seconds: Number(cfg.poll_interval_seconds || 60),
-        sheet_source_type: cfg.sheet_source_type || "file",
-        sheet_source_path: cfg.sheet_source_path || "",
-        apply_black_markup: Boolean(cfg.apply_black_markup),
-        dry_run: Boolean(cfg.dry_run),
-        group_reply_enabled: Boolean(cfg.group_reply_enabled),
-        reply_to_mentions_only: Boolean(cfg.reply_to_mentions_only),
-        group_reply_allowed_sender_ids: cfg.group_reply_allowed_sender_ids || [],
-      });
-      setCfg(saved);
-      setInfo("AGENT CONFIG SAVED");
-      await loadAgent();
-    } catch (e) {
-      setErr(String(e.message || e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const probeSheet = async () => {
-    setErr("");
-    setInfo("");
-    try {
-      const r = await apiPostJson("/api/agent/sheet/probe", {
-        source_path: cfg?.sheet_source_path || null,
-      });
-      setProbeResult(r);
-      setInfo(JSON.stringify(r, null, 2));
-      await loadAgent();
-    } catch (e) {
-      setErr(String(e.message || e));
-    }
-  };
-
-  const runPollOnce = async () => {
-    setErr("");
-    setInfo("");
-    try {
-      const r = await apiPostJson("/api/agent/poller/run-once", {});
-      setProbeResult(r);
-      setInfo(JSON.stringify(r, null, 2));
-      await loadAgent();
-    } catch (e) {
-      setErr(String(e.message || e));
-    }
-  };
-
-  const createPricingWorkflow = async () => {
-    const pns = cleanPnLines(pricingPns);
-    if (!pns.length) {
-      setErr("Enter at least one PN.");
-      return;
-    }
-    const requestKey = idempotencyKey.trim() || `ui-${Date.now()}`;
-    setIdempotencyKey(requestKey);
-    setErr("");
-    setInfo("");
-    setSaving(true);
-    try {
-      const task = await apiPostJson("/api/agent/pricing-task", {
-        pns,
-        source: "agent-console",
-        notify: false,
-        apply_black_markup: Boolean(cfg?.apply_black_markup),
-        idempotency_key: requestKey,
-      });
-      setInfo(JSON.stringify(task, null, 2));
-      await loadAgent();
-    } catch (e) {
-      setErr(String(e.message || e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="stack">
-      <Card
-        title="AGENT OPS · HERMES-READY AUTOMATION"
-        right={
-          <div className="row wrap">
-            {cfg ? <Badge status={cfg.enabled ? "ok" : "disabled"} /> : null}
-            <button className="btn" onClick={loadAgent} disabled={loading}>
-              RELOAD
-            </button>
-            <button className="btn primary" onClick={saveConfig} disabled={!cfg || saving}>
-              SAVE CONFIG
-            </button>
-          </div>
-        }
-      >
-        {err ? <div className="small err">{err}</div> : null}
-        {info ? <pre className="codebox">{info}</pre> : null}
-        {!cfg ? <div className="small">/api/agent/config</div> : null}
-        {cfg ? (
-          <div className="stack">
-            <div className="agentGrid">
-              <label className="batchCheck">
-                <input
-                  type="checkbox"
-                  checked={Boolean(cfg.enabled)}
-                  onChange={(e) => updateCfg({ enabled: e.target.checked })}
-                />
-                ENABLED
-              </label>
-              <label className="batchCheck">
-                <input
-                  type="checkbox"
-                  checked={Boolean(cfg.apply_black_markup)}
-                  onChange={(e) => updateCfg({ apply_black_markup: e.target.checked })}
-                />
-                VARIANT MARKUP
-              </label>
-              <label className="batchCheck">
-                <input
-                  type="checkbox"
-                  checked={Boolean(cfg.group_reply_enabled)}
-                  onChange={(e) => updateCfg({ group_reply_enabled: e.target.checked })}
-                />
-                STREAM REPLY
-              </label>
-              <label className="batchCheck">
-                <input
-                  type="checkbox"
-                  checked={Boolean(cfg.reply_to_mentions_only)}
-                  onChange={(e) => updateCfg({ reply_to_mentions_only: e.target.checked })}
-                />
-                @ ONLY
-              </label>
-              <label className="batchCheck">
-                <input
-                  type="checkbox"
-                  checked={Boolean(cfg.poller_enabled)}
-                  onChange={(e) => updateCfg({ poller_enabled: e.target.checked })}
-                />
-                FILE POLLER
-              </label>
-            </div>
-
-            <div className="agentGrid two">
-              <div>
-                <div className="sectionTitle">KEYWORD</div>
-                <input
-                  className="input"
-                  value={cfg.notification_keyword || ""}
-                  onChange={(e) => updateCfg({ notification_keyword: e.target.value })}
-                />
-              </div>
-              <div>
-                <div className="sectionTitle">POLL INTERVAL SECONDS</div>
-                <input
-                  className="input mono"
-                  type="number"
-                  min="10"
-                  max="3600"
-                  value={cfg.poll_interval_seconds || 60}
-                  onChange={(e) => updateCfg({ poll_interval_seconds: e.target.value })}
-                />
-              </div>
-              <div>
-                <div className="sectionTitle">ALLOWED STREAM SENDERS</div>
-                <input
-                  className="input mono"
-                  value={(cfg.group_reply_allowed_sender_ids || []).join(",")}
-                  placeholder="senderStaffId list, optional"
-                  onChange={(e) =>
-                    updateCfg({
-                      group_reply_allowed_sender_ids: e.target.value
-                        .split(",")
-                        .map((x) => x.trim())
-                        .filter(Boolean),
-                    })
-                  }
-                />
-              </div>
-            </div>
-
-            <div>
-              <div className="sectionTitle">SHEET SOURCE PATH</div>
-              <input
-                className="input mono"
-                value={cfg.sheet_source_path || ""}
-                placeholder="/data/dahua_pricing_runtime/agent/inbox/inquiry.xlsx"
-                onChange={(e) => updateCfg({ sheet_source_path: e.target.value })}
-              />
-            </div>
-
-            <details>
-              <summary>CONFIG / STATE</summary>
-              <div className="agentSplit">
-                <KV obj={cfg} />
-                <KV obj={state} />
-              </div>
-            </details>
-          </div>
-        ) : null}
-      </Card>
-
-      <Card
-        title="PRICING WORKFLOW · DURABLE STATE MACHINE"
-        right={
-          <button className="btn primary" onClick={createPricingWorkflow} disabled={saving}>
-            CREATE TASK
-          </button>
-        }
-      >
-        <div className="small">
-          Pricing and validation run on Linux. GSP submission is a separately leased Windows action;
-          submission remains unavailable while the Windows write switch is off.
-        </div>
-        <Hr />
-        <div className="agentGrid two">
-          <div>
-            <div className="sectionTitle">PN LIST</div>
-            <textarea
-              className="textarea mono"
-              rows="6"
-              value={pricingPns}
-              placeholder={"1.0.01...\n1.0.02..."}
-              onChange={(e) => setPricingPns(e.target.value)}
-            />
-          </div>
-          <div>
-            <div className="sectionTitle">IDEMPOTENCY KEY</div>
-            <input
-              className="input mono"
-              value={idempotencyKey}
-              placeholder="Same key = same task; blank generates one"
-              onChange={(e) => setIdempotencyKey(e.target.value)}
-            />
-            <div className="small" style={{ marginTop: 10 }}>
-              submitting timeout → verifying → found / confirmed absent / manual review
-            </div>
-          </div>
-        </div>
-        <Hr />
-        {workflows.length ? (
-          <div className="stack">
-            {workflows.map((task) => (
-              <div className="resultItem" key={task.task_id}>
-                <div className="row wrap">
-                  <Badge status={task.state} />
-                  <span className="mono">{task.task_id}</span>
-                  <span className="small">v{task.version}</span>
-                  {task.submission?.pla_no ? <span className="pill">{task.submission.pla_no}</span> : null}
-                </div>
-                <div className="small mono">
-                  effect={task.effect_key} · submit attempts={task.submission?.attempts || 0} · verify
-                  attempts={task.verification?.attempts || 0}
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="small">No pricing workflows yet.</div>
-        )}
-      </Card>
-
-      <Card
-        title="SHEET PULL TEST"
-        right={
-          <div className="row wrap">
-            <button className="btn" onClick={runPollOnce}>
-              RUN POLLER ONCE
-            </button>
-            <button className="btn primary" onClick={probeSheet}>
-              PROBE SHEET
-            </button>
-          </div>
-        }
-      >
-        <div className="small">
-          This card only probes the configured online/local sheet. Pricing workflows are created in the
-          dedicated state-machine card above.
-        </div>
-        <Hr />
-        {probeResult ? <pre className="codebox">{JSON.stringify(probeResult, null, 2)}</pre> : null}
-      </Card>
-    </div>
-  );
-}
-
 /* =========================
  * Meta
  * ========================= */
@@ -2888,16 +2557,16 @@ export default function App() {
             KEYWORD
           </button>
           <button
-            className={`tab ${tab === "agent" ? "active" : ""}`}
-            onClick={() => setTab("agent")}
-          >
-            AGENT
-          </button>
-          <button
             className={`tab ${tab === "meta" ? "active" : ""}`}
             onClick={() => setTab("meta")}
           >
             META
+          </button>
+          <button
+            className={`tab ${tab === "demo" ? "active" : ""}`}
+            onClick={() => setTab("demo")}
+          >
+            端到端演示
           </button>
         </div>
       </div>
@@ -2908,8 +2577,8 @@ export default function App() {
         {tab === "batch" ? <BatchExport /> : null}
         {tab === "rules" ? <AdminConsole /> : null}
         {tab === "keyword" ? <KeywordAdjustConsole /> : null}
-        {tab === "agent" ? <AgentConsole /> : null}
         {tab === "meta" ? <MetaPanel meta={meta} metaErr={metaErr} /> : null}
+        {tab === "demo" ? <DemoPipeline /> : null}
       </div>
     </div>
   );

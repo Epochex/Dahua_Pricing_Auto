@@ -1,0 +1,182 @@
+{
+  "run_id": "fixture-blocked-placeholder",
+  "scenario": "blocked",
+  "message_id": "PLACEHOLDER-message-id",
+  "started_at": 1000000000.0,
+  "ended_at": 1000000003.333,
+  "total_ms": 3333,
+  "final_state": "blocked",
+  "source": "fixture",
+  "placeholder": true,
+  "label": "占位快照 · 契约拦截（数字为占位符）",
+  "environment": {
+    "project_id": "gen-lang-client-0394580582",
+    "region": "europe-west1",
+    "workflow_name": "pricing-request-sandbox",
+    "spreadsheet_id": "PLACEHOLDER-spreadsheet-id",
+    "sheet_name": "2026.07",
+    "data_version": "v-PLACEHOLDER",
+    "cloud_run_url": "https://pricing-huachat-ingress-339841524852.europe-west1.run.app"
+  },
+  "steps": [
+    {
+      "key": "message",
+      "index": 1,
+      "title": "消息构造与字段解析",
+      "subtitle": "脱敏消息 · 14 列任务行",
+      "layer": "local",
+      "state": "ok",
+      "started_at": 1000000000.0,
+      "ended_at": 1000000001.111,
+      "duration_ms": 1111,
+      "facts": [
+        {
+          "label": "消息 ID",
+          "value": "PLACEHOLDER-message-id"
+        },
+        {
+          "label": "解析结果",
+          "value": "不满足契约（pn_missing）"
+        },
+        {
+          "label": "PN 列表",
+          "value": "（缺失）"
+        },
+        {
+          "label": "客户",
+          "value": "PLACEHOLDER-customer"
+        },
+        {
+          "label": "价格应用层级",
+          "value": "PLACEHOLDER-tier"
+        },
+        {
+          "label": "产品线",
+          "value": "PLACEHOLDER-product-line"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜按场景故意构造的不合契约消息（缺 PN 行），原样发往入口以展示真实拦截"
+    },
+    {
+      "key": "ingress",
+      "index": 2,
+      "title": "Cloud Run 入口",
+      "subtitle": "鉴权 · 契约校验 · 派发",
+      "layer": "cloud",
+      "state": "blocked",
+      "started_at": 1000000001.111,
+      "ended_at": 1000000003.333,
+      "duration_ms": 2222,
+      "facts": [
+        {
+          "label": "服务",
+          "value": "pricing-huachat-ingress"
+        },
+        {
+          "label": "区域",
+          "value": "europe-west1"
+        },
+        {
+          "label": "HTTP 状态",
+          "value": "422"
+        },
+        {
+          "label": "拦截原因",
+          "value": "pn_missing"
+        },
+        {
+          "label": "说明",
+          "value": "use an explicit 'PN:' line with at least one part number"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口在写入任何外部系统之前拒绝了这条消息，未触达 Workflows 与工作簿"
+    },
+    {
+      "key": "workflow",
+      "index": 3,
+      "title": "Google Workflows 编排",
+      "subtitle": "执行状态 · 去重判定",
+      "layer": "cloud",
+      "state": "skipped",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000003.333,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口拦截，未触达外部系统"
+    },
+    {
+      "key": "sheet",
+      "index": 4,
+      "title": "Google Sheets 任务行",
+      "subtitle": "updatedRange · 写入内容",
+      "layer": "cloud",
+      "state": "skipped",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000003.333,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口拦截，未触达外部系统"
+    },
+    {
+      "key": "ingest",
+      "index": 5,
+      "title": "内网摄取与任务建立",
+      "subtitle": "任务 id · 幂等键 · 状态机",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000003.333,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口拦截，未触达外部系统"
+    },
+    {
+      "key": "pricing",
+      "index": 6,
+      "title": "确定性算价",
+      "subtitle": "匹配路径 · 价格层级 · 版本",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000003.333,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口拦截，未触达外部系统"
+    },
+    {
+      "key": "artifact",
+      "index": 7,
+      "title": "GSP 模板制品 + 人工复核边界",
+      "subtitle": "xlsx 制品 · 未授权提交",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000003.333,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜入口拦截，未触达外部系统"
+    }
+  ],
+  "artifact": null
+}

@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.app.agent_ops import (
@@ -42,6 +42,13 @@ from backend.app.pricing_workflow import (
     WorkflowError,
     WorkflowNotFound,
     WorkflowValidationError,
+)
+from backend.app.demo_pipeline import (
+    DemoPipeline,
+    DemoPipelineError,
+    DemoRunBusy,
+    DemoRunNotFound,
+    DemoRunReq,
 )
 from backend.app.sheet_workflow_ingest import SheetWorkflowIngestCoordinator
 from backend.app.evolution.control_plane import EvolutionControlPlane
@@ -1116,6 +1123,7 @@ _agent: Optional[AgentAutomation] = None
 _pricing_workflows: Optional[PricingWorkflowStore] = None
 _sheet_workflow_ingest: Optional[SheetWorkflowIngestCoordinator] = None
 _evolution: Optional[EvolutionControlPlane] = None
+_demo_pipeline: Optional[DemoPipeline] = None
 
 
 @app.on_event("startup")
@@ -1143,6 +1151,7 @@ def _startup() -> None:
         execution_enabled=os.getenv("DAHUA_EVOLUTION_EXECUTION_ENABLED", "false").lower() == "true",
     )
     _evolution.ensure_baseline()
+    # 演示管线按需初始化：它只服务 /api/demo/*，不应该让定价服务的启动依赖它。
 
 
 def _require_agent() -> AgentAutomation:
@@ -1173,6 +1182,29 @@ def _require_evolution() -> EvolutionControlPlane:
         _evolution = EvolutionControlPlane(RUNTIME_DIR, execution_enabled=False)
         _evolution.ensure_baseline()
     return _evolution
+
+
+def _require_demo_pipeline() -> DemoPipeline:
+    global _demo_pipeline
+    if _demo_pipeline is None:
+        _demo_pipeline = DemoPipeline(
+            RUNTIME_DIR,
+            # 用 lambda 而不是直接传函数对象，保证测试里替换模块级函数后依然生效。
+            compute_rows=lambda pns, apply_black_markup: _agent_compute_rows(pns, apply_black_markup),
+            workflow_store=_require_pricing_workflows,
+            engine_meta=lambda: _engine.meta() if _engine is not None else {"loaded": False},
+            execution_context=lambda session_id=None: _workflow_execution_context(session_id),
+        )
+        _demo_pipeline.ensure_dirs()
+    return _demo_pipeline
+
+
+def _demo_http_error(exc: DemoPipelineError) -> HTTPException:
+    if isinstance(exc, DemoRunNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, DemoRunBusy):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
 
 
 def _workflow_execution_context(session_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1905,6 +1937,58 @@ def evolution_rollback(release_id: str, req: EvolutionRollbackReq) -> Dict[str, 
         )
     except Exception as exc:
         raise _evolution_http_error(exc) from exc
+
+
+@app.get("/api/demo/config")
+def demo_config() -> Dict[str, Any]:
+    return _require_demo_pipeline().config()
+
+
+@app.post("/api/demo/run")
+def demo_run(req: DemoRunReq) -> Dict[str, Any]:
+    try:
+        return _require_demo_pipeline().start_run(req)
+    except DemoPipelineError as exc:
+        raise _demo_http_error(exc) from exc
+
+
+@app.get("/api/demo/runs")
+def demo_runs(limit: int = 50) -> Dict[str, Any]:
+    return _require_demo_pipeline().list_runs(limit=limit)
+
+
+@app.get("/api/demo/runs/{run_id}")
+def demo_run_snapshot(run_id: str) -> Dict[str, Any]:
+    try:
+        return _require_demo_pipeline().snapshot(run_id)
+    except DemoPipelineError as exc:
+        raise _demo_http_error(exc) from exc
+
+
+@app.get("/api/demo/runs/{run_id}/stream")
+def demo_run_stream(run_id: str) -> StreamingResponse:
+    try:
+        events = _require_demo_pipeline().stream(run_id)
+    except DemoPipelineError as exc:
+        raise _demo_http_error(exc) from exc
+    return StreamingResponse(
+        events,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/demo/runs/{run_id}/artifact")
+def demo_run_artifact(run_id: str) -> FileResponse:
+    try:
+        path, filename = _require_demo_pipeline().artifact(run_id)
+    except DemoPipelineError as exc:
+        raise _demo_http_error(exc) from exc
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.post("/api/query")

@@ -1,0 +1,245 @@
+{
+  "run_id": "fixture-duplicate-placeholder",
+  "scenario": "duplicate",
+  "message_id": "PLACEHOLDER-message-id",
+  "started_at": 1000000000.0,
+  "ended_at": 1000000007.11,
+  "total_ms": 7110,
+  "final_state": "duplicate",
+  "source": "fixture",
+  "placeholder": true,
+  "label": "占位快照 · 去重拦截（数字为占位符）",
+  "environment": {
+    "project_id": "gen-lang-client-0394580582",
+    "region": "europe-west1",
+    "workflow_name": "pricing-request-sandbox",
+    "spreadsheet_id": "PLACEHOLDER-spreadsheet-id",
+    "sheet_name": "2026.07",
+    "data_version": "v-PLACEHOLDER",
+    "cloud_run_url": "https://pricing-huachat-ingress-339841524852.europe-west1.run.app"
+  },
+  "steps": [
+    {
+      "key": "message",
+      "index": 1,
+      "title": "消息构造与字段解析",
+      "subtitle": "脱敏消息 · 14 列任务行",
+      "layer": "local",
+      "state": "ok",
+      "started_at": 1000000000.0,
+      "ended_at": 1000000001.111,
+      "duration_ms": 1111,
+      "facts": [
+        {
+          "label": "消息 ID",
+          "value": "PLACEHOLDER-message-id"
+        },
+        {
+          "label": "发起人",
+          "value": "PLACEHOLDER-requester"
+        },
+        {
+          "label": "PN 列表",
+          "value": "PLACEHOLDER-PN-1, PLACEHOLDER-PN-2"
+        },
+        {
+          "label": "PN 数",
+          "value": "1111"
+        },
+        {
+          "label": "客户",
+          "value": "PLACEHOLDER-customer"
+        },
+        {
+          "label": "价格应用层级",
+          "value": "PLACEHOLDER-tier"
+        },
+        {
+          "label": "产品线",
+          "value": "PLACEHOLDER-product-line"
+        },
+        {
+          "label": "任务行",
+          "value": "14 列（A:N）"
+        },
+        {
+          "label": "初始状态列",
+          "value": "尚未开始 / 收集需求"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜复用上一次成功的 message_id"
+    },
+    {
+      "key": "ingress",
+      "index": 2,
+      "title": "Cloud Run 入口",
+      "subtitle": "鉴权 · 契约校验 · 派发",
+      "layer": "cloud",
+      "state": "ok",
+      "started_at": 1000000001.111,
+      "ended_at": 1000000003.333,
+      "duration_ms": 2222,
+      "facts": [
+        {
+          "label": "服务",
+          "value": "pricing-huachat-ingress"
+        },
+        {
+          "label": "区域",
+          "value": "europe-west1"
+        },
+        {
+          "label": "HTTP 状态",
+          "value": "200"
+        },
+        {
+          "label": "消息 ID",
+          "value": "PLACEHOLDER-message-id"
+        },
+        {
+          "label": "派发方式",
+          "value": "Google Workflows"
+        },
+        {
+          "label": "执行名",
+          "value": "projects/PLACEHOLDER/locations/europe-west1/workflows/pricing-request-sandbox/executions/PLACEHOLDER-execution-id"
+        },
+        {
+          "label": "执行初始状态",
+          "value": "ACTIVE"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值"
+    },
+    {
+      "key": "workflow",
+      "index": 3,
+      "title": "Google Workflows 编排",
+      "subtitle": "执行状态 · 去重判定",
+      "layer": "cloud",
+      "state": "duplicate",
+      "started_at": 1000000003.333,
+      "ended_at": 1000000006.666,
+      "duration_ms": 3333,
+      "facts": [
+        {
+          "label": "工作流",
+          "value": "pricing-request-sandbox"
+        },
+        {
+          "label": "执行 ID",
+          "value": "PLACEHOLDER-execution-id"
+        },
+        {
+          "label": "执行状态",
+          "value": "SUCCEEDED"
+        },
+        {
+          "label": "去重判定",
+          "value": "命中（message_id 已存在）"
+        },
+        {
+          "label": "阶段",
+          "value": "收集需求"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [
+        {
+          "label": "GCP 控制台执行详情",
+          "url": "https://console.cloud.google.com/workflows/workflow/europe-west1/pricing-request-sandbox/execution/PLACEHOLDER-execution-id?project=gen-lang-client-0394580582"
+        }
+      ],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜编排扫描到相同 [HUACHAT:message_id] 标记后直接返回，未再写表"
+    },
+    {
+      "key": "sheet",
+      "index": 4,
+      "title": "Google Sheets 任务行",
+      "subtitle": "updatedRange · 写入内容",
+      "layer": "cloud",
+      "state": "duplicate",
+      "started_at": 1000000006.666,
+      "ended_at": 1000000007.11,
+      "duration_ms": 444,
+      "facts": [
+        {
+          "label": "目标工作簿",
+          "value": "PLACEHOLDER-spreadsheet-id"
+        },
+        {
+          "label": "标签页",
+          "value": "2026.07"
+        },
+        {
+          "label": "去重判定",
+          "value": "命中"
+        },
+        {
+          "label": "写入行数",
+          "value": "0"
+        }
+      ],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜相同 message_id 已存在，工作簿未追加第二行"
+    },
+    {
+      "key": "ingest",
+      "index": 5,
+      "title": "内网摄取与任务建立",
+      "subtitle": "任务 id · 幂等键 · 状态机",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000007.11,
+      "ended_at": 1000000007.11,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜去重命中，链路提前收束，未建立第二个任务"
+    },
+    {
+      "key": "pricing",
+      "index": 6,
+      "title": "确定性算价",
+      "subtitle": "匹配路径 · 价格层级 · 版本",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000007.11,
+      "ended_at": 1000000007.11,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜去重命中，链路提前收束，未建立第二个任务"
+    },
+    {
+      "key": "artifact",
+      "index": 7,
+      "title": "GSP 模板制品 + 人工复核边界",
+      "subtitle": "xlsx 制品 · 未授权提交",
+      "layer": "local",
+      "state": "skipped",
+      "started_at": 1000000007.11,
+      "ended_at": 1000000007.11,
+      "duration_ms": 0,
+      "facts": [],
+      "request": null,
+      "response": null,
+      "links": [],
+      "note": "占位快照：本条为断网保底用的结构占位，数字与标识符均为占位符，非真实测量值｜去重命中，链路提前收束，未建立第二个任务"
+    }
+  ],
+  "artifact": null
+}
