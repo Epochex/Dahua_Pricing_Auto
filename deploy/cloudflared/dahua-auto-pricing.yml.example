@@ -1,0 +1,19 @@
+# Copy to /etc/cloudflared/dahua-auto-pricing.yml, replace every placeholder,
+# and keep the real credentials JSON outside this repository.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+# TCP 7844 is normally easier to approve on a corporate network.  QUIC uses
+# UDP 7844 and can be selected after UDP egress has also been approved.
+protocol: http2
+
+loglevel: info
+no-autoupdate: true
+
+ingress:
+  - hostname: <PRICING-HOSTNAME>
+    service: http://127.0.0.1:18083
+    originRequest:
+      connectTimeout: 10s
+      httpHostHeader: <PRICING-HOSTNAME>
+  - service: http_status:404

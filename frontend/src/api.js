@@ -6,38 +6,72 @@ async function readTextSafe(r) {
   }
 }
 
+export const ADMIN_TOKEN_SESSION_KEY = "dahua_price_data_admin_token";
+
+function adminWriteHeaders(url) {
+  if (!String(url || "").startsWith("/api/admin")) return {};
+  try {
+    const token = window.sessionStorage.getItem(ADMIN_TOKEN_SESSION_KEY) || "";
+    return token ? { "X-Price-Data-Admin-Token": token } : {};
+  } catch {
+    return {};
+  }
+}
+
+async function throwRequestError(method, url, response) {
+  const detail = await readTextSafe(response);
+  const authHint =
+    String(url || "").startsWith("/api/admin") && (response.status === 401 || response.status === 403)
+      ? "。请先到“价格数据源”页面输入有效的管理员令牌"
+      : "";
+  const error = new Error(`${method} ${url} -> ${response.status} ${detail}${authHint}`);
+  error.status = response.status;
+  throw error;
+}
+
 export async function apiGetJson(url) {
   const r = await fetch(url, { method: "GET" });
-  if (!r.ok) throw new Error(`GET ${url} -> ${r.status} ${await readTextSafe(r)}`);
+  if (!r.ok) await throwRequestError("GET", url, r);
   return await r.json();
 }
 
-export async function apiPostJson(url, body, extraHeaders) {
+export async function apiPostJson(url, body, options = {}) {
   const r = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...adminWriteHeaders(url),
+      ...(options.headers || {}),
+    },
     body: JSON.stringify(body)
   });
-  if (!r.ok) {
-    const err = new Error(`POST ${url} -> ${r.status} ${await readTextSafe(r)}`);
-    err.status = r.status;
-    throw err;
-  }
+  if (!r.ok) await throwRequestError("POST", url, r);
   return await r.json();
 }
 
-export async function apiPutJson(url, body) {
+export async function apiPutJson(url, body, options = {}) {
   const r = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...adminWriteHeaders(url),
+      ...(options.headers || {}),
+    },
     body: JSON.stringify(body)
   });
-  if (!r.ok) throw new Error(`PUT ${url} -> ${r.status} ${await readTextSafe(r)}`);
+  if (!r.ok) await throwRequestError("PUT", url, r);
   return await r.json().catch(() => ({}));
 }
 
-export async function apiPostForm(url, formData) {
-  const r = await fetch(url, { method: "POST", body: formData });
-  if (!r.ok) throw new Error(`POST ${url} -> ${r.status} ${await readTextSafe(r)}`);
+export async function apiPostForm(url, formData, options = {}) {
+  const r = await fetch(url, {
+    method: "POST",
+    ...options,
+    headers: { ...adminWriteHeaders(url), ...(options.headers || {}) },
+    body: formData,
+  });
+  if (!r.ok) await throwRequestError("POST", url, r);
   return await r.json();
 }

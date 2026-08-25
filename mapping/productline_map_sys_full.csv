@@ -3,6 +3,10 @@
 6,Internal Model,contains,EVS,,,,EVS,EVS,auto-learn seed: Internal Model contains EVS
 7,Internal Model,contains,XVR,,,,XVR,XVR,auto-learn seed: Internal Model contains XVR
 8,Internal Model,contains,MNVR,,,,车载后端,车载,auto-learn seed: Internal Model contains MNVR
+9,First Product Line,equals,Matrix,,,,键盘/解码器,键盘/解码器,manual central-control alias: Matrix -> 键盘/解码器
+9,First Product Line,equals,AVoIP,,,,键盘/解码器,键盘/解码器,manual central-control alias: AVoIP -> 键盘/解码器
+9,First Product Line,equals,Keyboard,,,,键盘/解码器,键盘/解码器,manual central-control alias: Keyboard -> 键盘/解码器
+9,First Product Line,equals,Decoder,,,,键盘/解码器,键盘/解码器,manual central-control alias: Decoder -> 键盘/解码器
 9,First Product Line,equals,Dahua Auto,Second Product Line,equals,Auto Terminal,车载后端,车载,auto-learn seed: Dahua Auto / Auto Terminal
 10,First Product Line,equals,HDCVI,Second Product Line,equals,HDCVI Camera,HAC,HAC,"auto-learn dominant first+second (6207, purity=1.000)"
 11,First Product Line,equals,IPC,Second Product Line,equals,IP Camera for Distributors,IPC,IPC,"auto-learn dominant first+second (3404, purity=1.000)"

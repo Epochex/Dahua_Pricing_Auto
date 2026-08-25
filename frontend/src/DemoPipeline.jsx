@@ -2200,7 +2200,7 @@ export default function DemoPipeline() {
         tier: tier.trim(),
         reuse_message_id: reuseMessageId.trim() ? reuseMessageId.trim() : null
       };
-      const resp = await apiPostJson("/api/demo/run", body, demoKeyHeaders());
+      const resp = await apiPostJson("/api/demo/run", body, { headers: demoKeyHeaders() });
       const runId = safeStr(resp?.run_id || "");
       if (!runId) throw new Error("后端未返回 run_id");
       setRun(normalizeRun(resp, { run_id: runId, scenario }));

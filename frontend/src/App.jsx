@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { apiGetJson, apiPostForm, apiPostJson, apiPutJson } from "./api.js";
+import {
+  ADMIN_TOKEN_SESSION_KEY,
+  apiGetJson,
+  apiPostForm,
+  apiPostJson,
+  apiPutJson,
+} from "./api.js";
 import { formatPricePiecewise, safeStr } from "./format.js";
 import DemoPipeline from "./DemoPipeline.jsx";
 
@@ -10,9 +16,9 @@ import DemoPipeline from "./DemoPipeline.jsx";
 function Badge({ status }) {
   const s = (status || "").toLowerCase();
   const cls =
-    s === "done" || s === "ok"
+    s === "done" || s === "ok" || s === "active" || s === "published" || s === "valid"
       ? "ok"
-      : s === "running" || s === "queued"
+      : s === "running" || s === "queued" || s === "staged" || s === "candidate" || s === "history"
       ? "run"
       : "fail";
   return <span className={`badge ${cls}`}>{status || "unknown"}</span>;
@@ -78,8 +84,11 @@ function getPriceSourceLabel(field, resp) {
 
   if (!hasValue) return "";
 
+  if (Object.prototype.hasOwnProperty.call(meta?.manual_final_values || {}, field)) return "Manual";
   if (atcVariant?.applied && PRICE_KEYS.includes(field)) return "ATC+Sys";
-  if (blackVariant?.applied && PRICE_KEYS.includes(field)) return "Black+2";
+  if (blackVariant?.applied && PRICE_KEYS.includes(field)) {
+    return `Black+${safeStr(formatPricePiecewise(blackVariant?.markup_eur))}`;
+  }
   if (safeStr(meta?.manual_price_field) === field) return "Manual";
   if (meta?.manual_override_field === "fob" && field === "FOB C(EUR)") return "Manual";
 
@@ -154,6 +163,13 @@ function attachManualPriceOverride(payload, meta) {
   }
 }
 
+function attachManualFinalValues(payload, meta) {
+  const values = meta?.manual_final_values;
+  if (values && typeof values === "object" && Object.keys(values).length > 0) {
+    payload.manual_final_values = { ...values };
+  }
+}
+
 function formatMatchMode(mode, matchedPn) {
   const m = String(mode || "").toLowerCase();
   const hit = safeStr(matchedPn);
@@ -165,6 +181,14 @@ function formatMatchMode(mode, matchedPn) {
   }
   if (m === "none") return "未匹配";
   return safeStr(mode);
+}
+
+function formatRuleAdjustPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || Math.abs(n) < 1e-12) return "";
+  const pct = n * 100;
+  const text = Number.isInteger(pct) ? String(pct) : String(Number(pct.toFixed(4)));
+  return `${pct > 0 ? "+" : ""}${text}%`;
 }
 
 function parseFilenameFromContentDisposition(value) {
@@ -199,7 +223,7 @@ function formatMetaTime(iso, epoch) {
   return `${d.getFullYear()}.${p2(d.getMonth() + 1)}.${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
 }
 
-function QueryPriceTable({ resp }) {
+function QueryPriceTable({ resp, editing = false, drafts = {}, onDraftChange }) {
   const fv = resp?.final_values || {};
   const calculated = new Set(resp?.calculated_fields || []);
   const meta = resp?.meta || {};
@@ -241,12 +265,29 @@ function QueryPriceTable({ resp }) {
             <tr key={k}>
               <td className="mono">{k}</td>
               <td className="priceCell">
-                <span className="priceVal">{display}</span>
-                {source ? (
-                  <span className={`inlineTag ${calculated.has(k) ? "calc" : "orig"}`}>
-                    {source}
-                  </span>
-                ) : null}
+                {editing ? (
+                  <input
+                    className="input mono cellInput manualPriceInput"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={drafts[k] ?? ""}
+                    onChange={(e) => onDraftChange?.(k, e.target.value)}
+                    placeholder={raw === null || raw === undefined || raw === "" ? "输入价格" : safeStr(raw)}
+                    aria-label={`手动修改 ${k}`}
+                  />
+                ) : (
+                  <>
+                    <span className="priceVal">{display}</span>
+                    {source ? (
+                      <span
+                        className={`inlineTag ${source === "Manual" ? "manual" : calculated.has(k) ? "calc" : "orig"}`}
+                      >
+                        {source}
+                      </span>
+                    ) : null}
+                  </>
+                )}
               </td>
               <td className="mono">{safeStr(raw)}</td>
             </tr>
@@ -311,20 +352,41 @@ function QueryDiagnosticBlock({ resp }) {
   const statusOk = String(resp?.status || "").toLowerCase() === "ok";
   const manualOverride = Boolean(meta?.manual_override);
   const manualPrice = getManualPriceMeta(meta);
+  const manualFinalFields = Array.isArray(meta?.manual_final_fields) ? meta.manual_final_fields : [];
   const frMatchText = formatMatchMode(meta.fr_match_mode, meta.fr_matched_pn);
   const sysMatchText = formatMatchMode(meta.sys_match_mode, meta.sys_matched_pn);
 
   const calcStatusText = statusOk
     ? `自动化计算成功（产品线：${safeStr(meta.category)} / 子线：${safeStr(
         meta.series_key
-      )} | 系列：${safeStr(meta.series_display)} | 定价公式：${safeStr(meta.pricing_rule_name)}）`
+      )} | 系列：${safeStr(meta.series_display)}）`
     : safeStr(resp?.status);
 
-  const calcLevelText = `${safeStr(meta.sys_sales_type)}（Sys 基准字段：${safeStr(
-    meta.sys_basis_field
-  )} | Sys adjust key：${safeStr(meta.sys_uplift_key)} | 关键词叠加：${safeStr(
-    meta.sys_keyword_uplift_hits
-  )} (+${safeStr(meta.sys_keyword_uplift_pct)}) | 定价公式：${safeStr(meta.pricing_rule_name)}）`;
+  const adjustmentNotices = [];
+  const sysAdjustPct = formatRuleAdjustPct(meta.sys_uplift_pct);
+  const keywordAdjustPct = formatRuleAdjustPct(meta.sys_keyword_uplift_pct);
+  const fobAdjustPct = formatRuleAdjustPct(meta.fob_euro_adjust_pct);
+  const ddpAdjustPct = formatRuleAdjustPct(meta.ddp_adjust_pct);
+  if (sysAdjustPct) {
+    const key = safeStr(meta.sys_uplift_key);
+    adjustmentNotices.push(`Sys Adjust${key ? ` [${key}]` : ""}：${sysAdjustPct}`);
+  }
+  if (keywordAdjustPct) {
+    const hits = Array.isArray(meta.sys_keyword_uplift_hits)
+      ? meta.sys_keyword_uplift_hits.join(", ")
+      : safeStr(meta.sys_keyword_uplift_hits);
+    adjustmentNotices.push(`关键词叠加${hits ? ` [${hits}]` : ""}：${keywordAdjustPct}`);
+  }
+  if (fobAdjustPct) {
+    adjustmentNotices.push(`FOB Euro Adjust [${safeStr(meta.category)}]：${fobAdjustPct}`);
+  }
+  if (ddpAdjustPct) {
+    adjustmentNotices.push(`DDP Adjust [${safeStr(meta.category)}]：${ddpAdjustPct}`);
+  }
+  const calcLevelBase = safeStr(meta.sys_sales_type);
+  const calcLevelText = adjustmentNotices.length
+    ? `${calcLevelBase}（额外 Adjust：${adjustmentNotices.join(" | ")}）`
+    : calcLevelBase;
 
   return (
     <div className="diagBlock">
@@ -377,14 +439,21 @@ function QueryDiagnosticBlock({ resp }) {
         <div className="diagTextValue">
           {manualOverride ? (
             <>
-              <span className="bigPill monoInline">
-                MANUAL OVERRIDE · category={safeStr(meta?.forced_category)} · price_group={safeStr(
-                  meta?.forced_price_group
-                )} · series_key={safeStr(meta?.forced_series_key)}
-              </span>
+              {meta?.forced_category || meta?.forced_price_group || meta?.forced_series_key ? (
+                <span className="bigPill monoInline">
+                  MANUAL OVERRIDE · category={safeStr(meta?.forced_category)} · price_group={safeStr(
+                    meta?.forced_price_group
+                  )} · series_key={safeStr(meta?.forced_series_key)}
+                </span>
+              ) : null}
               {manualPrice.field ? (
                 <span className="bigPill monoInline">
                   manual {manualPrice.field}={safeStr(formatPricePiecewise(manualPrice.value))}
+                </span>
+              ) : null}
+              {manualFinalFields.length > 0 ? (
+                <span className="bigPill monoInline">
+                  direct final: {manualFinalFields.join(", ")}
                 </span>
               ) : null}
             </>
@@ -408,7 +477,9 @@ function ExternalModelClusterBlock({ cluster, loading, onExportAll, exporting })
           {loading
             ? "loading..."
             : `external_model=${safeStr(cluster?.external_model)} · rows=${safeStr(cluster?.count)} · anchor=${
-                cluster?.anchor_applied ? `yes(${safeStr(cluster?.anchor_pn)})` : "no"
+                cluster?.anchor_applied
+                  ? `yes(${safeStr((cluster?.anchor_pns || [cluster?.anchor_pn]).filter(Boolean).join(", "))})`
+                  : "no"
               } · changed=${safeStr(cluster?.anchor_changed_count)}`}
         </span>
       </div>
@@ -458,7 +529,9 @@ function ExternalModelClusterBlock({ cluster, loading, onExportAll, exporting })
                     <td className="mono">{safeStr(formatPricePiecewise(fv["MSRP(EUR)"]))}</td>
                     <td className="mono">
                       {m?.external_model_anchor_applied
-                        ? `FR anchor ${safeStr(m?.external_model_anchor_pn)}`
+                        ? `FR anchor ${safeStr(m?.external_model_anchor_pn)} · lens ${safeStr(
+                            (m?.external_model_anchor_lens_signature || []).join("/") || "-"
+                          )}`
                         : "normal"}
                     </td>
                     <td className="mono">{m?.external_model_anchor_changed ? "yes" : "no"}</td>
@@ -481,27 +554,60 @@ function BlackVariantBlock({ resp, onApply, applying }) {
   const adjustedPrices = bv?.adjusted_prices || {};
   const eligible = Boolean(bv?.eligible);
   const applied = Boolean(bv?.applied);
+  const policyAllowed = bv?.policy_allowed !== false;
+  const excluded = !policyAllowed;
+  const markup = Number(bv?.markup_eur);
+  const markupText = Number.isFinite(markup) ? `${formatPricePiecewise(markup)} EUR` : "-";
+  const rejectionReason = safeStr(bv?.match_rejection_reason);
 
   return (
     <div className={`diagBlock blackVariantBlock ${applied ? "applied" : eligible ? "eligible" : "missing"}`}>
       <div className="diagHeader">
         <div className="diagTitle">BLACK SKU PRICE CHECK</div>
         <span className={`inlineTag ${applied ? "orig" : eligible ? "calc" : ""}`}>
-          {applied ? "APPLIED" : eligible ? "WHITE PRICE FOUND" : "WHITE PRICE MISSING"}
+          {applied
+            ? `APPLIED +${safeStr(formatPricePiecewise(markup))}`
+            : excluded
+              ? "NO MARKUP · POLICY"
+              : eligible
+                ? "WHITE PRICE FOUND"
+                : "WHITE PRICE MISSING"}
         </span>
+      </div>
+
+      <div className="diagTextRow">
+        <div className="diagTextLabel">加价规则</div>
+        <div className="diagTextValue">
+          <span className="bigPill monoInline">scope: {safeStr(bv?.policy_scope)}</span>
+          <span className="bigPill monoInline">series: {safeStr(bv?.policy_series || "-")}</span>
+          <span className="bigPill monoInline">rule: {safeStr(bv?.policy_rule)}</span>
+          <span className="bigPill monoInline">markup: {markupText}</span>
+          <div className="small" style={{ marginTop: 6 }}>{safeStr(bv?.policy_reason)}</div>
+        </div>
       </div>
 
       <div className="diagTextRow">
         <div className="diagTextLabel">白色款</div>
         <div className="diagTextValue">
-          {eligible ? (
+          {excluded ? (
+            <span className="small">该 IPC 系列不允许 Black 加价，因此不会套用白色款价格。</span>
+          ) : eligible ? (
             <>
               <span className="bigPill monoInline">PN: {safeStr(bv?.white_pn)}</span>
               <span className="bigPill monoInline">Internal: {safeStr(bv?.white_internal_model)}</span>
               <span className="bigPill monoInline">Match: {safeStr(bv?.match_source)}</span>
+              <span className="bigPill monoInline">
+                Lens: {safeStr((bv?.black_lens_signature || []).join("/")) || "-"}
+                {" = "}
+                {safeStr((bv?.white_lens_signature || []).join("/")) || "-"}
+              </span>
             </>
           ) : (
-            <span className="small err">没有在 France 国家侧找到可用于 +2 的白色款完整价格。</span>
+            <span className="small err">
+              {rejectionReason.includes("lens") || rejectionReason.includes("ambiguous")
+                ? `没有找到镜头规格完全一致且唯一的白色款（${rejectionReason}），已禁止加价。`
+                : `没有在 France 国家侧找到可用于 +${safeStr(formatPricePiecewise(markup))} 的白色款完整价格。`}
+            </span>
           )}
         </div>
       </div>
@@ -513,7 +619,7 @@ function BlackVariantBlock({ resp, onApply, applying }) {
               <tr>
                 <th style={{ minWidth: 170 }}>Field</th>
                 <th style={{ minWidth: 110 }}>White FR</th>
-                <th style={{ minWidth: 110 }}>Black +2</th>
+                <th style={{ minWidth: 110 }}>Black +{safeStr(formatPricePiecewise(markup))}</th>
               </tr>
             </thead>
             <tbody>
@@ -532,11 +638,15 @@ function BlackVariantBlock({ resp, onApply, applying }) {
       {eligible ? (
         <div className="blackVariantActions">
           <div className="small">
-            确认后，本 black SKU 导出价会使用白色款 France 价格 + {safeStr(bv?.markup_eur)} EUR；Sys Basis Price
-            Used 不会改动。
+            镜头规格已核对一致。确认后，本 Black SKU 导出价会使用白色款 France 价格 + {markupText}；Sys Basis
+            Price Used 不会改动。
           </div>
           <button className="btn primary" onClick={onApply} disabled={applying || applied}>
-            {applied ? "BLACK +2 ACTIVE" : applying ? "APPLYING..." : "APPLY BLACK +2"}
+            {applied
+              ? `BLACK +${safeStr(formatPricePiecewise(markup))} ACTIVE`
+              : applying
+                ? "APPLYING..."
+                : `APPLY BLACK +${safeStr(formatPricePiecewise(markup))}`}
           </button>
         </div>
       ) : null}
@@ -649,6 +759,9 @@ function SingleQuery() {
   const [manualSeriesKey, setManualSeriesKey] = useState("_default_");
   const [manualPriceField, setManualPriceField] = useState(MANUAL_SYS_BASIS_PRICE_FIELD);
   const [manualPriceValue, setManualPriceValue] = useState("");
+  const [priceEditMode, setPriceEditMode] = useState(false);
+  const [priceEditDrafts, setPriceEditDrafts] = useState({});
+  const [priceEditSaving, setPriceEditSaving] = useState(false);
 
   async function loadQueryOptions({ silent = false } = {}) {
     if (!silent) setOptionsErr("");
@@ -743,10 +856,129 @@ function SingleQuery() {
     setManualPriceValue("");
   }
 
+  function closePriceEditor() {
+    setPriceEditMode(false);
+    setPriceEditDrafts({});
+  }
+
+  function openPriceEditor() {
+    const values = resp?.final_values || {};
+    setPriceEditDrafts(
+      Object.fromEntries(PRICE_KEYS.map((field) => [field, safeStr(values[field])]))
+    );
+    setPriceEditMode(true);
+    setErr("");
+  }
+
+  function attachCurrentRecomputeContext(payload, meta, { includeDirect = true } = {}) {
+    payload.force_category = safeStr(meta?.forced_category) || null;
+    payload.force_price_group = safeStr(meta?.forced_price_group) || null;
+    payload.force_series_key = safeStr(meta?.forced_series_key) || null;
+    attachManualPriceOverride(payload, meta);
+    if (includeDirect) attachManualFinalValues(payload, meta);
+  }
+
+  async function saveDirectPriceEdits() {
+    if (!resp) return;
+    const s = (pn || safeStr(resp?.pn)).trim();
+    if (!s) return;
+
+    const current = resp?.final_values || {};
+    const existing = resp?.meta?.manual_final_values || {};
+    const overrides = { ...existing };
+    let changed = false;
+
+    try {
+      PRICE_KEYS.forEach((field) => {
+        const rawInput = String(priceEditDrafts[field] ?? "").trim();
+        const currentRaw = current[field];
+        const hasCurrent = currentRaw !== null && currentRaw !== undefined && String(currentRaw) !== "";
+        if (!rawInput) {
+          if (hasCurrent) throw new Error(`${field} 不能为空；如无需修改请点击取消`);
+          return;
+        }
+        const value = normalizeManualPriceInput(rawInput);
+        const currentNumber = Number(currentRaw);
+        if (!Number.isFinite(currentNumber) || value !== currentNumber) {
+          overrides[field] = value;
+          changed = true;
+        }
+      });
+    } catch (e) {
+      setErr(String(e.message || e));
+      return;
+    }
+
+    if (!changed && Object.keys(existing).length === 0) {
+      closePriceEditor();
+      return;
+    }
+
+    const payload = {
+      pn: s,
+      manual_final_values: overrides,
+      apply_black_markup: Boolean(
+        resp?.meta?.black_variant?.applied || resp?.meta?.atc_variant?.applied
+      ),
+    };
+    attachCurrentRecomputeContext(payload, resp?.meta || {}, { includeDirect: false });
+
+    setErr("");
+    setPriceEditSaving(true);
+    try {
+      const r = await apiPostJson("/api/query/recompute", payload);
+      setResp(r);
+      syncManualInputsFromResponse(r);
+      closePriceEditor();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setPriceEditSaving(false);
+    }
+  }
+
+  async function resetDirectPriceEdits() {
+    if (!resp) return;
+    const s = (pn || safeStr(resp?.pn)).trim();
+    if (!s) return;
+    const meta = resp?.meta || {};
+    const payload = {
+      pn: s,
+      apply_black_markup: Boolean(meta?.black_variant?.applied || meta?.atc_variant?.applied),
+    };
+    attachCurrentRecomputeContext(payload, meta, { includeDirect: false });
+    const needsRecompute = Boolean(
+      payload.force_category ||
+        payload.force_price_group ||
+        payload.manual_price_field ||
+        payload.manual_sys_basis_price_used ||
+        payload.manual_fob
+    );
+
+    setErr("");
+    setPriceEditSaving(true);
+    try {
+      const r = needsRecompute
+        ? await apiPostJson("/api/query/recompute", payload)
+        : await apiPostJson("/api/query", {
+            pn: s,
+            apply_black_markup: payload.apply_black_markup,
+          });
+      setResp(r);
+      syncManualInputsFromResponse(r);
+      closePriceEditor();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setPriceEditSaving(false);
+    }
+  }
+
   async function run() {
     setErr("");
     setResp(null);
     setExtResp(null);
+    closePriceEditor();
 
     const s = pn.trim();
     if (!s) return;
@@ -875,10 +1107,7 @@ function SingleQuery() {
         apply_black_markup: true,
       };
       if (manualOverride) {
-        payload.force_category = safeStr(meta?.forced_category || meta?.category) || null;
-        payload.force_price_group = safeStr(meta?.forced_price_group || meta?.price_group) || null;
-        payload.force_series_key = safeStr(meta?.forced_series_key || meta?.series_key) || null;
-        attachManualPriceOverride(payload, meta);
+        attachCurrentRecomputeContext(payload, meta);
         const r = await apiPostJson("/api/query/recompute", payload);
         setResp(r);
         syncManualInputsFromResponse(r);
@@ -923,6 +1152,7 @@ function SingleQuery() {
       payload.force_full_recalc = Boolean(meta?.force_full_recalc);
       attachManualPriceOverride(payload, meta);
     }
+    attachManualFinalValues(payload, meta);
 
     setErr("");
     setExporting(true);
@@ -1018,8 +1248,49 @@ function SingleQuery() {
           <QueryInfoTable resp={resp} />
 
           <Hr />
-          <div className="sectionTitle">PRICE FIELDS</div>
-          <QueryPriceTable resp={resp} />
+          <div className="sectionTitleRow">
+            <div className="sectionTitle">PRICE FIELDS</div>
+            <div className="row wrap">
+              {priceEditMode ? (
+                <>
+                  <button className="btn primary compact" onClick={saveDirectPriceEdits} disabled={priceEditSaving}>
+                    {priceEditSaving ? "保存中..." : "保存修改"}
+                  </button>
+                  <button className="btn compact" onClick={closePriceEditor} disabled={priceEditSaving}>
+                    取消
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className="btn compact"
+                    onClick={openPriceEditor}
+                    disabled={String(resp?.status || "").toLowerCase() !== "ok"}
+                  >
+                    手动修改
+                  </button>
+                  {Object.keys(resp?.meta?.manual_final_values || {}).length > 0 ? (
+                    <button className="btn compact" onClick={resetDirectPriceEdits} disabled={priceEditSaving}>
+                      恢复自动价格
+                    </button>
+                  ) : null}
+                </>
+              )}
+            </div>
+          </div>
+          {priceEditMode ? (
+            <div className="small manualPriceHint">
+              可直接修改任意价格或补充空缺价格；保存后标记为 Manual，顶部 EXPORT 会按修改后的最终值导出。
+            </div>
+          ) : null}
+          <QueryPriceTable
+            resp={resp}
+            editing={priceEditMode}
+            drafts={priceEditDrafts}
+            onDraftChange={(field, value) =>
+              setPriceEditDrafts((prev) => ({ ...prev, [field]: value }))
+            }
+          />
 
           {extMode ? (
             <>
@@ -1333,6 +1604,11 @@ function BatchJobBlock({ job }) {
           <div className="diagValue">{safeStr(job.export_layout)}</div>
         </div>
 
+        <div className="diagItem">
+          <div className="diagLabel">price_priority</div>
+          <div className="diagValue">{safeStr(job.price_priority)}</div>
+        </div>
+
         <div className="diagItem diagSpan2">
           <div className="diagLabel">input file</div>
           <div className="diagValue mono">{safeStr(job.input_name)}</div>
@@ -1346,7 +1622,7 @@ function BatchJobBlock({ job }) {
           <span className="bigPill monoInline">not_found: {safeStr(report.count_not_found)}</span>
           <span className="bigPill monoInline">anchor_applied: {safeStr(report.count_anchor_applied)}</span>
           <span className="bigPill monoInline">anchor_changed: {safeStr(report.count_anchor_changed)}</span>
-          <span className="bigPill monoInline">black+2: {safeStr(report.count_black_markup_applied)}</span>
+          <span className="bigPill monoInline">black adjusted: {safeStr(report.count_black_markup_applied)}</span>
           <span className="bigPill monoInline">atc+sys: {safeStr(report.count_atc_markup_applied)}</span>
           <span className="bigPill monoInline">outputs: {outputFiles.length}</span>
         </div>
@@ -1471,6 +1747,7 @@ function BatchExport() {
   // 新增：后端 /api/batch 要求必填 level
   const [level, setLevel] = useState("country");
   const [applyBlackMarkup, setApplyBlackMarkup] = useState(true);
+  const [pricePriority, setPricePriority] = useState("country_first");
 
   async function submit() {
     if (!file) return;
@@ -1483,6 +1760,7 @@ function BatchExport() {
       fd.append("file", file);
       fd.append("level", level); // 修复 422: missing body.level
       fd.append("apply_black_markup", applyBlackMarkup ? "true" : "false");
+      fd.append("price_priority", pricePriority);
 
       const r = await apiPostForm("/api/batch", fd);
       setJob(r);
@@ -1560,8 +1838,22 @@ function BatchExport() {
             checked={applyBlackMarkup}
             onChange={(e) => setApplyBlackMarkup(Boolean(e.target.checked))}
           />
-          Black +2 / ATC delta
+          Black policy / ATC delta
         </label>
+
+        <button
+          type="button"
+          className={`btn pricePriorityToggle ${pricePriority === "system_first" ? "primary" : ""}`}
+          aria-pressed={pricePriority === "system_first"}
+          title="点击切换价格计算优先级"
+          onClick={() =>
+            setPricePriority((current) =>
+              current === "country_first" ? "system_first" : "country_first",
+            )
+          }
+        >
+          价格优先级：{pricePriority === "country_first" ? "国家侧优先" : "系统底价优先"}
+        </button>
 
         <input
           className="input mono"
@@ -1588,6 +1880,12 @@ function BatchExport() {
 
       <div className="small" style={{ marginTop: 10 }}>
         txt/csv: one PN per line · xlsx/xls: backend parser handles file format
+      </div>
+
+      <div className="small pricePriorityHint">
+        {pricePriority === "country_first"
+          ? "当前：优先使用国家侧已有价格，缺失时再用系统底价计算。"
+          : "当前：优先用系统底价重算，仅在系统底价不存在时回退到国家侧已有价格。"}
       </div>
 
       {err ? (
@@ -1656,6 +1954,8 @@ function flattenDdpRules(ddpRules) {
       p2: safeStr(v[1]),
       p3: safeStr(v[2]),
       p4: safeStr(v[3]),
+      adjust: safeStr(v[4] ?? 0),
+      fobAdjust: safeStr(v[5] ?? 0),
     });
   }
   return rows;
@@ -1669,6 +1969,8 @@ function rebuildDdpRules(rows) {
       normNum(r.p2, 0),
       normNum(r.p3, 0),
       normNum(r.p4, 0),
+      normNum(r.adjust, 0),
+      normNum(r.fobAdjust, 0),
     ];
   }
   return out;
@@ -2035,12 +2337,14 @@ function AdminUnifiedRules() {
           <thead>
             <tr>
               <th style={{ minWidth: 180 }}>Category</th>
+              <th style={{ minWidth: 180 }}>FOB Euro Adjust</th>
               {DDP_RULE_FIELDS.map((f) => (
                 <th key={f.key} style={{ minWidth: 110 }}>
                   {f.label}
                 </th>
               ))}
               <th style={{ minWidth: 380 }}>Formula Preview</th>
+              <th style={{ minWidth: 180 }}>Adjust</th>
             </tr>
           </thead>
           <tbody>
@@ -2049,6 +2353,15 @@ function AdminUnifiedRules() {
               return (
                 <tr key={r.category}>
                   <td className="mono">{r.category}</td>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.fobAdjust)}
+                      onChange={(e) => setDdpValue(actualIdx, "fobAdjust", e.target.value)}
+                      placeholder="0 / 0.05 / 0.15"
+                      title="Applied to this category's calculated FOB; 0.15 means FOB +15%"
+                    />
+                  </td>
                   {DDP_RULE_FIELDS.map((f) => (
                     <td key={f.key}>
                       <input
@@ -2059,7 +2372,16 @@ function AdminUnifiedRules() {
                     </td>
                   ))}
                   <td className="mono small">
-                    {`FOB*(1+${safeStr(r.p1 || 0)})*(1+${safeStr(r.p2 || 0)})*(1+${safeStr(r.p3 || 0)})*(1+${safeStr(r.p4 || 0)})`}
+                    {`FOB*(1+${safeStr(r.p1 || 0)})*(1+${safeStr(r.p2 || 0)})*(1+${safeStr(r.p3 || 0)})*(1+${safeStr(r.p4 || 0)})*(1+${safeStr(r.adjust || 0)})`}
+                  </td>
+                  <td>
+                    <input
+                      className="input mono cellInput"
+                      value={safeStr(r.adjust)}
+                      onChange={(e) => setDdpValue(actualIdx, "adjust", e.target.value)}
+                      placeholder="0 / 0.05 / 0.15"
+                      title="Applied after M1-M4; 0.15 means DDP +15%"
+                    />
                   </td>
                 </tr>
               );
@@ -2485,6 +2807,422 @@ function MetaPanel({ meta, metaErr }) {
 }
 
 /* =========================
+ * Price data releases
+ * ========================= */
+
+function readPriceDataToken() {
+  try {
+    return window.sessionStorage.getItem(ADMIN_TOKEN_SESSION_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function priceDataVersionId(version) {
+  if (typeof version === "string") return version;
+  return safeStr(version?.version_id || version?.id || version?.version);
+}
+
+function priceDataFile(version, side) {
+  if (!version || typeof version !== "object") return {};
+  const direct = version?.[`${side}_file`] || version?.[side];
+  const nested = version?.files?.[side] || version?.file_metadata?.[side];
+  return direct && typeof direct === "object" ? direct : nested && typeof nested === "object" ? nested : {};
+}
+
+function priceDataFileName(file, fallback) {
+  return safeStr(file?.filename || file?.name || file?.original_filename || fallback);
+}
+
+function priceDataRows(file) {
+  const value = file?.row_count ?? file?.rows ?? file?.record_count ?? file?.count;
+  return value === null || value === undefined || value === "" ? "-" : safeStr(value);
+}
+
+function priceDataHash(file) {
+  const value = safeStr(file?.sha256 || file?.hash || file?.checksum);
+  if (!value) return "-";
+  return value.length > 20 ? `${value.slice(0, 12)}…${value.slice(-6)}` : value;
+}
+
+function priceDataTime(value) {
+  if (!value) return "-";
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? safeStr(value) : formatMetaTime(d.toISOString(), null);
+}
+
+function PriceDataFileCard({ label, fallbackName, file }) {
+  const fullHash = safeStr(file?.sha256 || file?.hash || file?.checksum);
+  return (
+    <div className="priceDataFileCard">
+      <div className="priceDataFileLabel">{label}</div>
+      <div className="priceDataFileName mono">{priceDataFileName(file, fallbackName)}</div>
+      <div className="priceDataFileFacts">
+        <span>行数 <strong>{priceDataRows(file)}</strong></span>
+        <span>更新时间 <strong>{priceDataTime(file?.updated_at || file?.modified_at || file?.mtime)}</strong></span>
+      </div>
+      <div className="small mono priceDataHash" title={fullHash || undefined}>
+        SHA-256 {priceDataHash(file)}
+      </div>
+    </div>
+  );
+}
+
+function PriceDataObjectSummary({ title, value }) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object") {
+    return (
+      <div className="priceDataSummaryBlock">
+        <div className="sectionTitle">{title}</div>
+        <div className="small mono">{safeStr(value)}</div>
+      </div>
+    );
+  }
+
+  const entries = Object.entries(value);
+  return (
+    <div className="priceDataSummaryBlock">
+      <div className="sectionTitle">{title}</div>
+      {Array.isArray(value) ? (
+        value.length ? (
+          <ul className="priceDataMessages">
+            {value.map((item, index) => (
+              <li key={`${index}-${safeStr(item)}`}>
+                {typeof item === "object" ? JSON.stringify(item) : safeStr(item)}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="small">无</div>
+        )
+      ) : (
+        <div className="tableWrap">
+          <table className="table dense">
+            <tbody>
+              {entries.map(([key, item]) => (
+                <tr key={key}>
+                  <td className="mono priceDataSummaryKey">{key}</td>
+                  <td className="mono">
+                    {item && typeof item === "object" ? JSON.stringify(item) : safeStr(item)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PriceDataPage() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState("");
+  const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+  const [token, setToken] = useState(readPriceDataToken);
+  const [franceFile, setFranceFile] = useState(null);
+  const [sysFile, setSysFile] = useState(null);
+  const [candidate, setCandidate] = useState(null);
+  const [publishConfirmed, setPublishConfirmed] = useState(false);
+  const franceInputRef = useRef(null);
+  const sysInputRef = useRef(null);
+
+  async function loadData({ quiet = false } = {}) {
+    if (!quiet) setLoading(true);
+    setErr("");
+    try {
+      setData(await apiGetJson("/api/admin/price-data"));
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadData();
+  }, []);
+
+  function updateToken(value) {
+    setToken(value);
+    try {
+      if (value) window.sessionStorage.setItem(ADMIN_TOKEN_SESSION_KEY, value);
+      else window.sessionStorage.removeItem(ADMIN_TOKEN_SESSION_KEY);
+    } catch {
+      // The page still works when the browser blocks session storage.
+    }
+  }
+
+  function validateSelectedFile(file, label) {
+    if (!file) throw new Error(`请选择 ${label}`);
+    if (!file.name.toLowerCase().endsWith(".xlsx")) {
+      throw new Error(`${label} 仅支持 .xlsx 文件`);
+    }
+  }
+
+  async function stageFiles() {
+    setErr("");
+    setInfo("");
+    setPublishConfirmed(false);
+    try {
+      if (!token.trim()) throw new Error("请输入价格数据管理员令牌");
+      validateSelectedFile(franceFile, "FrancePrice.xlsx");
+      validateSelectedFile(sysFile, "SysPrice.xlsx");
+      const form = new FormData();
+      form.append("france_file", franceFile);
+      form.append("sys_file", sysFile);
+      setActionLoading("stage");
+      const result = await apiPostForm("/api/admin/price-data/stage", form, {
+        headers: { "X-Price-Data-Admin-Token": token.trim() },
+      });
+      setCandidate(result?.candidate || result?.version || result);
+      setInfo("候选版本验证完成。请核对校验结果与数据差异，再确认发布。");
+      await loadData({ quiet: true });
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setActionLoading("");
+    }
+  }
+
+  async function runVersionAction(versionId, action) {
+    if (!token.trim()) {
+      setErr("请输入价格数据管理员令牌");
+      return;
+    }
+    if (!versionId) {
+      setErr("缺少价格数据版本 ID");
+      return;
+    }
+    if (action === "publish" && !publishConfirmed) {
+      setErr("请先勾选确认，表示已核对两份文件和验证结果");
+      return;
+    }
+    if (action === "rollback" && !window.confirm(`确认回滚到价格数据版本 ${versionId}？`)) return;
+
+    setErr("");
+    setInfo("");
+    setActionLoading(`${action}:${versionId}`);
+    try {
+      await apiPostJson(
+        `/api/admin/price-data/${encodeURIComponent(versionId)}/${action}`,
+        {},
+        { headers: { "X-Price-Data-Admin-Token": token.trim() } }
+      );
+      setInfo(action === "publish" ? `版本 ${versionId} 已发布并生效。` : `已回滚到版本 ${versionId}。`);
+      setCandidate(null);
+      setPublishConfirmed(false);
+      setFranceFile(null);
+      setSysFile(null);
+      if (franceInputRef.current) franceInputRef.current.value = "";
+      if (sysInputRef.current) sysInputRef.current.value = "";
+      await loadData({ quiet: true });
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setActionLoading("");
+    }
+  }
+
+  const activeId = priceDataVersionId(data?.active_version) || priceDataVersionId(data?.active);
+  const versions = Array.isArray(data?.versions) ? data.versions : [];
+  const activeFromList = versions.find((item) => priceDataVersionId(item) === activeId);
+  const active =
+    data?.active && typeof data.active === "object"
+      ? data.active
+      : data?.active_version && typeof data.active_version === "object"
+        ? data.active_version
+        : activeFromList || {};
+  const candidateId = priceDataVersionId(candidate);
+  const validation = candidate?.validation || candidate?.validation_result || candidate?.checks;
+  const diff = candidate?.diff || candidate?.changes || candidate?.comparison;
+  const candidateValid = candidate?.valid !== false && validation?.valid !== false && validation?.ok !== false;
+
+  return (
+    <div className="stack">
+      <Card
+        title="PRICE DATA SOURCE"
+        right={
+          <div className="row wrap">
+            {activeId ? <span className="pill mono">active {activeId}</span> : null}
+            <button className="btn compact" onClick={() => void loadData()} disabled={loading || Boolean(actionLoading)}>
+              {loading ? "LOADING..." : "REFRESH"}
+            </button>
+          </div>
+        }
+      >
+        <div className="priceDataNotice">
+          当前定价引擎使用下面这一组 France / Sys 数据。新文件会先进入候选版本并使用现有解析逻辑完整校验，只有确认发布后才会切换线上数据。
+        </div>
+        {loading ? <div className="small">正在加载价格数据版本…</div> : null}
+        {!loading && !activeId ? <div className="small err">当前没有可识别的生效版本。</div> : null}
+        <div className="priceDataFileGrid">
+          <PriceDataFileCard label="COUNTRY / FRANCE" fallbackName="FrancePrice.xlsx" file={priceDataFile(active, "france")} />
+          <PriceDataFileCard label="SYSTEM / SYS" fallbackName="SysPrice.xlsx" file={priceDataFile(active, "sys")} />
+        </div>
+      </Card>
+
+      <Card title="UPLOAD & VALIDATE" right={<span className="small monoInline">两份文件作为同一版本发布</span>}>
+        <div className="priceDataTokenRow">
+          <label htmlFor="price-data-token">管理员令牌</label>
+          <input
+            id="price-data-token"
+            className="input mono"
+            type="password"
+            autoComplete="off"
+            value={token}
+            onChange={(e) => updateToken(e.target.value)}
+            placeholder="X-Price-Data-Admin-Token"
+          />
+          <span className="small">仅保存在当前浏览器标签页会话中，关闭标签页后清除。</span>
+        </div>
+
+        <div className="priceDataUploadGrid">
+          <label className="priceDataUploadBox">
+            <span className="sectionTitle">FrancePrice.xlsx</span>
+            <input
+              ref={franceInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              onChange={(e) => {
+                setFranceFile(e.target.files?.[0] || null);
+                setCandidate(null);
+                setPublishConfirmed(false);
+              }}
+            />
+            <span className="small mono">{franceFile ? `${franceFile.name} · ${Math.ceil(franceFile.size / 1024)} KB` : "请选择国家侧 .xlsx"}</span>
+          </label>
+          <label className="priceDataUploadBox">
+            <span className="sectionTitle">SysPrice.xlsx</span>
+            <input
+              ref={sysInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              onChange={(e) => {
+                setSysFile(e.target.files?.[0] || null);
+                setCandidate(null);
+                setPublishConfirmed(false);
+              }}
+            />
+            <span className="small mono">{sysFile ? `${sysFile.name} · ${Math.ceil(sysFile.size / 1024)} KB` : "请选择系统侧 .xlsx"}</span>
+          </label>
+        </div>
+
+        <div className="row wrap priceDataActions">
+          <button
+            className="btn primary"
+            onClick={() => void stageFiles()}
+            disabled={Boolean(actionLoading) || !franceFile || !sysFile}
+          >
+            {actionLoading === "stage" ? "VALIDATING..." : "UPLOAD & VALIDATE"}
+          </button>
+          <span className="small">上传不会直接替换当前价格数据。</span>
+        </div>
+
+        {err ? <div className="priceDataFeedback error" role="alert">{err}</div> : null}
+        {info ? <div className="priceDataFeedback success" role="status">{info}</div> : null}
+
+        {candidate ? (
+          <div className={`priceDataCandidate ${candidateValid ? "valid" : "invalid"}`}>
+            <div className="diagHeader">
+              <div className="diagTitle">候选版本 {candidateId || "-"}</div>
+              <Badge status={candidateValid ? "ok" : "validation failed"} />
+            </div>
+            <div className="priceDataFileGrid compact">
+              <PriceDataFileCard label="COUNTRY / FRANCE" fallbackName="FrancePrice.xlsx" file={priceDataFile(candidate, "france")} />
+              <PriceDataFileCard label="SYSTEM / SYS" fallbackName="SysPrice.xlsx" file={priceDataFile(candidate, "sys")} />
+            </div>
+            <div className="priceDataCandidateDetails">
+              <PriceDataObjectSummary title="VALIDATION" value={validation} />
+              <PriceDataObjectSummary title="DIFF FROM ACTIVE" value={diff} />
+            </div>
+            <div className="priceDataPublishBar">
+              <label className="priceDataConfirm">
+                <input
+                  type="checkbox"
+                  checked={publishConfirmed}
+                  onChange={(e) => setPublishConfirmed(e.target.checked)}
+                  disabled={!candidateValid}
+                />
+                我已核对 France、Sys 文件及校验差异，确认发布此版本
+              </label>
+              <button
+                className="btn secondary"
+                disabled={!candidateValid || !publishConfirmed || Boolean(actionLoading) || !candidateId}
+                onClick={() => void runVersionAction(candidateId, "publish")}
+              >
+                {actionLoading === `publish:${candidateId}` ? "PUBLISHING..." : "PUBLISH VERSION"}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </Card>
+
+      <Card title="VERSION HISTORY" right={<span className="small monoInline">回滚会把所选完整数据组重新设为 active</span>}>
+        {versions.length ? (
+          <div className="tableWrap">
+            <table className="table dense priceDataHistory">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>版本</th>
+                  <th>创建 / 发布</th>
+                  <th>France</th>
+                  <th>Sys</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {versions.map((version) => {
+                  const id = priceDataVersionId(version);
+                  const isActive = id === activeId || version?.active === true || version?.status === "active";
+                  const fr = priceDataFile(version, "france");
+                  const sys = priceDataFile(version, "sys");
+                  return (
+                    <tr key={id || JSON.stringify(version)}>
+                      <td><Badge status={isActive ? "active" : safeStr(version?.status || "history")} /></td>
+                      <td className="mono">{id || "-"}</td>
+                      <td className="small mono">
+                        {priceDataTime(version?.published_at || version?.activated_at || version?.created_at)}
+                      </td>
+                      <td>
+                        <div className="mono">{priceDataFileName(fr, "FrancePrice.xlsx")}</div>
+                        <div className="small mono">{priceDataRows(fr)} rows · {priceDataHash(fr)}</div>
+                      </td>
+                      <td>
+                        <div className="mono">{priceDataFileName(sys, "SysPrice.xlsx")}</div>
+                        <div className="small mono">{priceDataRows(sys)} rows · {priceDataHash(sys)}</div>
+                      </td>
+                      <td>
+                        {isActive ? (
+                          <span className="small okc">当前版本</span>
+                        ) : (
+                          <button
+                            className="btn compact"
+                            disabled={!id || Boolean(actionLoading)}
+                            onClick={() => void runVersionAction(id, "rollback")}
+                          >
+                            {actionLoading === `rollback:${id}` ? "ROLLING BACK..." : "ROLLBACK"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="small">暂无历史版本。</div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* =========================
  * App root
  * ========================= */
 
@@ -2568,6 +3306,12 @@ export default function App() {
           >
             端到端演示
           </button>
+          <button
+            className={`tab ${tab === "price-data" ? "active" : ""}`}
+            onClick={() => setTab("price-data")}
+          >
+            价格数据源
+          </button>
         </div>
       </div>
 
@@ -2579,6 +3323,7 @@ export default function App() {
         {tab === "keyword" ? <KeywordAdjustConsole /> : null}
         {tab === "meta" ? <MetaPanel meta={meta} metaErr={metaErr} /> : null}
         {tab === "demo" ? <DemoPipeline /> : null}
+        {tab === "price-data" ? <PriceDataPage /> : null}
       </div>
     </div>
   );

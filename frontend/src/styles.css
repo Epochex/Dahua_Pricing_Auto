@@ -378,6 +378,29 @@ a:hover {
   margin-bottom: 8px;
 }
 
+.sectionTitleRow {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 14px;
+  min-height: 40px;
+  margin-bottom: 8px;
+}
+
+.sectionTitleRow .sectionTitle {
+  margin-bottom: 0;
+}
+
+.btn.compact {
+  height: 34px;
+  padding: 0 13px;
+}
+
+.manualPriceHint {
+  margin: -2px 0 8px;
+  color: var(--warn);
+}
+
 /* ===== New: query/batch summary diagnostic block ===== */
 .diagBlock {
   border: 1px solid var(--line);
@@ -528,6 +551,12 @@ a:hover {
   height: 34px;
 }
 
+.manualPriceInput {
+  max-width: 190px;
+  background: #fffaf0;
+  border-color: var(--brass-3);
+}
+
 .priceCell {
   white-space: nowrap;
 }
@@ -559,6 +588,13 @@ a:hover {
   border-color: #9dbba7;
   color: #2f6b55;
   background: #edf5ef;
+}
+
+.inlineTag.manual {
+  border-color: var(--brass-3);
+  color: #6a5312;
+  background: #fff3cc;
+  font-weight: 700;
 }
 
 .blackVariantBlock {
@@ -604,6 +640,15 @@ a:hover {
   background: var(--paper-3);
 }
 
+.pricePriorityToggle {
+  min-width: 224px;
+}
+
+.pricePriorityHint {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
 .agentGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
@@ -619,6 +664,192 @@ a:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   margin-top: 10px;
+}
+
+/* ===== Price data release management ===== */
+.priceDataNotice {
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border-left: 4px solid var(--brass-3);
+  background: #f3ede2;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.priceDataFileGrid,
+.priceDataUploadGrid,
+.priceDataCandidateDetails {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.priceDataFileCard {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--paper-3);
+}
+
+.priceDataFileLabel {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-bottom: 7px;
+}
+
+.priceDataFileName {
+  font-size: 15px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.priceDataFileFacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.priceDataFileFacts strong {
+  color: var(--ink);
+  font-family: var(--mono);
+}
+
+.priceDataHash {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+}
+
+.priceDataTokenRow {
+  display: grid;
+  grid-template-columns: 110px minmax(220px, 480px) 1fr;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.priceDataTokenRow label {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.priceDataUploadBox {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px dashed var(--green);
+  background: var(--paper-3);
+  cursor: pointer;
+}
+
+.priceDataUploadBox:hover {
+  background: #f2ece1;
+}
+
+.priceDataUploadBox .sectionTitle {
+  margin: 0;
+}
+
+.priceDataUploadBox input[type="file"] {
+  max-width: 100%;
+  font-family: var(--mono);
+}
+
+.priceDataActions {
+  margin-top: 12px;
+}
+
+.priceDataFeedback {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.priceDataFeedback.error {
+  border-color: #d6aaaa;
+  background: #f8ece8;
+  color: var(--fail);
+}
+
+.priceDataFeedback.success {
+  border-color: #9dbba7;
+  background: #edf5ef;
+  color: var(--ok);
+}
+
+.priceDataCandidate {
+  margin-top: 14px;
+  border: 1px solid #9dbba7;
+  background: var(--paper-3);
+}
+
+.priceDataCandidate.invalid {
+  border-color: #d6aaaa;
+}
+
+.priceDataFileGrid.compact,
+.priceDataCandidateDetails {
+  padding: 12px;
+}
+
+.priceDataFileGrid.compact {
+  padding-bottom: 0;
+}
+
+.priceDataSummaryBlock {
+  min-width: 0;
+}
+
+.priceDataSummaryKey {
+  width: 190px;
+}
+
+.priceDataMessages {
+  margin: 0;
+  padding: 10px 10px 10px 30px;
+  border: 1px solid var(--line);
+  background: var(--paper-3);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.priceDataMessages li + li {
+  margin-top: 6px;
+}
+
+.priceDataPublishBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: #f2ece1;
+}
+
+.priceDataConfirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.priceDataConfirm input {
+  margin-top: 3px;
+}
+
+.priceDataHistory td {
+  vertical-align: middle;
 }
 
 details {
@@ -1627,5 +1858,17 @@ summary {
   .agentGrid.two,
   .agentSplit {
     grid-template-columns: 1fr;
+  }
+
+  .priceDataFileGrid,
+  .priceDataUploadGrid,
+  .priceDataCandidateDetails,
+  .priceDataTokenRow {
+    grid-template-columns: 1fr;
+  }
+
+  .priceDataPublishBar {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

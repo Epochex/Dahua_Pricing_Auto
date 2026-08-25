@@ -22,15 +22,78 @@ PRICE_COLS = [
     "MSRP(EUR)",
 ]
 
+PRICE_PRIORITY_COUNTRY_FIRST = "country_first"
+PRICE_PRIORITY_SYSTEM_FIRST = "system_first"
+PRICE_PRIORITIES = {
+    PRICE_PRIORITY_COUNTRY_FIRST,
+    PRICE_PRIORITY_SYSTEM_FIRST,
+}
+
+
+def normalize_price_priority(value: Optional[str]) -> str:
+    normalized = str(value or PRICE_PRIORITY_COUNTRY_FIRST).strip().lower()
+    if normalized not in PRICE_PRIORITIES:
+        allowed = ", ".join(sorted(PRICE_PRIORITIES))
+        raise ValueError(f"price_priority must be one of: {allowed}")
+    return normalized
+
+
 MANUAL_SYS_BASIS_PRICE_FIELD = "Sys Basis Price Used"
 MANUAL_PRICE_FIELDS = [MANUAL_SYS_BASIS_PRICE_FIELD, *PRICE_COLS]
 
-BLACK_VARIANT_MARKUP_EUR = 2.0
+BLACK_IPC_LOW_SERIES_MARKUP_EUR = 2.0
+BLACK_NON_IPC_MARKUP_EUR = 1.0
+# Backward-compatible name for callers that still import the historical constant.
+BLACK_VARIANT_MARKUP_EUR = BLACK_IPC_LOW_SERIES_MARKUP_EUR
+
+
+def normalize_manual_final_price_overrides(values: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """Validate direct, final-tier price edits supplied by the query UI."""
+    if not values:
+        return {}
+    if not isinstance(values, dict):
+        raise ValueError("manual_final_values must be an object")
+
+    normalized: Dict[str, float] = {}
+    for raw_field, raw_value in values.items():
+        field = str(raw_field or "").strip()
+        if field not in PRICE_COLS:
+            raise ValueError(f"manual final price field not supported: {field!r}")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"manual final price for {field!r} must be a number") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"manual final price for {field!r} must be > 0")
+        normalized[field] = value
+    return normalized
+
+
+def apply_manual_final_price_overrides(
+    row: Dict[str, Any], values: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Apply direct edits after calculation/variant adjustments, ready for display and export."""
+    normalized = normalize_manual_final_price_overrides(values)
+    if not normalized or str((row or {}).get("status", "")).lower() != "ok":
+        return row
+
+    final_values = row.setdefault("final_values", {})
+    calculated = set(row.get("calculated_fields") or [])
+    for field, value in normalized.items():
+        final_values[field] = value
+        calculated.discard(field)
+    row["calculated_fields"] = sorted(calculated)
+
+    meta = row.setdefault("meta", {})
+    meta["manual_override"] = True
+    meta["manual_final_values"] = normalized
+    meta["manual_final_fields"] = [field for field in PRICE_COLS if field in normalized]
+    return row
 
 # =========================
 # Sys FOB Adjust（涨价系数）
 # =========================
-# 仅在“使用 Sys 计算 FOB 且 France FOB 缺失”时生效。
+# 在使用 Sys 底价计算 FOB 时生效（包括国家侧缺价回退与 Sys 优先模式）。
 # 默认值可为空；通过 /api/admin/uplift（前端 Adjust 列）可热更新。
 UPLIFT_PCT_BY_LINE: Dict[str, float] = {}
 # 关键词涨价规则（叠加在 Sys FOB Adjust 之后）：
@@ -275,6 +338,16 @@ def _to_float(v) -> Optional[float]:
         return None
 
 
+def _ddp_rule_adjust_pct(category: str) -> float:
+    rule = DDP_RULES.get(category) or ()
+    return _to_float(rule[4]) if len(rule) > 4 else 0.0
+
+
+def _fob_rule_adjust_pct(category: str) -> float:
+    rule = DDP_RULES.get(category) or ()
+    return _to_float(rule[5]) if len(rule) > 5 else 0.0
+
+
 def compute_ddp_a_from_fob(fob: Optional[float], category: str) -> Optional[float]:
     if fob is None or fob <= 0:
         return None
@@ -284,7 +357,9 @@ def compute_ddp_a_from_fob(fob: Optional[float], category: str) -> Optional[floa
     if not rule:
         return None
     ddp = fob
-    for pct in rule:
+    # 前四项是 M1-M4，第五项是 DDP Adjust；第六项 FOB Adjust 已在
+    # FOB 计算阶段应用，不能在这里重复计算。
+    for pct in rule[:5]:
         ddp *= (1 + pct)
     return ddp
 
@@ -296,7 +371,7 @@ def _ddp_multiplier_for_category(category: str) -> Optional[float]:
     if not rule:
         return None
     multiplier = 1.0
-    for pct in rule:
+    for pct in rule[:5]:
         multiplier *= (1 + pct)
     return multiplier
 
@@ -532,6 +607,79 @@ def _strip_black_suffix(model: Any) -> Optional[str]:
     return stripped or None
 
 
+_OPTICAL_CODE_RE = re.compile(
+    r"(?<![0-9])(?:27135|0210|0280|0360|0400|0600|0735|0832|1200|2500|2712)B?(?![0-9])",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_optical_signature(*models: Any) -> List[str]:
+    """Return stable lens/focal codes such as 0280B, 0360B, 2712 or 0832."""
+    found: Set[str] = set()
+    for model in models:
+        text = str(model or "").upper()
+        for match in _OPTICAL_CODE_RE.finditer(text):
+            found.add(match.group(0).upper().removesuffix("B"))
+    return sorted(found)
+
+
+def _black_markup_policy(meta: Dict[str, Any], internal_model: Any, external_model: Any) -> Dict[str, Any]:
+    model_context = " ".join(str(v or "") for v in (internal_model, external_model)).upper()
+    context = " ".join(
+        str(v or "")
+        for v in (
+            meta.get("category"),
+            meta.get("price_group"),
+            meta.get("series_key"),
+            meta.get("series_display"),
+            internal_model,
+            external_model,
+        )
+    ).upper()
+    category = str(meta.get("category") or "").strip().upper()
+    model_says_ipc = bool(re.search(r"(?:^|[-_\s])IPC(?:$|[-_\s])", model_context))
+    # Model family is more reliable here than the broad legacy classifier: HAC
+    # rows can currently be classified as IPC1, but they are still non-IPC for
+    # the Black price policy.
+    is_ipc = model_says_ipc or (not model_context.strip() and category == "IPC")
+
+    generation: Optional[str] = None
+    model_match = re.search(r"H(?:DBW|DB|DW|FW)([1-8])", model_context)
+    if model_match:
+        generation = f"IPC{model_match.group(1)}"
+    if not generation:
+        generation_match = re.search(r"\bIPC\s*[-_/]?\s*([1-8])\b", context)
+        if generation_match:
+            generation = f"IPC{generation_match.group(1)}"
+
+    if is_ipc and generation in {"IPC2", "IPC3"}:
+        return {
+            "allowed": True,
+            "scope": "IPC",
+            "series": generation,
+            "markup_eur": BLACK_IPC_LOW_SERIES_MARKUP_EUR,
+            "rule": "ipc2_ipc3_plus_2",
+            "reason": "IPC2/IPC3 black variants use the matching white price +2 EUR",
+        }
+    if is_ipc:
+        return {
+            "allowed": False,
+            "scope": "IPC",
+            "series": generation or "IPC_OTHER",
+            "markup_eur": 0.0,
+            "rule": "ipc_other_no_markup",
+            "reason": "Only IPC2/IPC3 black variants are eligible for the +2 EUR rule",
+        }
+    return {
+        "allowed": True,
+        "scope": "NON_IPC",
+        "series": None,
+        "markup_eur": BLACK_NON_IPC_MARKUP_EUR,
+        "rule": "non_ipc_plus_1",
+        "reason": "Non-IPC black variants use the matching white price +1 EUR",
+    }
+
+
 def _strip_atc_token(model: Any) -> Optional[str]:
     s = str(model or "").strip()
     if not s:
@@ -641,6 +789,23 @@ def _build_model_row_index(df: pd.DataFrame) -> Dict[str, pd.Series]:
     return index
 
 
+def _build_model_rows_index(df: pd.DataFrame) -> Dict[str, List[pd.Series]]:
+    """Multi-row model index used where one External Model has several lens variants."""
+    internal_col = "Internal Model" if "Internal Model" in df.columns else None
+    external_col = "External Model" if "External Model" in df.columns else None
+    index: Dict[str, List[pd.Series]] = {}
+    for _, row in df.iterrows():
+        row_keys: Set[str] = set()
+        for col in (internal_col, external_col):
+            if not col:
+                continue
+            key = _normalize_model_lookup(row.get(col))
+            if key and key not in row_keys:
+                index.setdefault(key, []).append(row)
+                row_keys.add(key)
+    return index
+
+
 def _model_counterpart_payload(
     row: pd.Series,
     *,
@@ -665,38 +830,117 @@ def _find_white_counterpart_in_france(
     internal_model: Any,
     external_model: Any,
 ) -> Optional[Dict[str, Any]]:
+    counterpart, _ = _find_white_counterpart_with_audit(
+        data,
+        internal_model=internal_model,
+        external_model=external_model,
+    )
+    return counterpart
+
+
+def _find_white_counterpart_with_audit(
+    data: DataBundle,
+    *,
+    internal_model: Any,
+    external_model: Any,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     candidates = _black_white_candidate_models(internal_model, external_model)
+    black_lens_signature = _extract_optical_signature(internal_model, external_model)
+    audit: Dict[str, Any] = {
+        "black_lens_signature": black_lens_signature,
+        "white_lens_signature": [],
+        "candidate_lens_signatures": [],
+        "candidate_count": 0,
+        "complete_candidate_count": 0,
+        "lens_mismatch_count": 0,
+        "ambiguous": False,
+        "rejection_reason": None,
+    }
     if not candidates:
-        return None
+        audit["rejection_reason"] = "no_white_model_candidate"
+        return None, audit
 
     df = data.france_df
     if df is None or df.empty:
-        return None
+        audit["rejection_reason"] = "france_table_empty"
+        return None, audit
 
     pn_col = _pick_pn_col(df)
     internal_col = "Internal Model" if "Internal Model" in df.columns else None
     external_col = "External Model" if "External Model" in df.columns else None
     if not internal_col and not external_col:
-        return None
+        audit["rejection_reason"] = "model_columns_missing"
+        return None, audit
 
-    index = _build_model_row_index(df)
+    cached_index = getattr(data, "_black_france_model_rows_index", None)
+    cached_df_id = getattr(data, "_black_france_model_rows_df_id", None)
+    if not isinstance(cached_index, dict) or cached_df_id != id(df):
+        cached_index = _build_model_rows_index(df)
+        setattr(data, "_black_france_model_rows_index", cached_index)
+        setattr(data, "_black_france_model_rows_df_id", id(df))
+    index = cached_index
 
     for cand in candidates:
-        row = index.get(_normalize_model_lookup(cand.get("model")))
-        if row is None:
+        key = _normalize_model_lookup(cand.get("model"))
+        matched_rows = list(index.get(key) or [])
+        audit["candidate_count"] += len(matched_rows)
+        complete_rows: List[Tuple[pd.Series, Dict[str, float], List[str]]] = []
+        for row in matched_rows:
+            if _strip_black_suffix(row.get("Internal Model")) or _strip_black_suffix(
+                row.get("External Model")
+            ):
+                continue
+            prices = _row_complete_prices(row)
+            if not prices:
+                continue
+            signature = _extract_optical_signature(
+                row.get("Internal Model"), row.get("External Model")
+            )
+            complete_rows.append((row, prices, signature))
+            audit["candidate_lens_signatures"].append(signature)
+        audit["complete_candidate_count"] += len(complete_rows)
+        if not complete_rows:
             continue
-        prices = _row_complete_prices(row)
-        if not prices:
+
+        compatible = complete_rows
+        if black_lens_signature:
+            compatible = [item for item in complete_rows if item[2] == black_lens_signature]
+            audit["lens_mismatch_count"] += len(complete_rows) - len(compatible)
+        if not compatible:
             continue
-        return _model_counterpart_payload(
+
+        # A full Internal Model match is deterministic. External Model matches
+        # may cover several lens sizes and are accepted only when they collapse
+        # to one exact Internal Model after the optical filter above.
+        source = str(cand.get("source") or "")
+        if source.endswith("_external"):
+            distinct_internal = {
+                _normalize_model_lookup(item[0].get("Internal Model")) for item in compatible
+            }
+            distinct_internal.discard("")
+            if len(distinct_internal) > 1:
+                audit["ambiguous"] = True
+                continue
+
+        row, prices, white_lens_signature = compatible[0]
+        payload = _model_counterpart_payload(
             row,
             pn_col=pn_col,
             match_model=cand.get("model"),
             match_source=cand.get("source"),
             prices=prices,
         )
+        payload["lens_signature"] = white_lens_signature
+        audit["white_lens_signature"] = white_lens_signature
+        return payload, audit
 
-    return None
+    if audit["ambiguous"]:
+        audit["rejection_reason"] = "ambiguous_external_model_after_lens_filter"
+    elif black_lens_signature and audit["lens_mismatch_count"] > 0:
+        audit["rejection_reason"] = "lens_mismatch"
+    else:
+        audit["rejection_reason"] = "white_counterpart_not_found_or_incomplete"
+    return None, audit
 
 
 def _find_atc_base_counterpart_in_france(
@@ -823,8 +1067,9 @@ def apply_black_variant_markup(
     apply: bool = False,
 ) -> bool:
     """
-    Detect black SKUs, expose the matching France-side white price, and optionally
-    set every exported price tier to white + 2 EUR. Sys basis metadata is not changed.
+    Detect black SKUs, enforce product-line and optical-match policy, then optionally
+    set every exported tier from the exact white counterpart plus the allowed markup.
+    Sys basis metadata is not changed.
     """
     if str(row.get("status", "")).lower() != "ok":
         return False
@@ -839,17 +1084,27 @@ def apply_black_variant_markup(
     stripped_internal = _strip_black_suffix(internal_model)
     stripped_external = _strip_black_suffix(external_model)
     is_black = bool(stripped_internal or stripped_external)
+    policy = _black_markup_policy(meta, internal_model, external_model)
 
     black_meta: Dict[str, Any] = {
         "is_black": is_black,
         "eligible": False,
         "applied": False,
-        "markup_eur": BLACK_VARIANT_MARKUP_EUR,
+        "policy_allowed": bool(policy.get("allowed")),
+        "policy_scope": policy.get("scope"),
+        "policy_series": policy.get("series"),
+        "policy_rule": policy.get("rule"),
+        "policy_reason": policy.get("reason"),
+        "markup_eur": policy.get("markup_eur"),
         "white_pn": None,
         "white_internal_model": None,
         "white_external_model": None,
         "match_model": None,
         "match_source": None,
+        "black_lens_signature": _extract_optical_signature(internal_model, external_model),
+        "white_lens_signature": [],
+        "candidate_lens_signatures": [],
+        "match_rejection_reason": None,
         "white_prices": None,
         "adjusted_prices": None,
     }
@@ -863,20 +1118,39 @@ def apply_black_variant_markup(
         for w in (row.get("warnings") or [])
         if not str(w).startswith("black_variant_")
     ]
-    counterpart = _find_white_counterpart_in_france(
+    if not policy.get("allowed"):
+        warning = f"black_variant_policy_excluded_{policy.get('series') or 'IPC_OTHER'}"
+        if warning not in ws:
+            ws.append(warning)
+        row["warnings"] = ws
+        return False
+
+    counterpart, match_audit = _find_white_counterpart_with_audit(
         data,
         internal_model=internal_model,
         external_model=external_model,
     )
+    black_meta.update(
+        {
+            "black_lens_signature": match_audit.get("black_lens_signature") or [],
+            "white_lens_signature": match_audit.get("white_lens_signature") or [],
+            "candidate_lens_signatures": match_audit.get("candidate_lens_signatures") or [],
+            "match_rejection_reason": match_audit.get("rejection_reason"),
+            "match_ambiguous": bool(match_audit.get("ambiguous")),
+        }
+    )
     if not counterpart:
-        if "black_variant_white_counterpart_not_found" not in ws:
-            ws.append("black_variant_white_counterpart_not_found")
+        reason = str(match_audit.get("rejection_reason") or "white_counterpart_not_found")
+        warning = f"black_variant_{reason}"
+        if warning not in ws:
+            ws.append(warning)
         row["warnings"] = ws
         return False
 
+    markup = float(policy.get("markup_eur") or 0.0)
     white_prices = dict(counterpart.get("prices") or {})
     adjusted_prices = {
-        col: (float(v) + BLACK_VARIANT_MARKUP_EUR)
+        col: (float(v) + markup)
         for col, v in white_prices.items()
         if _to_float(v) is not None
     }
@@ -888,14 +1162,17 @@ def apply_black_variant_markup(
             "white_external_model": counterpart.get("external_model"),
             "match_model": counterpart.get("match_model"),
             "match_source": counterpart.get("match_source"),
+            "white_lens_signature": counterpart.get("lens_signature") or [],
+            "match_rejection_reason": None,
             "white_prices": white_prices,
             "adjusted_prices": adjusted_prices,
         }
     )
 
     if not apply:
-        if "black_variant_white_counterpart_found_apply_plus_2" not in ws:
-            ws.append("black_variant_white_counterpart_found_apply_plus_2")
+        warning = f"black_variant_white_counterpart_found_apply_plus_{markup:g}"
+        if warning not in ws:
+            ws.append(warning)
         row["warnings"] = ws
         return False
 
@@ -915,7 +1192,10 @@ def apply_black_variant_markup(
 
     black_meta["applied"] = True
     row["calculated_fields"] = sorted(list(cf))
-    applied_msg = f"black_variant_plus_2_applied_from_white_pn={counterpart.get('pn') or 'UNKNOWN'}"
+    applied_msg = (
+        f"black_variant_plus_{markup:g}_applied_from_white_pn="
+        f"{counterpart.get('pn') or 'UNKNOWN'}"
+    )
     if applied_msg not in ws:
         ws.append(applied_msg)
     row["warnings"] = ws
@@ -1351,6 +1631,12 @@ def _compute_fob_from_basis_price(
     if kw_pct > 0:
         fob = fob * (1 + kw_pct)
 
+    # 每个产品线的第六项配置是 FOB Euro Adjust。它位于 FOB 计算链路的
+    # 最后一步，因此会先于 DDP 与各渠道价生效。
+    fob_adjust_pct = _fob_rule_adjust_pct(category)
+    if fob_adjust_pct:
+        fob = fob * (1 + fob_adjust_pct)
+
     return fob, uplift_key, kw_pct, kw_hits
 
 
@@ -1461,6 +1747,7 @@ def compute_prices_for_part(
     manual_fob: Optional[float] = None,
     manual_price_field: Optional[str] = None,
     manual_price_value: Optional[float] = None,
+    price_priority: str = PRICE_PRIORITY_COUNTRY_FIRST,
 ) -> Dict:
     """
     输出 result dict：
@@ -1468,10 +1755,11 @@ def compute_prices_for_part(
       - sys_sales_type: 本 PN 在 Sys 中的 Sales Type（规范化后的）
       - sys_basis_field: 本次 Sys FOB 计算若发生，用的是哪列（Min Price / Area Price）
       - sys_basis_price: 该层级在 Sys 表对应底价
-      - sys_basis_price_used: 本次是否实际用于反算 FOB（仅 France FOB 缺失时）
+      - sys_basis_price_used: 本次实际用于反算 FOB 的 Sys 底价
       - sys_uplift_key: 本次 Sys FOB uplift 命中的 key（若未命中则 None）
       - sys_keyword_uplift_pct / sys_keyword_uplift_hits: 关键词叠加涨价命中信息
     """
+    price_priority_norm = normalize_price_priority(price_priority)
     has_manual_price_field = bool(manual_price_field) or manual_price_value is not None
     legacy_manual_count = int(manual_sys_basis_price_used is not None) + int(manual_fob is not None)
     if legacy_manual_count > 1 or (has_manual_price_field and legacy_manual_count > 0):
@@ -1528,6 +1816,11 @@ def compute_prices_for_part(
             price_group=price_group,
             series_display=series_display,
         )
+    prefer_sys_prices = bool(
+        price_priority_norm == PRICE_PRIORITY_SYSTEM_FIRST
+        and sys_basis_price is not None
+        and sys_basis_price > 0
+    )
 
     # ===== 预计算：本次会使用的 PRICE_RULES 规则名字（即使最终不需要补全渠道价，也可输出供核对）=====
     effective_price_group = resolve_price_group_for_rules(price_group, series_key, series_display)
@@ -1549,19 +1842,24 @@ def compute_prices_for_part(
             "series_key": series_key or "",
             "pricing_rule_name": pricing_rule_name,
             "auto_success": False,
+            "price_priority": price_priority_norm,
             "used_sys": False,
             "sys_sales_type": sys_sales_type,
             "sys_basis_field": None,
             "sys_basis_price": sys_basis_price,
             "sys_basis_price_used": None,
             "sys_uplift_key": None,
+            "sys_uplift_pct": 0.0,
             "sys_keyword_uplift_pct": 0.0,
             "sys_keyword_uplift_hits": [],
+            "fob_euro_adjust_pct": 0.0,
+            "ddp_adjust_pct": 0.0,
         }
 
     # 4) 如果 France 所有价格都齐全 → 全部 Original（不计算）
     if (
         _all_prices_present(france_row)
+        and not prefer_sys_prices
         and not force_recalc_all
         and manual_sys_basis_price_used is None
         and manual_fob is None
@@ -1578,14 +1876,18 @@ def compute_prices_for_part(
             "series_key": series_key or "",
             "pricing_rule_name": pricing_rule_name,
             "auto_success": True,
+            "price_priority": price_priority_norm,
             "used_sys": False,
             "sys_sales_type": sys_sales_type,
             "sys_basis_field": None,
             "sys_basis_price": sys_basis_price,
             "sys_basis_price_used": None,
             "sys_uplift_key": None,
+            "sys_uplift_pct": 0.0,
             "sys_keyword_uplift_pct": 0.0,
             "sys_keyword_uplift_hits": [],
+            "fob_euro_adjust_pct": 0.0,
+            "ddp_adjust_pct": 0.0,
         }
 
     # 5) 需要补全：先找 FOB
@@ -1600,6 +1902,7 @@ def compute_prices_for_part(
     manual_override_field: Optional[str] = None
     manual_price_field_used: Optional[str] = None
     manual_price_input: Optional[float] = None
+    ddp_adjust_applied = False
 
     if manual_price_field and manual_price_value is not None:
         fob, used_sys_uplift_key, used_sys_keyword_uplift_pct, used_sys_keyword_uplift_hits, used_basis = (
@@ -1653,7 +1956,29 @@ def compute_prices_for_part(
         manual_override_field = "fob"
         manual_price_field_used = "FOB C(EUR)"
         manual_price_input = manual_fob
-    # 只在 France 缺失 FOB 时，才允许从 Sys 计算 FOB（不改你原逻辑）
+    elif prefer_sys_prices:
+        # System-first is authoritative when a usable floor price exists: do not
+        # retain a mixed row containing Sys FOB and country-side channel prices.
+        for col in PRICE_COLS:
+            final_values[col] = None
+        fob, used_sys_uplift_key, used_sys_keyword_uplift_pct, used_sys_keyword_uplift_hits = (
+            _compute_fob_from_basis_price(
+                sys_basis_price,
+                category=category,
+                price_group=price_group,
+                effective_price_group=effective_price_group,
+                price_rule_key=price_rule_key,
+                series_display=series_display,
+                france_row=france_row,
+                sys_row=sys_row,
+            )
+        )
+        final_values["FOB C(EUR)"] = fob
+        calculated_fields.add("FOB C(EUR)")
+        used_sys = True
+        used_sys_basis_field = sys_basis_field
+        used_sys_basis_price = sys_basis_price
+    # country-first 模式下，只在 France 缺失 FOB 时才从 Sys 回退计算。
     elif (fob is None or fob <= 0) and sys_row is not None:
         base_price, sales_norm, basis_field = _choose_sys_base_price_from_sys(
             sys_row,
@@ -1685,13 +2010,15 @@ def compute_prices_for_part(
 
     # 6) DDP A：如果 France 没写，就用 FOB + DDP_RULES 算
     ddp_existing = _to_float(final_values.get("DDP A(EUR)"))
+    recalculate_all_prices = bool(force_recalc_all or prefer_sys_prices)
     if _is_software_category(category):
         ddp_a = _sync_software_ddp_to_fob(final_values, calculated_fields)
-    elif force_recalc_all:
+    elif recalculate_all_prices:
         ddp_a = compute_ddp_a_from_fob(fob, category)
         if ddp_a is not None:
             final_values["DDP A(EUR)"] = ddp_a
             calculated_fields.add("DDP A(EUR)")
+            ddp_adjust_applied = True
     elif ddp_existing is not None and ddp_existing > 0:
         ddp_a = ddp_existing
     else:
@@ -1699,6 +2026,7 @@ def compute_prices_for_part(
         if ddp_a is not None:
             final_values["DDP A(EUR)"] = ddp_a
             calculated_fields.add("DDP A(EUR)")
+            ddp_adjust_applied = True
 
     # 7) 渠道价：如果某列缺失且有 DDP + 价格组规则，就计算补全
     if ddp_a is not None:
@@ -1709,7 +2037,7 @@ def compute_prices_for_part(
                     continue
                 if col not in channel_prices:
                     continue
-                if force_recalc_all:
+                if recalculate_all_prices:
                     if channel_prices[col] is not None:
                         final_values[col] = channel_prices[col]
                         calculated_fields.add(col)
@@ -1727,14 +2055,22 @@ def compute_prices_for_part(
         "series_key": series_key or "",
         "pricing_rule_name": pricing_rule_name,
         "auto_success": True,
+        "price_priority": price_priority_norm,
         "used_sys": used_sys,
         "sys_sales_type": sys_sales_type,
         "sys_basis_field": used_sys_basis_field,
         "sys_basis_price": sys_basis_price,
         "sys_basis_price_used": used_sys_basis_price,
         "sys_uplift_key": used_sys_uplift_key,
+        "sys_uplift_pct": (
+            _to_float(UPLIFT_PCT_BY_LINE.get(used_sys_uplift_key)) or 0.0
+            if used_sys_uplift_key
+            else 0.0
+        ),
         "sys_keyword_uplift_pct": used_sys_keyword_uplift_pct,
         "sys_keyword_uplift_hits": used_sys_keyword_uplift_hits,
+        "fob_euro_adjust_pct": _fob_rule_adjust_pct(category) if used_sys else 0.0,
+        "ddp_adjust_pct": _ddp_rule_adjust_pct(category) if ddp_adjust_applied else 0.0,
         "manual_override_field": manual_override_field,
         "manual_sys_basis_price_input": manual_sys_basis_price_used,
         "manual_fob_input": manual_fob,
@@ -1880,7 +2216,9 @@ def compute_one(
     manual_fob: Optional[float] = None,
     manual_price_field: Optional[str] = None,
     manual_price_value: Optional[float] = None,
+    manual_final_values: Optional[Dict[str, Any]] = None,
     apply_black_markup: bool = False,
+    price_priority: str = PRICE_PRIORITY_COUNTRY_FIRST,
 ) -> Dict[str, Any]:
     """
     server API：单个 PN 查询
@@ -1955,6 +2293,7 @@ def compute_one(
         manual_fob=manual_fob,
         manual_price_field=manual_price_field,
         manual_price_value=manual_price_value,
+        price_priority=price_priority,
     )
     result["final_values"]["Part No."] = pn  # 强制覆盖为用户输入
 
@@ -1969,14 +2308,18 @@ def compute_one(
             "series_display": result.get("series_display"),
             "series_key": result.get("series_key"),
             "pricing_rule_name": result.get("pricing_rule_name"),
+            "price_priority": result.get("price_priority"),
             "used_sys": result.get("used_sys"),
             "sys_sales_type": result.get("sys_sales_type"),
             "sys_basis_field": result.get("sys_basis_field"),
             "sys_basis_price": result.get("sys_basis_price"),
             "sys_basis_price_used": result.get("sys_basis_price_used"),
             "sys_uplift_key": result.get("sys_uplift_key"),
+            "sys_uplift_pct": result.get("sys_uplift_pct"),
             "sys_keyword_uplift_pct": result.get("sys_keyword_uplift_pct"),
             "sys_keyword_uplift_hits": result.get("sys_keyword_uplift_hits"),
+            "fob_euro_adjust_pct": result.get("fob_euro_adjust_pct"),
+            "ddp_adjust_pct": result.get("ddp_adjust_pct"),
             "fr_match_mode": fr_mode,
             "sys_match_mode": sys_mode,
             "fr_matched_pn": fr_matched,
@@ -1993,6 +2336,7 @@ def compute_one(
                 or manual_sys_basis_price_used is not None
                 or manual_fob is not None
                 or manual_price_value is not None
+                or manual_final_values
             ),
             "forced_category": force_category_norm,
             "forced_price_group": force_price_group_norm,
@@ -2012,7 +2356,7 @@ def compute_one(
         "warnings": warnings,
     }
     apply_variant_markups(data, row_out, apply=bool(apply_black_markup))
-    return row_out
+    return apply_manual_final_price_overrides(row_out, manual_final_values)
 
 
 def compute_many(data: DataBundle, pns: List[str], level: str) -> List[Dict[str, Any]]:

@@ -50,6 +50,8 @@ pip-wheel-metadata/
 # =========================
 frontend/node_modules/
 frontend/dist/
+frontend/current
+frontend/releases/
 frontend/.vite/
 frontend/.cache/
 frontend/.eslintcache
