@@ -1,0 +1,16 @@
+[Unit]
+Description=Dahua Pricing Adaptive Investigation API
+After=network.target dahua-pricing-backend.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/data/Dahua_Pricing_Auto-agent-investigation
+Environment=PYTHONUNBUFFERED=1
+Environment=DAHUA_PRICING_RUNTIME_DIR=/data/dahua_pricing_runtime
+ExecStart=/data/Dahua_Pricing_Auto/.venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8021 --no-access-log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
