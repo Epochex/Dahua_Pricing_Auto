@@ -1,6 +1,12 @@
+import pandas as pd
 from openpyxl import Workbook, load_workbook
 
-from backend.engine.core.loader import _prepare_france_price_file, _prepare_sys_price_file
+from backend.engine.core.loader import (
+    _pick_pn_column,
+    _prepare_france_price_file,
+    _prepare_sys_price_file,
+    _read_excel_any,
+)
 
 
 def _write_report_price(path):
@@ -70,3 +76,21 @@ def test_prepare_sys_price_consumes_pricelist_export(tmp_path):
     rows = list(ws.iter_rows(values_only=True))
     assert rows[0] == ("Part Num", "Internal Model", "Min Price", "Area Price", "Sales Type")
     assert rows[1] == ("1.0.02", "DHI-TEST", 10, 20, "Distribution")
+
+
+def test_read_excel_discovers_pn_table_after_navigation_sheet(tmp_path):
+    report = tmp_path / "renamed-upload.xlsx"
+    _write_report_price(report)
+
+    df = _read_excel_any(report)
+
+    assert list(df.columns) == ["Part No.", "Series", "FOB C(EUR)"]
+    assert df.to_dict("records") == [
+        {"Part No.": "1.0.01", "Series": "Cabling", "FOB C(EUR)": 12.3}
+    ]
+
+
+def test_pick_pn_column_tolerates_export_header_formatting():
+    df = pd.DataFrame(columns=["Series", "Part\nNo.", "Price"])
+
+    assert _pick_pn_column(df) == "Part\nNo."

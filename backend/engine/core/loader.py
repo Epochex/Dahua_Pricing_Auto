@@ -11,10 +11,9 @@ import pandas as pd
 
 REPORT_PRICE_GLOB = "reportPrice_*.xlsx"
 FRANCE_PRICE_XLSX = "FrancePrice.xlsx"
-FRANCE_REPORT_PRODUCT_SHEET_INDEX = 1
-FRANCE_REPORT_HEADER_ROW = 1
 PRICE_LIST_GLOBS = ("*PriceList.xls", "*PriceList.xlsx")
 SYS_PRICE_XLSX = "SysPrice.xlsx"
+EXCEL_HEADER_SCAN_ROWS = 50
 
 
 def safe_upper(v) -> str:
@@ -73,6 +72,42 @@ def _base_index_priority(raw_key: str, base_key: str) -> int:
     return 2
 
 
+def _try_pick_pn_column(df: pd.DataFrame) -> Optional[str]:
+    try:
+        return _pick_pn_column(df)
+    except ValueError:
+        return None
+
+
+def _read_excel_table(path: Path, *, engine: str) -> pd.DataFrame:
+    """Read the first PN-bearing table, discovering its sheet and header row."""
+    with pd.ExcelFile(path, engine=engine) as workbook:
+        first = pd.read_excel(workbook, sheet_name=0)
+        if _try_pick_pn_column(first) is not None:
+            return first
+
+        for sheet_name in workbook.sheet_names:
+            probe = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                header=None,
+                nrows=EXCEL_HEADER_SCAN_ROWS,
+            )
+            for header_row, values in probe.iterrows():
+                header = pd.DataFrame(columns=values.tolist())
+                if _try_pick_pn_column(header) is None:
+                    continue
+                table = pd.read_excel(
+                    workbook,
+                    sheet_name=sheet_name,
+                    header=int(header_row),
+                )
+                if _try_pick_pn_column(table) is not None:
+                    return table
+
+        return first
+
+
 def _read_excel_any(path: Path) -> pd.DataFrame:
     """
     按真实文件格式优先选择引擎，后缀仅作为兜底：
@@ -93,19 +128,19 @@ def _read_excel_any(path: Path) -> pd.DataFrame:
 
     # OOXML files are zip archives and start with PK, even when the suffix is wrong.
     if head.startswith(b"PK"):
-        return pd.read_excel(path, engine="openpyxl")
+        return _read_excel_table(path, engine="openpyxl")
 
     # Legacy .xls files use the OLE Compound File Binary Format.
     if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-        return pd.read_excel(path, engine="xlrd")
+        return _read_excel_table(path, engine="xlrd")
 
     if suffix == ".xls":
         # 需要 xlrd（仅 .xls）
-        return pd.read_excel(path, engine="xlrd")
+        return _read_excel_table(path, engine="xlrd")
 
     if suffix in (".xlsx", ".xlsm"):
         # 强制使用 openpyxl（你的目标）
-        return pd.read_excel(path, engine="openpyxl")
+        return _read_excel_table(path, engine="openpyxl")
 
     # 兜底（理论上当前业务不会走到这里）
     return pd.read_excel(path)
@@ -179,18 +214,7 @@ def _normalize_report_price_file(report_path: Path, target_path: Path) -> Path:
     report_path = Path(report_path)
     target_path = Path(target_path)
 
-    with pd.ExcelFile(report_path, engine="openpyxl") as xls:
-        if len(xls.sheet_names) <= FRANCE_REPORT_PRODUCT_SHEET_INDEX:
-            raise ValueError(
-                f"{report_path.name} must contain a products sheet at index "
-                f"{FRANCE_REPORT_PRODUCT_SHEET_INDEX + 1}; sheets={xls.sheet_names!r}"
-            )
-
-        df = pd.read_excel(
-            xls,
-            sheet_name=FRANCE_REPORT_PRODUCT_SHEET_INDEX,
-            header=FRANCE_REPORT_HEADER_ROW,
-        )
+    df = _read_excel_any(report_path)
     df = df.dropna(how="all")
     df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed:")]
 
@@ -328,7 +352,14 @@ def _pick_pn_column(df: pd.DataFrame) -> str:
         if k in low_map:
             return low_map[k]
 
-    # 3) 再做包含匹配（更宽松）
+    # 3) 容忍导出器插入换行、不间断空格或标点差异。
+    canonical_pn_headers = {"PARTNO", "PARTNUM", "PARTNUMBER", "PN"}
+    for c in cols:
+        canonical = re.sub(r"[^A-Z0-9]+", "", str(c).upper())
+        if canonical in canonical_pn_headers:
+            return c
+
+    # 4) 再做包含匹配（更宽松）
     for c in cols:
         uc = str(c).upper()
         if "PART" in uc and "NO" in uc:
