@@ -467,6 +467,9 @@ class MappingInvestigationAgent:
                     evidence_refs=evidence_refs,
                     counter_evidence_refs=counter_refs,
                     unresolved_codes=unresolved,
+                    finding_codes=list(action.get("finding_codes") or []),
+                    investigation_summary=str(action.get("investigation_summary") or ""),
+                    recommended_next_steps=list(action.get("recommended_next_steps") or []),
                     expected_revision=revision,
                     metrics=self._final_metrics(metrics, started=started),
                 )

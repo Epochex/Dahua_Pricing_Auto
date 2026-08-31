@@ -533,6 +533,9 @@ class MappingAgentCompleteReq(BaseModel):
     evidence_refs: List[str] = Field(default_factory=list, max_length=100)
     counter_evidence_refs: List[str] = Field(default_factory=list, max_length=100)
     unresolved_codes: List[str] = Field(default_factory=list, max_length=100)
+    finding_codes: List[str] = Field(default_factory=list, max_length=100)
+    investigation_summary: str = Field(default="", max_length=4000)
+    recommended_next_steps: List[str] = Field(default_factory=list, max_length=20)
     metrics: Dict[str, Any] = Field(default_factory=dict)
     expected_revision: int = Field(ge=1)
 
@@ -2102,6 +2105,9 @@ def mapping_investigation_complete(case_id: str, req: MappingAgentCompleteReq) -
             evidence_refs=req.evidence_refs,
             counter_evidence_refs=req.counter_evidence_refs,
             unresolved_codes=req.unresolved_codes,
+            finding_codes=req.finding_codes,
+            investigation_summary=req.investigation_summary,
+            recommended_next_steps=req.recommended_next_steps,
             metrics=req.metrics,
             expected_revision=req.expected_revision,
         )

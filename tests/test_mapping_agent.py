@@ -61,6 +61,9 @@ def test_agent_calls_custom_read_only_tool_and_completes_with_evidence(tmp_path:
             "evidence_refs": ["evidence:catalog:product:1832"],
             "counter_evidence_refs": [],
             "unresolved_codes": [],
+            "finding_codes": ["official_category_match"],
+            "investigation_summary": "Official product attributes resolve the category as IPC.",
+            "recommended_next_steps": ["Apply the candidate to this request only."],
         }
 
     completed = MappingInvestigationAgent(store=store, tools=tools).run(
@@ -71,6 +74,11 @@ def test_agent_calls_custom_read_only_tool_and_completes_with_evidence(tmp_path:
 
     assert completed["state"] == "investigation_complete"
     assert completed["agent_result"]["candidate_category"] == "IPC"
+    assert completed["agent_result"]["finding_codes"] == ["official_category_match"]
+    assert completed["agent_result"]["investigation_summary"].startswith("Official product")
+    assert completed["agent_result"]["recommended_next_steps"] == [
+        "Apply the candidate to this request only."
+    ]
     assert completed["checkpoints"][0]["tool_name"] == "catalog.get_product_attributes"
     assert completed["agent_result"]["metrics"]["tool_calls"] == 1
     assert completed["agent_result"]["metrics"]["planner_calls"] == 2

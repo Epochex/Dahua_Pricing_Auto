@@ -16,8 +16,10 @@ Return one JSON object only. Allowed actions:
    "reason":"why this observation is the best next discriminator"}
 2. {"type":"complete","candidate_category":string|null,
    "recommended_action":"use_candidate_for_current_request"|"retain_current_hold",
-   "stop_reason":"stable_code","evidence_refs":[],
-   "counter_evidence_refs":[],"unresolved_codes":[]}
+   "stop_reason":"short_machine_readable_reason","evidence_refs":[],
+   "counter_evidence_refs":[],"unresolved_codes":[],"finding_codes":[],
+   "investigation_summary":"evidence-based conclusion",
+   "recommended_next_steps":[]}
 Choose the next tool from the current observations and unresolved hypothesis. There is no
 mandatory tool order. Prefer the lowest-cost observation that can distinguish competing
 explanations, stop once the evidence is sufficient, and change direction when an observation
@@ -79,9 +81,18 @@ class OpenAICompatibleMappingPlanner:
             result["hypothesis"] = str(result.get("hypothesis") or "")[:1000]
             result["reason"] = str(result.get("reason") or "")[:1000]
         else:
-            for field in ("evidence_refs", "counter_evidence_refs", "unresolved_codes"):
+            for field in (
+                "evidence_refs",
+                "counter_evidence_refs",
+                "unresolved_codes",
+                "finding_codes",
+                "recommended_next_steps",
+            ):
                 if not isinstance(result.get(field) or [], list):
                     raise InvalidAgentAction(f"model {field} must be a list")
+            result["investigation_summary"] = str(
+                result.get("investigation_summary") or ""
+            )[:4000]
         return result
 
     def __call__(self, context: Mapping[str, Any]) -> Mapping[str, Any]:

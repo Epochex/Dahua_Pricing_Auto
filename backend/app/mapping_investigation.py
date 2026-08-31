@@ -86,6 +86,19 @@ def _bounded_object(name: str, value: Optional[Mapping[str, Any]], *, maximum: i
     return result
 
 
+def _bounded_text(name: str, value: Any, *, maximum: int) -> str:
+    text = str(value or "").strip()
+    if len(text) > maximum or "\x00" in text:
+        raise InvestigationValidationError(f"{name} exceeds its text boundary")
+    return text
+
+
+def _bounded_texts(name: str, values: Sequence[Any], *, count: int, maximum: int) -> list[str]:
+    if len(values) > count:
+        raise InvestigationValidationError(f"{name} supports at most {count} items")
+    return [_bounded_text(name, item, maximum=maximum) for item in values if str(item or "").strip()]
+
+
 class MappingInvestigationStore:
     """Durable investigation cases with immutable step history.
 
@@ -354,6 +367,9 @@ class MappingInvestigationStore:
         unresolved_codes: Sequence[str],
         expected_revision: int,
         metrics: Optional[Mapping[str, Any]] = None,
+        finding_codes: Sequence[str] = (),
+        investigation_summary: str = "",
+        recommended_next_steps: Sequence[str] = (),
     ) -> Dict[str, Any]:
         metrics_copy = _copy(dict(metrics or {}))
         for key, value in metrics_copy.items():
@@ -366,6 +382,16 @@ class MappingInvestigationStore:
             "evidence_refs": _refs("evidence_refs", evidence_refs),
             "counter_evidence_refs": _refs("counter_evidence_refs", counter_evidence_refs),
             "unresolved_codes": [_safe_code("unresolved_code", item) for item in unresolved_codes],
+            "finding_codes": [_safe_code("finding_code", item) for item in finding_codes],
+            "investigation_summary": _bounded_text(
+                "investigation_summary", investigation_summary, maximum=4000
+            ),
+            "recommended_next_steps": _bounded_texts(
+                "recommended_next_steps",
+                recommended_next_steps,
+                count=20,
+                maximum=500,
+            ),
             "metrics": metrics_copy,
             "completed_at": _utc_now(),
         }
