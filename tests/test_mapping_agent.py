@@ -165,3 +165,52 @@ def test_agent_bounds_large_tool_results_before_planner_call(tmp_path: Path) -> 
     assert completed["agent_result"]["candidate_category"] == "IPC"
     assert completed["agent_result"]["metrics"]["tool_result_chars_total"] > 50000
     assert completed["agent_result"]["metrics"]["planner_context_chars_max"] <= 2000
+
+
+def test_agent_holds_historical_conflict_without_independent_evidence(tmp_path: Path) -> None:
+    store = MappingInvestigationStore(tmp_path)
+    case = _investigating_case(store)
+    tools = ToolRegistry(
+        [
+            ToolDefinition(
+                name="history.compare_prior_classifications",
+                description="Return a historical conflict",
+                handler=lambda _args: {
+                    "summary_code": "prior_classification_conflict",
+                    "selected_category": None,
+                    "signals": [{"code": "historical_category_conflict"}],
+                    "evidence_refs": ["history:ipc", "history:ptz"],
+                },
+            )
+        ]
+    )
+
+    def planner(context: dict) -> dict:
+        if not context["observations"]:
+            return {
+                "type": "tool",
+                "tool_name": "history.compare_prior_classifications",
+                "arguments": {"pn": "PN-1"},
+            }
+        return {
+            "type": "complete",
+            "candidate_category": "IPC",
+            "recommended_action": "use_candidate_for_current_request",
+            "stop_reason": "model_forced_choice",
+            "evidence_refs": ["history:ipc"],
+            "counter_evidence_refs": ["history:ptz"],
+            "unresolved_codes": [],
+        }
+
+    completed = MappingInvestigationAgent(store=store, tools=tools).run(
+        case["case_id"],
+        planner=planner,
+        initial_context={"pn": "PN-1"},
+    )
+
+    result = completed["agent_result"]
+    assert result["candidate_category"] is None
+    assert result["recommended_action"] == "retain_current_hold"
+    assert result["stop_reason"] == "historical_conflict_requires_current_corroboration"
+    assert result["counter_evidence_refs"] == ["history:ptz", "history:ipc"]
+    assert result["metrics"]["decision_guard_interventions"] == 1

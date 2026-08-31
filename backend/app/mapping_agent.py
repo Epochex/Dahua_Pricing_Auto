@@ -364,6 +364,7 @@ class MappingInvestigationAgent:
             "provider_output_tokens": 0,
             "duplicate_tool_requests": 0,
             "discarded_evidence_refs": 0,
+            "decision_guard_interventions": 0,
         }
         invoked_inputs: set[str] = set()
 
@@ -405,6 +406,13 @@ class MappingInvestigationAgent:
                     if isinstance(observation, Mapping)
                     for ref in dict(observation.get("result") or {}).get("evidence_refs") or []
                 }
+                evidence_tools: Dict[str, set[str]] = {}
+                for observation in context["observations"]:
+                    if not isinstance(observation, Mapping):
+                        continue
+                    observed_tool = str(observation.get("tool_name") or "")
+                    for ref in dict(observation.get("result") or {}).get("evidence_refs") or []:
+                        evidence_tools.setdefault(str(ref), set()).add(observed_tool)
                 requested_evidence = [str(item) for item in action.get("evidence_refs") or []]
                 requested_counter = [
                     str(item) for item in action.get("counter_evidence_refs") or []
@@ -431,6 +439,26 @@ class MappingInvestigationAgent:
                     recommended_action = "retain_current_hold"
                     stop_reason = "planner_cited_unobserved_evidence"
                     unresolved = list(dict.fromkeys([*unresolved, stop_reason]))
+                historical_conflict = any(
+                    str(dict(observation.get("result") or {}).get("summary_code") or "")
+                    == "prior_classification_conflict"
+                    for observation in context["observations"]
+                    if isinstance(observation, Mapping)
+                )
+                independently_supported = any(
+                    any(not tool.startswith("history.") for tool in evidence_tools.get(ref, set()))
+                    for ref in evidence_refs
+                )
+                if candidate_category and historical_conflict and not independently_supported:
+                    candidate_category = None
+                    recommended_action = "retain_current_hold"
+                    stop_reason = "historical_conflict_requires_current_corroboration"
+                    unresolved = list(dict.fromkeys([*unresolved, stop_reason]))
+                    counter_refs = list(dict.fromkeys([*counter_refs, *evidence_refs]))
+                    evidence_refs = []
+                    metrics["decision_guard_interventions"] = int(
+                        metrics["decision_guard_interventions"]
+                    ) + 1
                 return self.store.complete_agent_result(
                     case_id,
                     candidate_category=candidate_category,
