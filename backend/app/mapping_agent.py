@@ -36,6 +36,7 @@ class ToolDefinition:
     description: str
     handler: ToolHandler
     read_only: bool = True
+    input_schema: Optional[Mapping[str, Any]] = None
 
 
 class ToolRegistry:
@@ -63,6 +64,11 @@ class ToolRegistry:
                 "name": tool.name,
                 "description": tool.description,
                 "read_only": tool.read_only,
+                **(
+                    {"input_schema": json.loads(json.dumps(dict(tool.input_schema)))}
+                    if tool.input_schema is not None
+                    else {}
+                ),
             }
             for tool in sorted(self._tools.values(), key=lambda item: item.name)
         ]
@@ -241,6 +247,30 @@ class MappingInvestigationAgent:
                         for item in list(result.get("items") or [])[:3]
                         if isinstance(item, Mapping)
                     ]
+                elif tool_name in {
+                    "history.search_pricing_results",
+                    "history.search_quote_requests",
+                }:
+                    decision_result["entries"] = [
+                        {
+                            key: item[key]
+                            for key in (
+                                "evidence_ref",
+                                "occurred_at",
+                                "observed_at",
+                                "status",
+                                "category",
+                                "price_group",
+                                "recorded_product_line",
+                                "price_level",
+                                "same_customer",
+                                "warnings",
+                            )
+                            if key in item
+                        }
+                        for item in list(result.get("entries") or [])[:5]
+                        if isinstance(item, Mapping)
+                    ]
                 observation["result"] = decision_result
             compact["investigation"] = {
                 key: value
@@ -255,6 +285,11 @@ class MappingInvestigationAgent:
                     "query",
                     "family_categories",
                     "anomaly_codes",
+                    "as_of",
+                    "customer_ref",
+                    "price_level",
+                    "request_description",
+                    "investigation_goal",
                 }
             }
             compact["available_tools"] = [
@@ -327,7 +362,10 @@ class MappingInvestigationAgent:
             "tool_result_chars_total": 0,
             "provider_input_tokens": 0,
             "provider_output_tokens": 0,
+            "duplicate_tool_requests": 0,
+            "discarded_evidence_refs": 0,
         }
+        invoked_inputs: set[str] = set()
 
         for step in range(1, self.max_tool_calls + 2):
             elapsed = time.monotonic() - started
@@ -361,14 +399,43 @@ class MappingInvestigationAgent:
                 )
             action_type = self._validate_action(action)
             if action_type == "complete":
-                evidence_refs = list(action.get("evidence_refs") or [])
-                counter_refs = list(action.get("counter_evidence_refs") or [])
+                observed_refs = {
+                    str(ref)
+                    for observation in context["observations"]
+                    if isinstance(observation, Mapping)
+                    for ref in dict(observation.get("result") or {}).get("evidence_refs") or []
+                }
+                requested_evidence = [str(item) for item in action.get("evidence_refs") or []]
+                requested_counter = [
+                    str(item) for item in action.get("counter_evidence_refs") or []
+                ]
+                evidence_refs = [item for item in requested_evidence if item in observed_refs]
+                counter_refs = [item for item in requested_counter if item in observed_refs]
+                discarded = (
+                    len(requested_evidence)
+                    + len(requested_counter)
+                    - len(evidence_refs)
+                    - len(counter_refs)
+                )
+                metrics["discarded_evidence_refs"] = int(
+                    metrics["discarded_evidence_refs"]
+                ) + discarded
                 unresolved = list(action.get("unresolved_codes") or [])
+                candidate_category = action.get("candidate_category")
+                recommended_action = str(
+                    action.get("recommended_action") or "retain_current_hold"
+                )
+                stop_reason = str(action.get("stop_reason") or "planner_completed")
+                if candidate_category and not evidence_refs:
+                    candidate_category = None
+                    recommended_action = "retain_current_hold"
+                    stop_reason = "planner_cited_unobserved_evidence"
+                    unresolved = list(dict.fromkeys([*unresolved, stop_reason]))
                 return self.store.complete_agent_result(
                     case_id,
-                    candidate_category=action.get("candidate_category"),
-                    recommended_action=str(action.get("recommended_action") or "retain_current_hold"),
-                    stop_reason=str(action.get("stop_reason") or "planner_completed"),
+                    candidate_category=candidate_category,
+                    recommended_action=recommended_action,
+                    stop_reason=stop_reason,
                     evidence_refs=evidence_refs,
                     counter_evidence_refs=counter_refs,
                     unresolved_codes=unresolved,
@@ -390,18 +457,29 @@ class MappingInvestigationAgent:
                 raise InvalidAgentAction("tool arguments must be an object")
             input_hash = _digest({"tool": tool_name, "arguments": dict(arguments)})
             idempotency_key = f"{case_id}:{step}:{input_hash[:20]}"
-            try:
-                result = self.tools.invoke_read_only(tool_name, arguments)
-                status = "succeeded"
-                summary_code = str(result.get("summary_code") or "tool_succeeded")
-            except Exception as exc:  # noqa: BLE001
+            if input_hash in invoked_inputs:
                 result = {
-                    "error_type": type(exc).__name__,
-                    "summary_code": "tool_failed",
+                    "error_type": "DuplicateToolRequest",
+                    "summary_code": "duplicate_tool_request",
                     "evidence_refs": [],
                 }
                 status = "failed"
-                summary_code = "tool_failed"
+                summary_code = "duplicate_tool_request"
+                metrics["duplicate_tool_requests"] = int(metrics["duplicate_tool_requests"]) + 1
+            else:
+                invoked_inputs.add(input_hash)
+                try:
+                    result = self.tools.invoke_read_only(tool_name, arguments)
+                    status = "succeeded"
+                    summary_code = str(result.get("summary_code") or "tool_succeeded")
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "error_type": type(exc).__name__,
+                        "summary_code": "tool_failed",
+                        "evidence_refs": [],
+                    }
+                    status = "failed"
+                    summary_code = "tool_failed"
             metrics["tool_calls"] = int(metrics["tool_calls"]) + 1
             metrics["tool_result_chars_total"] = int(metrics["tool_result_chars_total"]) + len(
                 json.dumps(result, ensure_ascii=False, sort_keys=True)
@@ -418,6 +496,27 @@ class MappingInvestigationAgent:
                 output_refs=output_refs,
                 idempotency_key=idempotency_key,
                 expected_revision=revision,
+                planner_decision={
+                    "hypothesis": str(action.get("hypothesis") or "")[:1000],
+                    "reason": str(action.get("reason") or "")[:1000],
+                    "tool_arguments": dict(arguments),
+                },
+                observation_summary={
+                    key: result[key]
+                    for key in (
+                        "summary_code",
+                        "selected_category",
+                        "count",
+                        "successful_count",
+                        "not_found_count",
+                        "warning_count",
+                        "category_counts",
+                        "price_group_counts",
+                        "signals",
+                        "evidence_refs",
+                    )
+                    if key in result
+                },
             )
             revision = int(case["revision"])
             context["observations"].append(

@@ -63,6 +63,7 @@ from backend.app.mapping_case_memory import MappingCaseMemory, MappingCaseMemory
 from backend.app.mapping_agent import MappingAgentError, MappingInvestigationAgent
 from backend.app.mapping_document_store import MappingDocumentStore, MappingDocumentStoreError
 from backend.app.mapping_domain_tools import build_mapping_domain_tools
+from backend.app.historical_pricing_evidence import HistoricalPricingEvidenceIndex
 from backend.app.mapping_investigation import (
     InvestigationConflict,
     InvestigationError,
@@ -520,6 +521,8 @@ class MappingCheckpointReq(BaseModel):
     output_refs: List[str] = Field(default_factory=list, max_length=100)
     idempotency_key: str
     expected_revision: int = Field(ge=1)
+    planner_decision: Dict[str, Any] = Field(default_factory=dict)
+    observation_summary: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MappingAgentCompleteReq(BaseModel):
@@ -542,6 +545,12 @@ class MappingAgentRunReq(BaseModel):
     data_version: Optional[str] = Field(default=None, max_length=500)
     document_source_version: Optional[str] = Field(default=None, max_length=500)
     query: Optional[str] = Field(default=None, max_length=2000)
+    internal_model: Optional[str] = Field(default=None, max_length=500)
+    customer_ref: Optional[str] = Field(default=None, max_length=500)
+    price_level: Optional[str] = Field(default=None, max_length=100)
+    request_description: Optional[str] = Field(default=None, max_length=4000)
+    as_of: Optional[str] = Field(default=None, max_length=100)
+    investigation_goal: str = Field(default="resolve_product_line_anomaly", max_length=200)
     family_categories: List[str] = Field(default_factory=list, max_length=100)
     max_tool_calls: int = Field(default=6, ge=1, le=20)
     time_budget_seconds: float = Field(default=60.0, gt=0, le=300)
@@ -1340,6 +1349,7 @@ _price_data_store: Optional[PriceDataStore] = None
 _mapping_investigations: Optional[MappingInvestigationStore] = None
 _mapping_case_memory: Optional[MappingCaseMemory] = None
 _mapping_documents: Optional[MappingDocumentStore] = None
+_historical_pricing_evidence: Optional[HistoricalPricingEvidenceIndex] = None
 
 
 @app.on_event("startup")
@@ -1366,6 +1376,8 @@ def _startup() -> None:
     _mapping_case_memory = MappingCaseMemory(RUNTIME_DIR)
     global _mapping_documents
     _mapping_documents = MappingDocumentStore(RUNTIME_DIR)
+    global _historical_pricing_evidence
+    _historical_pricing_evidence = HistoricalPricingEvidenceIndex(RUNTIME_DIR)
     global _sheet_workflow_ingest
     _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
         RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
@@ -1458,6 +1470,13 @@ def _require_mapping_documents() -> MappingDocumentStore:
     if _mapping_documents is None:
         _mapping_documents = MappingDocumentStore(RUNTIME_DIR)
     return _mapping_documents
+
+
+def _require_historical_pricing_evidence() -> HistoricalPricingEvidenceIndex:
+    global _historical_pricing_evidence
+    if _historical_pricing_evidence is None:
+        _historical_pricing_evidence = HistoricalPricingEvidenceIndex(RUNTIME_DIR)
+    return _historical_pricing_evidence
 
 
 def _mapping_investigation_http_error(exc: Exception) -> HTTPException:
@@ -2064,6 +2083,8 @@ def mapping_investigation_checkpoint(case_id: str, req: MappingCheckpointReq) ->
             output_refs=req.output_refs,
             idempotency_key=req.idempotency_key,
             expected_revision=req.expected_revision,
+            planner_decision=req.planner_decision,
+            observation_summary=req.observation_summary,
         )
     except Exception as exc:
         raise _mapping_investigation_http_error(exc) from exc
@@ -2105,6 +2126,7 @@ def _run_mapping_investigation(
         engine=_engine,
         memory=_require_mapping_case_memory(),
         document_records=_require_mapping_documents().records(),
+        historical_index=_require_historical_pricing_evidence(),
     )
     return MappingInvestigationAgent(
         store=store,
@@ -2123,6 +2145,12 @@ def _run_mapping_investigation(
             "document_source_version": req.document_source_version,
             "query": req.query or req.pn,
             "family_categories": req.family_categories,
+            "internal_model": req.internal_model,
+            "customer_ref": req.customer_ref,
+            "price_level": req.price_level,
+            "request_description": req.request_description,
+            "as_of": req.as_of,
+            "investigation_goal": req.investigation_goal,
         },
     )
 
@@ -2154,14 +2182,29 @@ def mapping_investigation_run_model(
 
     _require_agent()._check_desktop_agent_token(req.token)
     try:
-        endpoint = os.getenv("DAHUA_MAPPING_MODEL_ENDPOINT", "").strip()
-        model = os.getenv("DAHUA_MAPPING_MODEL_NAME", "").strip()
-        if not endpoint or not model:
+        endpoint = os.getenv(
+            "DAHUA_MAPPING_MODEL_ENDPOINT",
+            "https://api.deepseek.com/chat/completions",
+        ).strip()
+        model = os.getenv("DAHUA_MAPPING_MODEL_NAME", "deepseek-chat").strip()
+        api_key = os.getenv("DAHUA_MAPPING_MODEL_API_KEY", "").strip()
+        if not api_key:
+            key_path = Path(
+                os.getenv(
+                    "DAHUA_MAPPING_MODEL_API_KEY_PATH",
+                    str(RUNTIME_DIR / "agent" / "ds-api.key"),
+                )
+            )
+            try:
+                api_key = key_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                api_key = ""
+        if not endpoint or not model or not api_key:
             raise InvestigationValidationError("mapping model planner is not configured")
         planner = OpenAICompatibleMappingPlanner(
             endpoint=endpoint,
             model=model,
-            api_key=os.getenv("DAHUA_MAPPING_MODEL_API_KEY"),
+            api_key=api_key,
             timeout_seconds=min(req.time_budget_seconds, 120.0),
             max_output_tokens=int(os.getenv("DAHUA_MAPPING_MODEL_MAX_OUTPUT_TOKENS", "800")),
             allow_http=os.getenv("DAHUA_MAPPING_MODEL_ALLOW_HTTP", "false").lower() == "true",

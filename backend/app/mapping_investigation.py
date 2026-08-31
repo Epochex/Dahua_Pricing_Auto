@@ -79,6 +79,13 @@ def _refs(name: str, values: Sequence[Any], *, maximum: int = 100) -> list[str]:
     return [_safe_ref(name, item) for item in values]
 
 
+def _bounded_object(name: str, value: Optional[Mapping[str, Any]], *, maximum: int) -> Dict[str, Any]:
+    result = _copy(dict(value or {}))
+    if len(_canonical(result)) > maximum:
+        raise InvestigationValidationError(f"{name} exceeds {maximum} serialized characters")
+    return result
+
+
 class MappingInvestigationStore:
     """Durable investigation cases with immutable step history.
 
@@ -281,6 +288,8 @@ class MappingInvestigationStore:
         output_refs: Sequence[str],
         idempotency_key: str,
         expected_revision: int,
+        planner_decision: Optional[Mapping[str, Any]] = None,
+        observation_summary: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         clean_status = str(status or "").strip().lower()
         if clean_status not in CHECKPOINT_STATUSES:
@@ -290,6 +299,12 @@ class MappingInvestigationStore:
         idem = _safe_ref("idempotency_key", idempotency_key)
         normalized_inputs = _refs("input_refs", input_refs)
         normalized_outputs = _refs("output_refs", output_refs)
+        normalized_decision = _bounded_object(
+            "planner_decision", planner_decision, maximum=4000
+        )
+        normalized_observation = _bounded_object(
+            "observation_summary", observation_summary, maximum=8000
+        )
 
         with self._locked():
             state = self._read()
@@ -308,9 +323,11 @@ class MappingInvestigationStore:
                 "input_refs": normalized_inputs,
                 "output_refs": normalized_outputs,
                 "idempotency_key": idem,
+                "planner_decision": normalized_decision,
+                "observation_summary": normalized_observation,
             }
             if existing:
-                comparable = {key: existing[key] for key in requested}
+                comparable = {key: existing.get(key, {} if key in {"planner_decision", "observation_summary"} else None) for key in requested}
                 if comparable != requested:
                     raise InvestigationConflict("idempotency key already has different checkpoint data")
                 return _copy({**case, "idempotent_replay": True})

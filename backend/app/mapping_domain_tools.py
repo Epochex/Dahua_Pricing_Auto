@@ -11,6 +11,7 @@ import pandas as pd
 from backend.app.mapping_agent import ToolDefinition, ToolRegistry
 from backend.app.mapping_case_memory import MappingCaseMemory
 from backend.app.mapping_evidence import EvidenceRecord, TieredEvidenceRetriever
+from backend.app.historical_pricing_evidence import HistoricalPricingEvidenceIndex
 from backend.engine.core.classifier import classify_category_and_price_group
 from backend.engine.core.pricing_engine import resolve_product_rows
 from backend.engine.engine import PricingEngine
@@ -131,6 +132,7 @@ def build_mapping_domain_tools(
     engine: PricingEngine,
     memory: MappingCaseMemory,
     document_records: Iterable[EvidenceRecord] = (),
+    historical_index: Optional[HistoricalPricingEvidenceIndex] = None,
 ) -> ToolRegistry:
     """Build concrete, read-only tools backed by current pricing data."""
 
@@ -312,8 +314,37 @@ def build_mapping_domain_tools(
             "evidence_refs": [item.record.evidence_id for item in hits],
         }
 
-    return ToolRegistry(
-        [
+    def search_pricing_results(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        if historical_index is None:  # pragma: no cover - registered conditionally
+            raise RuntimeError("historical pricing index is unavailable")
+        return historical_index.search_pricing_results(
+            pn=_text(arguments.get("pn")),
+            internal_model=_text(arguments.get("internal_model")),
+            as_of=_text(arguments.get("as_of")) or None,
+            limit=_limit(arguments, default=10, maximum=50),
+        )
+
+    def search_quote_requests(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        if historical_index is None:  # pragma: no cover - registered conditionally
+            raise RuntimeError("historical pricing index is unavailable")
+        return historical_index.search_quote_requests(
+            pn=_text(arguments.get("pn")),
+            internal_model=_text(arguments.get("internal_model")),
+            customer_ref=_text(arguments.get("customer_ref")) or None,
+            as_of=_text(arguments.get("as_of")) or None,
+            limit=_limit(arguments, default=10, maximum=50),
+        )
+
+    def compare_prior_classifications(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        if historical_index is None:  # pragma: no cover - registered conditionally
+            raise RuntimeError("historical pricing index is unavailable")
+        return historical_index.compare_prior_classifications(
+            pn=_text(arguments.get("pn")),
+            internal_model=_text(arguments.get("internal_model")),
+            as_of=_text(arguments.get("as_of")) or None,
+        )
+
+    definitions = [
             ToolDefinition(
                 name="mapping.get_candidates",
                 description="Return all rule matches and independent verification signals for a PN.",
@@ -345,4 +376,60 @@ def build_mapping_domain_tools(
                 handler=search_documents,
             ),
         ]
-    )
+    if historical_index is not None:
+        identity_schema = {
+            "type": "object",
+            "properties": {
+                "pn": {"type": "string"},
+                "internal_model": {"type": "string"},
+                "as_of": {"type": "string", "description": "optional exclusive ISO-8601 boundary"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "anyOf": [{"required": ["pn"]}, {"required": ["internal_model"]}],
+        }
+        definitions.extend(
+            [
+                ToolDefinition(
+                    name="history.search_pricing_results",
+                    description=(
+                        "Search earlier persisted pricing results for prior classification, "
+                        "price-group, warning and failure evidence."
+                    ),
+                    handler=search_pricing_results,
+                    input_schema=identity_schema,
+                ),
+                ToolDefinition(
+                    name="history.search_quote_requests",
+                    description=(
+                        "Search prior quote-request rows for customer context, requested price "
+                        "level, request description and recorded product line."
+                    ),
+                    handler=search_quote_requests,
+                    input_schema={
+                        **identity_schema,
+                        "properties": {
+                            **identity_schema["properties"],
+                            "customer_ref": {"type": "string"},
+                        },
+                    },
+                ),
+                ToolDefinition(
+                    name="history.compare_prior_classifications",
+                    description=(
+                        "Aggregate earlier outcomes and expose consensus, conflicts, warnings "
+                        "and missing-result counts."
+                    ),
+                    handler=compare_prior_classifications,
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            key: value
+                            for key, value in identity_schema["properties"].items()
+                            if key != "limit"
+                        },
+                        "anyOf": identity_schema["anyOf"],
+                    },
+                ),
+            ]
+        )
+    return ToolRegistry(definitions)
