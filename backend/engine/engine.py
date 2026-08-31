@@ -19,7 +19,10 @@ from backend.engine.core.pricing_engine import (
     PRICE_PRIORITY_COUNTRY_FIRST,
     compute_one,
     compute_many,
+    resolve_product_rows,
 )
+from backend.engine.core.classifier import classify_category_and_price_group
+from backend.engine.core.mapping_verifier import MappingVerifier
 from backend.engine.core.formatter import (
     build_export_frames,
     write_export_xlsx,
@@ -151,6 +154,33 @@ class PricingEngine:
             apply_black_markup=apply_black_markup,
             price_priority=price_priority,
         )
+
+    def verify_mapping(self, pn: str, *, family_categories: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Return an independent mapping verification before price calculation."""
+        data, data_version = self.snapshot()
+        country_row, system_row, row_resolution = resolve_product_rows(data, pn)
+        if country_row is None and system_row is None:
+            selected_category, selected_price_group = "UNKNOWN", None
+        else:
+            selected_category, selected_price_group = classify_category_and_price_group(
+                country_row,
+                system_row,
+                data.map_fr,
+                data.map_sys,
+            )
+        result = MappingVerifier().verify(
+            selected_category=selected_category,
+            selected_price_group=selected_price_group,
+            country_row=country_row,
+            system_row=system_row,
+            country_mapping=data.map_fr,
+            system_mapping=data.map_sys,
+            family_categories=family_categories or (),
+            data_version=data_version,
+        ).to_dict()
+        result["pn"] = str(pn)
+        result["row_resolution"] = row_resolution
+        return result
 
     def run_batch(self, input_path: Path, level: str, out_dir: Path) -> Dict[str, Any]:
         """

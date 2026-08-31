@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import hmac
 import json
 import math
@@ -57,6 +58,14 @@ from backend.app.price_data_store import (
     PriceDataError,
     PriceDataNotFound,
     PriceDataStore,
+)
+from backend.app.mapping_case_memory import MappingCaseMemory, MappingCaseMemoryError
+from backend.app.mapping_investigation import (
+    InvestigationConflict,
+    InvestigationError,
+    InvestigationNotFound,
+    InvestigationValidationError,
+    MappingInvestigationStore,
 )
 from backend.app.evolution.control_plane import EvolutionControlPlane
 from backend.app.evolution.evaluation import EvaluationError
@@ -478,6 +487,76 @@ class EvolutionCaseReviewReq(BaseModel):
     expected_terminal_state: Optional[str] = None
     expected_action: Optional[str] = None
     strata: Dict[str, str] = Field(default_factory=dict)
+
+
+class MappingVerifyReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    pn: str = Field(min_length=1, max_length=500)
+    subject_ref: Optional[str] = Field(default=None, max_length=500)
+    family_categories: List[str] = Field(default_factory=list, max_length=100)
+    create_case: bool = True
+
+
+class MappingTriageReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    action: str
+    reviewer: str
+    rationale_code: str
+    expected_revision: int = Field(ge=1)
+    corrected_category: Optional[str] = None
+
+
+class MappingCheckpointReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    tool_name: str
+    status: str
+    summary_code: str
+    input_refs: List[str] = Field(default_factory=list, max_length=100)
+    output_refs: List[str] = Field(default_factory=list, max_length=100)
+    idempotency_key: str
+    expected_revision: int = Field(ge=1)
+
+
+class MappingAgentCompleteReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    candidate_category: Optional[str] = None
+    recommended_action: str
+    stop_reason: str
+    evidence_refs: List[str] = Field(default_factory=list, max_length=100)
+    counter_evidence_refs: List[str] = Field(default_factory=list, max_length=100)
+    unresolved_codes: List[str] = Field(default_factory=list, max_length=100)
+    expected_revision: int = Field(ge=1)
+
+
+class MappingCheckpointCorrectionReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    reviewer: str
+    reason_code: str
+    corrected_output_refs: List[str] = Field(default_factory=list, max_length=100)
+    expected_revision: int = Field(ge=1)
+
+
+class MappingCheckpointRetryReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    requested_by: str
+    reason_code: str
+    expected_revision: int = Field(ge=1)
+
+
+class MappingWritebackReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    writeback_kind: str
+    target_ref: str
+    action_receipt_ref: str
+    written_by: str
+    expected_revision: int = Field(ge=1)
+
+
+class MappingMemoryReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    family_ref: Optional[str] = None
+    scope: str = "exact_subject"
+    valid_until: Optional[str] = None
 
 
 def _norm_optional_text(v: Any) -> Optional[str]:
@@ -1224,6 +1303,8 @@ _sheet_workflow_ingest: Optional[SheetWorkflowIngestCoordinator] = None
 _evolution: Optional[EvolutionControlPlane] = None
 _demo_pipeline: Optional[DemoPipeline] = None
 _price_data_store: Optional[PriceDataStore] = None
+_mapping_investigations: Optional[MappingInvestigationStore] = None
+_mapping_case_memory: Optional[MappingCaseMemory] = None
 
 
 @app.on_event("startup")
@@ -1244,6 +1325,10 @@ def _startup() -> None:
     global _pricing_workflows
     _pricing_workflows = PricingWorkflowStore(RUNTIME_DIR)
     _pricing_workflows.ensure_dirs()
+    global _mapping_investigations
+    _mapping_investigations = MappingInvestigationStore(RUNTIME_DIR)
+    global _mapping_case_memory
+    _mapping_case_memory = MappingCaseMemory(RUNTIME_DIR)
     global _sheet_workflow_ingest
     _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
         RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
@@ -1315,6 +1400,32 @@ def _require_price_data_store() -> PriceDataStore:
     if _price_data_store is None:
         _price_data_store = PriceDataStore(RUNTIME_DIR)
     return _price_data_store
+
+
+def _require_mapping_investigations() -> MappingInvestigationStore:
+    global _mapping_investigations
+    if _mapping_investigations is None:
+        _mapping_investigations = MappingInvestigationStore(RUNTIME_DIR)
+    return _mapping_investigations
+
+
+def _require_mapping_case_memory() -> MappingCaseMemory:
+    global _mapping_case_memory
+    if _mapping_case_memory is None:
+        _mapping_case_memory = MappingCaseMemory(RUNTIME_DIR)
+    return _mapping_case_memory
+
+
+def _mapping_investigation_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, InvestigationNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, InvestigationConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, (InvestigationValidationError, MappingCaseMemoryError, ValueError)):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, InvestigationError):
+        return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(status_code=500, detail="mapping investigation operation failed")
 
 
 def _require_price_data_admin_token(
@@ -1815,6 +1926,200 @@ def agent_sheet_workflow_backfill(req: SheetWorkflowBackfillReq) -> Dict[str, An
 @app.post("/api/agent/poller/run-once")
 def agent_poller_run_once() -> Dict[str, Any]:
     return _require_agent().run_poll_once()
+
+
+# =========================
+# Product-line mapping investigation APIs
+# =========================
+
+@app.post("/api/mapping/verify")
+def mapping_verify(req: MappingVerifyReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    assert _engine is not None
+    try:
+        verification = _engine.verify_mapping(
+            req.pn,
+            family_categories=req.family_categories,
+        )
+        case = None
+        if req.create_case and verification["status"] != "PASS":
+            subject_ref = req.subject_ref or f"pricing-engine:pn:{normalize_pn_raw(req.pn)}"
+            case = _require_mapping_investigations().create(
+                subject_ref=subject_ref,
+                data_version=str(verification.get("data_version") or "unversioned"),
+                verification=verification,
+                input_hash=hashlib.sha256(req.pn.encode("utf-8")).hexdigest(),
+            )
+        return {"verification": verification, "case": case}
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.get("/api/mapping/investigations")
+def mapping_investigations(
+    state: Optional[str] = None,
+    limit: int = 100,
+    token: Optional[str] = Header(default=None, alias="X-Agent-Token"),
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(token)
+    try:
+        result = _require_mapping_investigations().list(state_name=state)
+        selected = result["cases"][: max(1, min(int(limit), 500))]
+        return {"count": len(selected), "total": result["count"], "cases": selected}
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.get("/api/mapping/investigations/{case_id}")
+def mapping_investigation_case(
+    case_id: str,
+    token: Optional[str] = Header(default=None, alias="X-Agent-Token"),
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(token)
+    try:
+        return _require_mapping_investigations().get(case_id)
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/triage")
+def mapping_investigation_triage(case_id: str, req: MappingTriageReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().triage(
+            case_id,
+            action=req.action,
+            reviewer=req.reviewer,
+            rationale_code=req.rationale_code,
+            corrected_category=req.corrected_category,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/checkpoints")
+def mapping_investigation_checkpoint(case_id: str, req: MappingCheckpointReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().append_checkpoint(
+            case_id,
+            tool_name=req.tool_name,
+            status=req.status,
+            summary_code=req.summary_code,
+            input_refs=req.input_refs,
+            output_refs=req.output_refs,
+            idempotency_key=req.idempotency_key,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/complete")
+def mapping_investigation_complete(case_id: str, req: MappingAgentCompleteReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().complete_agent_result(
+            case_id,
+            candidate_category=req.candidate_category,
+            recommended_action=req.recommended_action,
+            stop_reason=req.stop_reason,
+            evidence_refs=req.evidence_refs,
+            counter_evidence_refs=req.counter_evidence_refs,
+            unresolved_codes=req.unresolved_codes,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/checkpoints/{checkpoint_id}/correct")
+def mapping_investigation_correct_checkpoint(
+    case_id: str,
+    checkpoint_id: str,
+    req: MappingCheckpointCorrectionReq,
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().correct_checkpoint(
+            case_id,
+            checkpoint_id=checkpoint_id,
+            reviewer=req.reviewer,
+            reason_code=req.reason_code,
+            corrected_output_refs=req.corrected_output_refs,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/checkpoints/{checkpoint_id}/retry")
+def mapping_investigation_retry_checkpoint(
+    case_id: str,
+    checkpoint_id: str,
+    req: MappingCheckpointRetryReq,
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().retry_from_checkpoint(
+            case_id,
+            checkpoint_id=checkpoint_id,
+            requested_by=req.requested_by,
+            reason_code=req.reason_code,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/writebacks")
+def mapping_investigation_writeback(case_id: str, req: MappingWritebackReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_investigations().record_writeback(
+            case_id,
+            writeback_kind=req.writeback_kind,
+            target_ref=req.target_ref,
+            action_receipt_ref=req.action_receipt_ref,
+            written_by=req.written_by,
+            expected_revision=req.expected_revision,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/memory")
+def mapping_investigation_remember(case_id: str, req: MappingMemoryReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        case = _require_mapping_investigations().get(case_id)
+        return _require_mapping_case_memory().remember(
+            case,
+            family_ref=req.family_ref,
+            scope=req.scope,
+            valid_until=req.valid_until,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.get("/api/mapping/memory")
+def mapping_memory_search(
+    subject_ref: Optional[str] = None,
+    family_ref: Optional[str] = None,
+    data_version: Optional[str] = None,
+    token: Optional[str] = Header(default=None, alias="X-Agent-Token"),
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(token)
+    try:
+        return _require_mapping_case_memory().search(
+            subject_ref=subject_ref,
+            family_ref=family_ref,
+            data_version=data_version,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
 
 
 # =========================

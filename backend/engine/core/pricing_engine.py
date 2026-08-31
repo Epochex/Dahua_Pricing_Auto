@@ -560,6 +560,27 @@ def _all_prices_present(fr_row: Optional[pd.Series]) -> bool:
     return True
 
 
+def resolve_product_rows(
+    data: DataBundle,
+    pn: str,
+) -> Tuple[Optional[pd.Series], Optional[pd.Series], Dict[str, Optional[str]]]:
+    """Resolve source rows without calculating or mutating a price result."""
+    key_raw = normalize_pn_raw(pn)
+    key_base = normalize_pn_base(pn)
+    fr_row, fr_mode, fr_matched = _find_row_with_fallback(
+        data.france_df, data.fr_idx_raw, data.fr_idx_base, key_raw, key_base
+    )
+    sys_row, sys_mode, sys_matched = _find_row_with_fallback(
+        data.sys_df, data.sys_idx_raw, data.sys_idx_base, key_raw, key_base
+    )
+    return fr_row, sys_row, {
+        "country_match_mode": fr_mode,
+        "system_match_mode": sys_mode,
+        "country_matched_pn": fr_matched,
+        "system_matched_pn": sys_matched,
+    }
+
+
 def _normalize_sales_type(v) -> str:
     """
     统一 Sales Type 输出为：
@@ -2225,13 +2246,11 @@ def compute_one(
     """
     key_raw = normalize_pn_raw(pn)
     key_base = normalize_pn_base(pn)
-
-    fr_row, fr_mode, fr_matched = _find_row_with_fallback(
-        data.france_df, data.fr_idx_raw, data.fr_idx_base, key_raw, key_base
-    )
-    sys_row, sys_mode, sys_matched = _find_row_with_fallback(
-        data.sys_df, data.sys_idx_raw, data.sys_idx_base, key_raw, key_base
-    )
+    fr_row, sys_row, row_resolution = resolve_product_rows(data, pn)
+    fr_mode = row_resolution["country_match_mode"]
+    sys_mode = row_resolution["system_match_mode"]
+    fr_matched = row_resolution["country_matched_pn"]
+    sys_matched = row_resolution["system_matched_pn"]
 
     warnings: List[str] = []
 

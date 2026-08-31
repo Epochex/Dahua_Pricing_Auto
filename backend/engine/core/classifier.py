@@ -1,6 +1,7 @@
 # core/classifier.py
 import re
-from typing import Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -25,6 +26,119 @@ def _normalize_field_name(f) -> str:
     return f
 
 
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+@dataclass(frozen=True)
+class MappingRuleMatch:
+    """One auditable decision-table match.
+
+    The pricing path still consumes the first match.  The verifier consumes
+    every match so a broad, early rule cannot hide a conflicting stronger
+    signal later in the table.
+    """
+
+    rule_id: str
+    rule_index: str
+    priority: Optional[float]
+    category: str
+    price_group_hint: Optional[str]
+    specificity: int
+    conditions: Tuple[Dict[str, str], ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _normalized_priority(value: Any) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_mapping_matches(
+    row: pd.Series,
+    mapping: pd.DataFrame,
+    *,
+    limit: Optional[int] = None,
+) -> List[MappingRuleMatch]:
+    """Return all matching decision-table rows with their provenance."""
+    if mapping is None or mapping.empty:
+        return []
+
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+
+    if "priority" in mapping.columns:
+        iter_rules = mapping.sort_values("priority", ascending=True).iterrows()
+    else:
+        iter_rules = mapping.iterrows()
+
+    matches: List[MappingRuleMatch] = []
+    for index, rule in iter_rules:
+        conditions: List[Dict[str, str]] = []
+        specificity = 0
+        matched = True
+        for suffix in ("1", "2"):
+            field = _normalize_field_name(rule.get(f"field{suffix}"))
+            if not field:
+                if suffix == "1":
+                    matched = False
+                break
+            match_type = str(rule.get(f"match_type{suffix}") or "").strip().lower()
+            pattern = safe_upper(rule.get(f"pattern{suffix}"))
+            actual = safe_upper(row.get(field))
+            if not pattern or match_type not in {"equals", "contains"}:
+                matched = False
+                break
+            condition_matched = actual == pattern if match_type == "equals" else pattern in actual
+            if not condition_matched:
+                matched = False
+                break
+            specificity += 2 if match_type == "equals" else 1
+            conditions.append(
+                {
+                    "field": field,
+                    "match_type": match_type,
+                    "pattern": pattern,
+                    "actual": actual,
+                }
+            )
+
+        if not matched:
+            continue
+
+        category = _optional_text(rule.get("category")) or "UNKNOWN"
+        price_group_hint = _optional_text(rule.get("price_group_hint"))
+        rule_id = _optional_text(rule.get("rule_id")) or f"mapping-row:{index}"
+        matches.append(
+            MappingRuleMatch(
+                rule_id=rule_id,
+                rule_index=str(index),
+                priority=_normalized_priority(rule.get("priority")),
+                category=category,
+                price_group_hint=price_group_hint,
+                specificity=specificity,
+                conditions=tuple(conditions),
+            )
+        )
+        if limit is not None and len(matches) >= limit:
+            break
+    return matches
+
+
 def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[str]]:
     """
     通用映射逻辑：
@@ -32,59 +146,11 @@ def apply_mapping(row: pd.Series, mapping: pd.DataFrame) -> Tuple[str, Optional[
       - 支持 equals / contains 两种模式
       - 返回 (category, price_group_hint)
     """
-    if mapping is None or mapping.empty:
+    matches = collect_mapping_matches(row, mapping, limit=1)
+    if not matches:
         return "UNKNOWN", None
-
-    if "priority" in mapping.columns:
-        iter_rules = mapping.sort_values("priority", ascending=True).iterrows()
-    else:
-        iter_rules = mapping.iterrows()
-
-    for _, rule in iter_rules:
-        field1 = _normalize_field_name(rule.get("field1"))
-        if not field1:
-            continue
-        match_type1 = str(rule.get("match_type1") or "").strip().lower()
-        pattern1 = safe_upper(rule.get("pattern1"))
-        value1 = safe_upper(row.get(field1))
-        if not pattern1:
-            continue
-
-        if match_type1 == "equals":
-            if value1 != pattern1:
-                continue
-        elif match_type1 == "contains":
-            if pattern1 not in value1:
-                continue
-        else:
-            continue
-
-        field2 = _normalize_field_name(rule.get("field2"))
-        if field2:
-            match_type2 = str(rule.get("match_type2") or "").strip().lower()
-            pattern2 = safe_upper(rule.get("pattern2"))
-            value2 = safe_upper(row.get(field2))
-            if not pattern2:
-                continue
-
-            if match_type2 == "equals":
-                if value2 != pattern2:
-                    continue
-            elif match_type2 == "contains":
-                if pattern2 not in value2:
-                    continue
-            else:
-                continue
-
-        category = str(rule.get("category") or "").strip()
-        if not category:
-            category = "UNKNOWN"
-
-        price_group_hint = rule.get("price_group_hint")
-        price_group_hint = str(price_group_hint).strip() if price_group_hint else None
-        return category, price_group_hint
-
-    return "UNKNOWN", None
+    first = matches[0]
+    return first.category, first.price_group_hint
 
 
 def _heuristic_detect_category_for_recorder(big: str) -> Tuple[str, Optional[str]]:
@@ -267,6 +333,14 @@ def _model_evidence_override(
         return ("HAC", "HAC")
 
     return None
+
+
+def detect_strong_model_evidence(
+    france_row: Optional[pd.Series],
+    sys_row: Optional[pd.Series],
+) -> Optional[Tuple[str, str]]:
+    """Expose strong, deterministic model evidence to independent verifiers."""
+    return _model_evidence_override(france_row, sys_row)
 
 
 def _forced_category_override(
