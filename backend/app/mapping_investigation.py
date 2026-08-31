@@ -89,11 +89,12 @@ class MappingInvestigationStore:
     original observation.
     """
 
-    def __init__(self, runtime_dir: Path):
+    def __init__(self, runtime_dir: Path, *, durable_writes: bool = True):
         self.root = Path(runtime_dir) / "mapping-investigations"
         self.state_path = self.root / "cases.json"
         self.lock_path = self.root / ".cases.lock"
         self._thread_lock = threading.RLock()
+        self.durable_writes = bool(durable_writes)
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -130,7 +131,8 @@ class MappingInvestigationStore:
             with tmp.open("w", encoding="utf-8") as handle:
                 json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.flush()
-                os.fsync(handle.fileno())
+                if self.durable_writes:
+                    os.fsync(handle.fileno())
             os.replace(tmp, self.state_path)
         finally:
             tmp.unlink(missing_ok=True)
@@ -334,7 +336,12 @@ class MappingInvestigationStore:
         counter_evidence_refs: Sequence[str],
         unresolved_codes: Sequence[str],
         expected_revision: int,
+        metrics: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        metrics_copy = _copy(dict(metrics or {}))
+        for key, value in metrics_copy.items():
+            if not isinstance(key, str) or not isinstance(value, (int, float, str, bool, type(None))):
+                raise InvestigationValidationError("metrics must contain scalar JSON values")
         result = {
             "candidate_category": str(candidate_category or "").strip().upper() or None,
             "recommended_action": _safe_code("recommended_action", recommended_action),
@@ -342,6 +349,7 @@ class MappingInvestigationStore:
             "evidence_refs": _refs("evidence_refs", evidence_refs),
             "counter_evidence_refs": _refs("counter_evidence_refs", counter_evidence_refs),
             "unresolved_codes": [_safe_code("unresolved_code", item) for item in unresolved_codes],
+            "metrics": metrics_copy,
             "completed_at": _utc_now(),
         }
         if result["candidate_category"] and not result["evidence_refs"]:

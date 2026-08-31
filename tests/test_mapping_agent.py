@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,8 @@ def test_agent_calls_custom_read_only_tool_and_completes_with_evidence(tmp_path:
     assert completed["state"] == "investigation_complete"
     assert completed["agent_result"]["candidate_category"] == "IPC"
     assert completed["checkpoints"][0]["tool_name"] == "catalog.get_product_attributes"
+    assert completed["agent_result"]["metrics"]["tool_calls"] == 1
+    assert completed["agent_result"]["metrics"]["planner_calls"] == 2
 
 
 def test_agent_stops_at_tool_budget(tmp_path: Path) -> None:
@@ -117,3 +120,48 @@ def test_registry_refuses_mutating_tool() -> None:
 
     with pytest.raises(ToolNotAllowed, match="not read-only"):
         tools.invoke_read_only("rules.publish", {})
+
+
+def test_agent_bounds_large_tool_results_before_planner_call(tmp_path: Path) -> None:
+    store = MappingInvestigationStore(tmp_path)
+    case = _investigating_case(store)
+    tools = ToolRegistry(
+        [
+            ToolDefinition(
+                name="catalog.large_result",
+                description="Return a deliberately large source record",
+                handler=lambda _args: {
+                    "summary_code": "large_result",
+                    "selected_category": "IPC",
+                    "evidence_refs": ["evidence:large:1"],
+                    "irrelevant_payload": "x" * 50000,
+                },
+            )
+        ]
+    )
+    observed_context_sizes: list[int] = []
+
+    def planner(context: dict) -> dict:
+        observed_context_sizes.append(len(json.dumps(context, ensure_ascii=False, sort_keys=True)))
+        if not context["observations"]:
+            return {"type": "tool", "tool_name": "catalog.large_result", "arguments": {}}
+        return {
+            "type": "complete",
+            "candidate_category": "IPC",
+            "recommended_action": "use_candidate_for_current_request",
+            "stop_reason": "bounded_context_has_decision_fields",
+            "evidence_refs": ["evidence:large:1"],
+            "counter_evidence_refs": [],
+            "unresolved_codes": [],
+        }
+
+    completed = MappingInvestigationAgent(
+        store=store,
+        tools=tools,
+        max_planner_context_chars=2000,
+    ).run(case["case_id"], planner=planner, initial_context={})
+
+    assert max(observed_context_sizes) <= 2000
+    assert completed["agent_result"]["candidate_category"] == "IPC"
+    assert completed["agent_result"]["metrics"]["tool_result_chars_total"] > 50000
+    assert completed["agent_result"]["metrics"]["planner_context_chars_max"] <= 2000

@@ -60,6 +60,9 @@ from backend.app.price_data_store import (
     PriceDataStore,
 )
 from backend.app.mapping_case_memory import MappingCaseMemory, MappingCaseMemoryError
+from backend.app.mapping_agent import MappingAgentError, MappingInvestigationAgent
+from backend.app.mapping_document_store import MappingDocumentStore, MappingDocumentStoreError
+from backend.app.mapping_domain_tools import build_mapping_domain_tools
 from backend.app.mapping_investigation import (
     InvestigationConflict,
     InvestigationError,
@@ -67,6 +70,8 @@ from backend.app.mapping_investigation import (
     InvestigationValidationError,
     MappingInvestigationStore,
 )
+from backend.app.mapping_llm_planner import OpenAICompatibleMappingPlanner
+from backend.app.mapping_reference_planner import ReferenceEvidencePlanner
 from backend.app.evolution.control_plane import EvolutionControlPlane
 from backend.app.evolution.evaluation import EvaluationError
 from backend.app.evolution.event_store import EventStoreError
@@ -525,7 +530,36 @@ class MappingAgentCompleteReq(BaseModel):
     evidence_refs: List[str] = Field(default_factory=list, max_length=100)
     counter_evidence_refs: List[str] = Field(default_factory=list, max_length=100)
     unresolved_codes: List[str] = Field(default_factory=list, max_length=100)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
     expected_revision: int = Field(ge=1)
+
+
+class MappingAgentRunReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    pn: str = Field(min_length=1, max_length=500)
+    subject_ref: str = Field(min_length=1, max_length=500)
+    family_ref: Optional[str] = Field(default=None, max_length=500)
+    data_version: Optional[str] = Field(default=None, max_length=500)
+    document_source_version: Optional[str] = Field(default=None, max_length=500)
+    query: Optional[str] = Field(default=None, max_length=2000)
+    family_categories: List[str] = Field(default_factory=list, max_length=100)
+    max_tool_calls: int = Field(default=6, ge=1, le=20)
+    time_budget_seconds: float = Field(default=60.0, gt=0, le=300)
+    max_planner_context_chars: int = Field(default=12000, ge=2000, le=100000)
+    expected_revision: int = Field(ge=1)
+
+
+class MappingDocumentReq(BaseModel):
+    token: Optional[str] = Field(default=None)
+    evidence_id: str = Field(min_length=1, max_length=500)
+    source_type: str = Field(min_length=1, max_length=100)
+    source_version: str = Field(min_length=1, max_length=500)
+    authority: str = Field(min_length=1, max_length=100)
+    subject_ref: str = Field(min_length=1, max_length=500)
+    family_ref: Optional[str] = Field(default=None, max_length=500)
+    content: str = Field(min_length=1, max_length=100000)
+    attributes: Dict[str, str] = Field(default_factory=dict)
+    approved: bool = False
 
 
 class MappingCheckpointCorrectionReq(BaseModel):
@@ -1305,6 +1339,7 @@ _demo_pipeline: Optional[DemoPipeline] = None
 _price_data_store: Optional[PriceDataStore] = None
 _mapping_investigations: Optional[MappingInvestigationStore] = None
 _mapping_case_memory: Optional[MappingCaseMemory] = None
+_mapping_documents: Optional[MappingDocumentStore] = None
 
 
 @app.on_event("startup")
@@ -1329,6 +1364,8 @@ def _startup() -> None:
     _mapping_investigations = MappingInvestigationStore(RUNTIME_DIR)
     global _mapping_case_memory
     _mapping_case_memory = MappingCaseMemory(RUNTIME_DIR)
+    global _mapping_documents
+    _mapping_documents = MappingDocumentStore(RUNTIME_DIR)
     global _sheet_workflow_ingest
     _sheet_workflow_ingest = SheetWorkflowIngestCoordinator(
         RUNTIME_DIR / "agent" / "sheet_workflow_ingest" / "state.json"
@@ -1416,12 +1453,28 @@ def _require_mapping_case_memory() -> MappingCaseMemory:
     return _mapping_case_memory
 
 
+def _require_mapping_documents() -> MappingDocumentStore:
+    global _mapping_documents
+    if _mapping_documents is None:
+        _mapping_documents = MappingDocumentStore(RUNTIME_DIR)
+    return _mapping_documents
+
+
 def _mapping_investigation_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, InvestigationNotFound):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, InvestigationConflict):
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, (InvestigationValidationError, MappingCaseMemoryError, ValueError)):
+    if isinstance(
+        exc,
+        (
+            InvestigationValidationError,
+            MappingCaseMemoryError,
+            MappingDocumentStoreError,
+            MappingAgentError,
+            ValueError,
+        ),
+    ):
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, InvestigationError):
         return HTTPException(status_code=500, detail=str(exc))
@@ -2028,8 +2081,92 @@ def mapping_investigation_complete(case_id: str, req: MappingAgentCompleteReq) -
             evidence_refs=req.evidence_refs,
             counter_evidence_refs=req.counter_evidence_refs,
             unresolved_codes=req.unresolved_codes,
+            metrics=req.metrics,
             expected_revision=req.expected_revision,
         )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+def _run_mapping_investigation(
+    case_id: str,
+    req: MappingAgentRunReq,
+    *,
+    planner: Any,
+) -> Dict[str, Any]:
+    assert _engine is not None
+    store = _require_mapping_investigations()
+    case = store.get(case_id)
+    if int(case["revision"]) != req.expected_revision:
+        raise InvestigationConflict("case revision changed; reload before running investigation")
+    if case["subject_ref"] != req.subject_ref:
+        raise InvestigationValidationError("subject_ref does not match the investigation case")
+    tools = build_mapping_domain_tools(
+        engine=_engine,
+        memory=_require_mapping_case_memory(),
+        document_records=_require_mapping_documents().records(),
+    )
+    return MappingInvestigationAgent(
+        store=store,
+        tools=tools,
+        max_tool_calls=req.max_tool_calls,
+        time_budget_seconds=req.time_budget_seconds,
+        max_planner_context_chars=req.max_planner_context_chars,
+    ).run(
+        case_id,
+        planner=planner,
+        initial_context={
+            "pn": req.pn,
+            "subject_ref": req.subject_ref,
+            "family_ref": req.family_ref,
+            "data_version": req.data_version or case["data_version"],
+            "document_source_version": req.document_source_version,
+            "query": req.query or req.pn,
+            "family_categories": req.family_categories,
+        },
+    )
+
+
+@app.post("/api/mapping/investigations/{case_id}/run-reference")
+def mapping_investigation_run_reference(
+    case_id: str,
+    req: MappingAgentRunReq,
+) -> Dict[str, Any]:
+    """Run the reproducible evidence planner after human triage."""
+
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _run_mapping_investigation(
+            case_id,
+            req,
+            planner=ReferenceEvidencePlanner(),
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/investigations/{case_id}/run-model")
+def mapping_investigation_run_model(
+    case_id: str,
+    req: MappingAgentRunReq,
+) -> Dict[str, Any]:
+    """Run the same bounded chain with a configured model planner."""
+
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        endpoint = os.getenv("DAHUA_MAPPING_MODEL_ENDPOINT", "").strip()
+        model = os.getenv("DAHUA_MAPPING_MODEL_NAME", "").strip()
+        if not endpoint or not model:
+            raise InvestigationValidationError("mapping model planner is not configured")
+        planner = OpenAICompatibleMappingPlanner(
+            endpoint=endpoint,
+            model=model,
+            api_key=os.getenv("DAHUA_MAPPING_MODEL_API_KEY"),
+            timeout_seconds=min(req.time_budget_seconds, 120.0),
+            max_output_tokens=int(os.getenv("DAHUA_MAPPING_MODEL_MAX_OUTPUT_TOKENS", "800")),
+            allow_http=os.getenv("DAHUA_MAPPING_MODEL_ALLOW_HTTP", "false").lower() == "true",
+        )
+        return _run_mapping_investigation(case_id, req, planner=planner)
     except Exception as exc:
         raise _mapping_investigation_http_error(exc) from exc
 
@@ -2117,6 +2254,33 @@ def mapping_memory_search(
             subject_ref=subject_ref,
             family_ref=family_ref,
             data_version=data_version,
+        )
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.post("/api/mapping/evidence/documents")
+def mapping_document_register(req: MappingDocumentReq) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(req.token)
+    try:
+        return _require_mapping_documents().register(req.model_dump(exclude={"token"}))
+    except Exception as exc:
+        raise _mapping_investigation_http_error(exc) from exc
+
+
+@app.get("/api/mapping/evidence/documents")
+def mapping_documents(
+    subject_ref: Optional[str] = None,
+    family_ref: Optional[str] = None,
+    source_version: Optional[str] = None,
+    token: Optional[str] = Header(default=None, alias="X-Agent-Token"),
+) -> Dict[str, Any]:
+    _require_agent()._check_desktop_agent_token(token)
+    try:
+        return _require_mapping_documents().list(
+            subject_ref=subject_ref,
+            family_ref=family_ref,
+            source_version=source_version,
         )
     except Exception as exc:
         raise _mapping_investigation_http_error(exc) from exc
